@@ -38,7 +38,19 @@ OBJ := $(NVN_OBJ) \
        $(patsubst %,$(OUT)/obj/linux/%.o,$(NULL_SRC))
 
 .DEFAULT_GOAL := null-renderer
-.PHONY: profile null-renderer vulkan-replay-objects nxasahi-renderer-objects nxasahi-renderer nxasahi-front vulkan-selftest vk-mem-selftest t_push t_skipcs t_gpstamp t_focus t_gmem_trace t_missing_log t_counter_report t_vk_stage t_vk_mesh t_vk_mesh_compile t_vk_descriptor_pool t_vk_mesh_coverage t_vk_shader_resolve clean
+.PHONY: profile null-renderer vulkan-replay-objects nxasahi-renderer-objects nxasahi-renderer nxasahi-front vulkan-selftest vk-mem-selftest t_push t_skipcs t_gpstamp t_focus t_gmem_trace t_missing_log t_counter_report t_vk_stage t_vk_mesh t_vk_mesh_compile t_vk_descriptor_pool t_vk_mesh_coverage t_vk_shader_resolve dmhost dmhost-vulkan t_fs_linux clean
+
+# The consolidated asahi branch also carries the Linux host. Keep its object
+# namespace and rules separate so renderer-only checks remain bounded and a
+# change of backend flags cannot accidentally reuse a renderer object.
+dmhost:
+	$(MAKE) -f Runtime.mk GAME=$(GAME) BACKEND=null dmhost
+
+dmhost-vulkan:
+	$(MAKE) -f Runtime.mk GAME=$(GAME) BACKEND=vulkan dmhost
+
+t_fs_linux:
+	$(MAKE) -f Runtime.mk GAME=$(GAME) t_fs_linux
 
 profile:
 	$(MAKE) -C $(HOST) GAME=$(GAME) game_profile

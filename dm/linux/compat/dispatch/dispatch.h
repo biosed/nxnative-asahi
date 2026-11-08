@@ -2,6 +2,7 @@
 #pragma once
 #include <stdint.h>
 typedef struct dm_dispatch_sem *dispatch_semaphore_t;
+typedef struct dm_dispatch_queue *dispatch_queue_t;
 typedef uint64_t dispatch_time_t;
 #define DISPATCH_TIME_NOW 0ull
 #define DISPATCH_TIME_FOREVER (~0ull)
@@ -13,4 +14,6 @@ dispatch_semaphore_t dispatch_semaphore_create(long value);
 long dispatch_semaphore_wait(dispatch_semaphore_t s, dispatch_time_t timeout);
 long dispatch_semaphore_signal(dispatch_semaphore_t s);
 void dispatch_release(void *obj);
+dispatch_queue_t dispatch_get_global_queue(long qos, unsigned long flags);
+void dispatch_async_f(dispatch_queue_t q, void *ctx, void (*work)(void *));
 

@@ -105,6 +105,23 @@ long dispatch_semaphore_wait(dispatch_semaphore_t s, dispatch_time_t timeout) {
 long dispatch_semaphore_signal(dispatch_semaphore_t s) { sem_post(&s->s); return 0; }
 void dispatch_release(void *o) { struct dm_dispatch_sem *s = o; if (s) { sem_destroy(&s->s); free(s); } }
 
+struct dm_dispatch_queue { int unused; };
+static struct dm_dispatch_queue g_global_queue;
+typedef struct { void (*work)(void *); void *ctx; } dm_dispatch_job;
+static void *dm_dispatch_run(void *p) {
+    dm_dispatch_job *j = p; void (*work)(void *) = j->work; void *ctx = j->ctx;
+    free(j); work(ctx); return NULL;
+}
+dispatch_queue_t dispatch_get_global_queue(long qos, unsigned long flags) { (void)qos; (void)flags; return &g_global_queue; }
+void dispatch_async_f(dispatch_queue_t q, void *ctx, void (*work)(void *)) {
+    (void)q;
+    dm_dispatch_job *j = malloc(sizeof *j); if (!j) { work(ctx); return; }
+    *j = (dm_dispatch_job){work, ctx};
+    pthread_t th;
+    if (pthread_create(&th, NULL, dm_dispatch_run, j)) { free(j); work(ctx); return; }
+    pthread_detach(th);
+}
+
 malloc_zone_t *malloc_create_zone(size_t start, unsigned flags) { (void)start; (void)flags; static malloc_zone_t z; return &z; }
 
 // SHA-256 (FIPS 180-4)
@@ -230,8 +247,12 @@ kern_return_t vm_region_64(mach_port_t task, vm_address_t *addr, vm_size_t *size
     (void)task; (void)addr; (void)size; (void)flavor; (void)info; (void)cnt; (void)obj; return KERN_FAILURE;
 }
 kern_return_t thread_policy_get(mach_port_t th, thread_policy_flavor_t f, thread_policy_t p, mach_msg_type_number_t *cnt, boolean_t *def) { (void)th; (void)f; (void)p; (void)cnt; (void)def; return KERN_FAILURE; }
-// Darwin's per-thread performance counters (libsyscall): not available, the caller's zeros stay
-int thread_selfcounts(int type, void *buf, size_t nbytes) { (void)type; (void)buf; (void)nbytes; return -1; }
+// Darwin's per-thread performance counters (libsyscall): not available, the caller's zeros stay.
+__attribute__((weak)) int thread_selfcounts(int type, void *buf, size_t nbytes) {
+    (void)type;
+    memset(buf, 0, nbytes);
+    return -1;
+}
 // BSD's mergesort: a stable sort (bionic has none); 0, or -1 with errno set when the buffer cannot be allocated
 int mergesort(void *base, size_t n, size_t size, int (*cmp)(const void *, const void *)) {
     if (n < 2) return 0;

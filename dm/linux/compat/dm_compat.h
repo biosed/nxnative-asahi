@@ -2,15 +2,21 @@
 #pragma once
 #ifndef __ASSEMBLER__
 #include <stdint.h>
+#include <stdbool.h>
 #include <time.h>
 #include <unistd.h>
 #define CLOCK_UPTIME_RAW CLOCK_MONOTONIC
 #define CLOCK_MONOTONIC_RAW_APPROX CLOCK_MONOTONIC
 static inline uint64_t clock_gettime_nsec_np(clockid_t c) { struct timespec t; if (clock_gettime(c, &t)) return 0; return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec; }
-#ifdef __ANDROID__
+#if !defined(__GLIBC__)
 static inline int getdtablesize(void) { return (int)sysconf(_SC_OPEN_MAX); }
 #endif
 #include <pthread.h>
+#include <pthread/qos.h>
+#ifndef MAP_JIT
+#define MAP_JIT 0
+#endif
+static inline void pthread_jit_write_protect_np(int enabled) { (void)enabled; }
 // Darwin's stack bounds of a thread (the address is the top: stacks grow down). Bionic counts the guard pages at the bottom of a created thread's stack in it (the PROT_NONE
 // region pthread_create puts there); Darwin does not, and a collector scanning the reported range (Unity's, through nn::os stack info) faulted there: they are left out
 static inline size_t pthread_get_stacksize_np(pthread_t t) {
