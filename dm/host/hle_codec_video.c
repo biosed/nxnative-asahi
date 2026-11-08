@@ -44,18 +44,467 @@ typedef struct {
     uint32_t magic, id; pthread_mutex_t mu; vpx_codec_ctx_t vpx; int vpx_ok; void *event; uint64_t submits, pictures;
     int codec; uint16_t w, h; mavc *avc; uint8_t *csd; size_t csd_n;   // H.264: VideoToolbox and the parameter sets Initialize gave
     mav1 *av1;   // AV1: VideoToolbox, or dav1d where the chip has no AV1 decoder (hle_movie_av1.c)
-    struct { cv_pool *pool; uint32_t pidx; int reg, filled; uint32_t gen, filled_gen; uint16_t w, h; int64_t ts; uint8_t eos; } buf[CV_BUFS];
+    uint32_t av1_ordinal; uint8_t skip_av1, skip_eos_sent, acquire_reserves;   // opt-in compatibility modes: fast EOS, or Acquire reserves the next output picture
+    struct { cv_pool *pool; uint32_t pidx; int reg, filled, reserved; uint32_t gen, filled_gen; uint16_t w, h; int64_t ts; uint8_t eos; } buf[CV_BUFS];
     uint32_t fifo[8], fhead, fcount;          // acquirable indices
-    uint32_t pend[CV_BUFS], phead, pcount;    // released, waiting for a picture
+    uint32_t pend[CV_BUFS], phead, pcount;    // released, or acquire-reserved in compatibility mode, waiting for a picture
     vpx_image_t *held[CV_HOLD]; int64_t held_ts[CV_HOLD]; uint8_t held_eos[CV_HOLD]; int nheld;
     int eos_pending;
 } cv_dec;
 
 static cv_dec *g_cv[16];
+static uint32_t g_cv_av1_ordinal;
 static pthread_mutex_t g_cv_mu = PTHREAD_MUTEX_INITIALIZER;   // lock order: g_cv_mu, then a decoder's mu, then g_spt_mu
+
+// Ocarina's movie player reads a decoded NV12 picture into one guest buffer,
+// then uploads a separate, SDK-managed presentation buffer.  Until that
+// SDK-side staging copy is modelled, an opt-in Linux bridge keeps one coherent
+// decoded frame so the Vulkan B2T replay can populate the presentation buffer.
+// The switch is deliberately exact-title/run-time opt-in; the normal codec ABI
+// and other games remain unchanged.
+static pthread_mutex_t g_cv_present_mu = PTHREAD_MUTEX_INITIALIZER;
+static uint8_t *g_cv_present_nv12;
+static size_t g_cv_present_cap, g_cv_present_n;
+static uint16_t g_cv_present_w, g_cv_present_h;
+static uint64_t g_cv_present_seq;
+static int cv_trace_on(void);
+
+static int cv_present_bridge_on(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *e = getenv("DM_CODEC_MOVIE_B2T_LATEST");
+        enabled = e && *e && strcmp(e, "0");
+    }
+    return enabled;
+}
+
+static void cv_present_remember(const uint8_t *nv12, uint16_t w, uint16_t h) {
+    if (!cv_present_bridge_on() || !nv12 || !w || !h) return;
+    size_t n = (size_t)w * h * 3 / 2;
+    pthread_mutex_lock(&g_cv_present_mu);
+    if (g_cv_present_cap < n) {
+        uint8_t *p = realloc(g_cv_present_nv12, n);
+        if (!p) { pthread_mutex_unlock(&g_cv_present_mu); return; }
+        g_cv_present_nv12 = p; g_cv_present_cap = n;
+    }
+    memcpy(g_cv_present_nv12, nv12, n);
+    g_cv_present_n = n; g_cv_present_w = w; g_cv_present_h = h; g_cv_present_seq++;
+    pthread_mutex_unlock(&g_cv_present_mu);
+}
+
+// Called weakly by the Linux Vulkan replay before the full-frame luma B2T.
+// The title allocates its NV12 presentation frame as contiguous Y then UV, so
+// one locked copy supplies both adjacent B2T records from the same generation.
+int dm_codec_movie_nv12_present(void *dst, uint32_t w, uint32_t h) {
+    if (!cv_present_bridge_on() || !dst || !w || !h) return 0;
+    size_t n = (size_t)w * h * 3 / 2;
+    int copied = 0; uint64_t seq = 0;
+    dm_guest_write_prepare(dst, n);
+    pthread_mutex_lock(&g_cv_present_mu);
+    if (g_cv_present_nv12 && g_cv_present_w == w && g_cv_present_h == h && g_cv_present_n == n) {
+        memcpy(dst, g_cv_present_nv12, n);
+        seq = g_cv_present_seq; copied = 1;
+    }
+    pthread_mutex_unlock(&g_cv_present_mu);
+    if (copied) {
+        static unsigned writes;
+        unsigned k = __atomic_add_fetch(&writes, 1, __ATOMIC_RELAXED);
+        if (k == 1 || (cv_trace_on() && !(k % 60))) {
+            uint8_t lo = 255, hi = 0; uint64_t sum = 0, samples = 0;
+            size_t ysize = (size_t)w * h, step = ysize > 4096 ? ysize / 4096 : 1;
+            for (size_t i = 0; i < ysize; i += step) {
+                uint8_t v = ((const uint8_t *)dst)[i];
+                if (v < lo) lo = v; if (v > hi) hi = v; sum += v; samples++;
+            }
+            LOG("[codec] movie NV12 presentation bridge write %u: decoded frame %llu -> %p (%ux%u), luma %u..%u mean %.2f",
+                k, (unsigned long long)seq, dst, w, h, lo, hi, samples ? (double)sum / samples : 0.0);
+        }
+    }
+    return copied;
+}
+
+// Bounded protocol telemetry for bringing up a new SDK movie player.  It is
+// intentionally opt-in: the ordinary decode path does not pay for per-call
+// logging, and a bad player cannot grow the log without bound.
+static int cv_trace_on(void) {
+    static int enabled = -1;
+    if (enabled < 0) enabled = getenv("DM_CODEC_TRACE") != NULL;
+    return enabled;
+}
+static int cv_trace_take(void) {
+    static int left = 400;
+    return cv_trace_on() && __atomic_fetch_sub(&left, 1, __ATOMIC_RELAXED) > 0;
+}
+
+// Some NintendoSDK_movie clients use Acquire as the reservation of the buffer
+// for the next picture, and Release only after that picture has been consumed.
+// Keep the established release-reserves protocol as the default: this switch
+// is deliberately opt-in until the client families can be distinguished from
+// their ABI rather than by a launch setting.
+static int cv_acquire_reserves_enabled(void) {
+    const char *e = getenv("DM_CODEC_ACQUIRE_RESERVES");
+    return e && *e && strcmp(e, "0");
+}
 
 static cv_dec *cv_of(void *t) { cv_dec *d = t ? *(cv_dec **)t : NULL; return d && d->magic == CV_MAGIC ? d : NULL; }
 static cv_pool *pool_of(const void *t) { cv_pool *p = t ? *(cv_pool *const *)t : NULL; return p && p->magic == CV_MAGIC ? p : NULL; }
+
+// Development-only movie fast-forward. DM_CODEC_SKIP_AV1 selects decoder
+// instances by process-wide ordinal: "4" or "1,3-5". It is read when an AV1
+// decoder is initialized, so the default path has no changed state. There is
+// deliberately no "all": a finite selector cannot silently disable later
+// in-game movies.
+static int cv_skip_av1_selected(uint32_t ordinal) {
+    const char *p = getenv("DM_CODEC_SKIP_AV1");
+    if (!p || !*p) return 0;
+    while (*p) {
+        while (*p == ',' || *p == ' ' || *p == '\t') p++;
+        char *end = NULL; unsigned long lo = strtoul(p, &end, 10), hi = lo;
+        if (end == p || !lo || lo > UINT32_MAX) {
+            static int once; if (!once++) LOG("[RED] DM_CODEC_SKIP_AV1 has an invalid selector near '%s'", p);
+            while (*p && *p != ',') p++;
+            continue;
+        }
+        if (*end == '-') {
+            char *last = NULL; hi = strtoul(end + 1, &last, 10);
+            if (last == end + 1 || hi < lo || hi > UINT32_MAX) {
+                static int once; if (!once++) LOG("[RED] DM_CODEC_SKIP_AV1 has an invalid range near '%s'", p);
+                while (*p && *p != ',') p++;
+                continue;
+            }
+            end = last;
+        }
+        if (ordinal >= lo && ordinal <= hi) return 1;
+        p = end; while (*p && *p != ',') p++;
+    }
+    return 0;
+}
+
+// The codec EOS alone does not finish NintendoSDK_movie's outer player: its
+// MediaExtractor keeps feeding the selected audio/video tracks and the movie
+// timeline remains alive.  While a selected AV1 decoder exists, remember the
+// extractor that feeds it and advance each track to the SDK's own EOS.  A
+// remembered extractor stays selected after the video decoder is destroyed so
+// its audio track can reach EOS too; Stop / Finalize remove it before another
+// movie can reuse the object.
+//
+// SDK 19.3.3's exact ABI (sdk 0x4c2420, 0x4c2440, 0x4c8a30): Buffer's filled
+// size, timestamp and flags are at +16, +24 and +32.  BaseMediaExtractor sets
+// flag 8 and returns 0x40100 for the genuine empty EOS buffer.  A data sample
+// may carry flag 8 first; subsequent reads are answered with the exact empty
+// terminal form the extractor would return next, without calling it past end.
+// Batching bounds one guest call and, if more samples remain, returns the last
+// genuine sample in the caller's Buffer.
+enum { CV_MOVIE_EOS_FLAG = 8, CV_MOVIE_EOS_RESULT = 0x40100, CV_MOVIE_DRAIN_BATCH = 65536, CV_MOVIE_TRACKS = 8 };
+typedef struct {
+    int used, track, eos;
+    int64_t timestamp;
+    uint32_t flags;
+} cv_skip_track;
+typedef struct { void *self; cv_skip_track track[CV_MOVIE_TRACKS]; } cv_skip_extractor;
+static cv_skip_extractor g_cv_skip_extractor[16];
+static pthread_mutex_t g_cv_skip_extractor_mu = PTHREAD_MUTEX_INITIALIZER;
+
+static int cv_skip_av1_active(void) {
+    int active = 0;
+    pthread_mutex_lock(&g_cv_mu);
+    for (int i = 0; i < 16; i++)
+        if (g_cv[i] && g_cv[i]->skip_av1) { active = 1; break; }
+    pthread_mutex_unlock(&g_cv_mu);
+    return active;
+}
+
+static void cv_movie_buffer_meta(const void *buffer, uint64_t *filled, int64_t *timestamp, uint32_t *flags) {
+    *filled = 0; *timestamp = 0; *flags = 0;
+    if (!buffer) return;
+    memcpy(filled, (const uint8_t *)buffer + 16, sizeof *filled);
+    memcpy(timestamp, (const uint8_t *)buffer + 24, sizeof *timestamp);
+    memcpy(flags, (const uint8_t *)buffer + 32, sizeof *flags);
+}
+
+static void cv_movie_buffer_set_meta(void *buffer, uint64_t filled, int64_t timestamp, uint32_t flags) {
+    if (!buffer) return;
+    memcpy((uint8_t *)buffer + 16, &filled, sizeof filled);
+    memcpy((uint8_t *)buffer + 24, &timestamp, sizeof timestamp);
+    memcpy((uint8_t *)buffer + 32, &flags, sizeof flags);
+}
+
+// Returns 0 when this extractor is ordinary, 1 when it is selected and needs a
+// real read, and 2 when a genuine EOS for this track was seen already and has
+// been replayed without calling the extractor past end.
+static int cv_skip_extractor_state(void *self, int track, void *buffer, Result *cached) {
+    int active = cv_skip_av1_active(), selected = 0, free_slot = -1, new_selection = 0, state = 0;
+    pthread_mutex_lock(&g_cv_skip_extractor_mu);
+    for (int i = 0; i < 16; i++) {
+        if (g_cv_skip_extractor[i].self == self) { selected = i + 1; break; }
+        if (!g_cv_skip_extractor[i].self && free_slot < 0) free_slot = i;
+    }
+    if (!selected && self && active && free_slot >= 0) {
+        g_cv_skip_extractor[free_slot].self = self; selected = free_slot + 1; new_selection = 1;
+    }
+    if (selected) {
+        cv_skip_extractor *e = &g_cv_skip_extractor[selected - 1];
+        cv_skip_track *t = NULL;
+        for (int i = 0; i < CV_MOVIE_TRACKS; i++) {
+            if (e->track[i].used && e->track[i].track == track) { t = &e->track[i]; break; }
+            if (!e->track[i].used && !t) t = &e->track[i];
+        }
+        if (t && !t->used) { t->used = 1; t->track = track; }
+        if (t) {
+            state = 1;
+            if (t->eos) {
+                cv_movie_buffer_set_meta(buffer, 0, t->timestamp, t->flags | CV_MOVIE_EOS_FLAG);
+                *cached = CV_MOVIE_EOS_RESULT; state = 2;
+            }
+        }
+    }
+    pthread_mutex_unlock(&g_cv_skip_extractor_mu);
+    if (new_selection) LOG("[movie] extractor %p selected with DM_CODEC_SKIP_AV1: draining tracks to genuine EOS", self);
+    if (!selected && active && free_slot < 0) {
+        static int once; if (!once++) LOG("[RED] DM_CODEC_SKIP_AV1: more than 16 live movie extractors; one was not selected");
+    }
+    if (selected && !state) {
+        static int once; if (!once++) LOG("[RED] DM_CODEC_SKIP_AV1: extractor %p has more than %u tracks; track %d is not drained", self, CV_MOVIE_TRACKS, track);
+    }
+    return state;
+}
+
+static void cv_skip_extractor_record_eos(void *self, int track, const void *buffer) {
+    uint64_t filled; int64_t timestamp; uint32_t flags;
+    cv_movie_buffer_meta(buffer, &filled, &timestamp, &flags);
+    (void)filled;
+    pthread_mutex_lock(&g_cv_skip_extractor_mu);
+    for (int i = 0; i < 16; i++) if (g_cv_skip_extractor[i].self == self) {
+        for (int j = 0; j < CV_MOVIE_TRACKS; j++) {
+            cv_skip_track *t = &g_cv_skip_extractor[i].track[j];
+            if (t->used && t->track == track) {
+                // A final data sample can carry EOS with Result 0. The next
+                // real extractor read would be the empty terminal form; cache
+                // that form so no compressed payload is ever replayed.
+                t->eos = 1; t->timestamp = timestamp; t->flags = flags | CV_MOVIE_EOS_FLAG;
+                i = 16; break;
+            }
+        }
+    }
+    pthread_mutex_unlock(&g_cv_skip_extractor_mu);
+}
+
+static void cv_skip_extractor_clear(void *self) {
+    pthread_mutex_lock(&g_cv_skip_extractor_mu);
+    for (int i = 0; i < 16; i++) if (g_cv_skip_extractor[i].self == self) memset(&g_cv_skip_extractor[i], 0, sizeof g_cv_skip_extractor[i]);
+    pthread_mutex_unlock(&g_cv_skip_extractor_mu);
+}
+
+static void cv_skip_extractor_clear_all(void) {
+    pthread_mutex_lock(&g_cv_skip_extractor_mu);
+    memset(g_cv_skip_extractor, 0, sizeof g_cv_skip_extractor);
+    pthread_mutex_unlock(&g_cv_skip_extractor_mu);
+}
+
+static uint32_t cv_movie_buffer_flags(const void *buffer) {
+    uint64_t filled; int64_t timestamp; uint32_t flags;
+    cv_movie_buffer_meta(buffer, &filled, &timestamp, &flags);
+    return flags;
+}
+
+HLE_FORCE("_ZN2nn5movie14MediaExtractor11ReadSamplesEPNS0_6BufferEi",
+          "selected AV1 movies: bounded extractor drain to the SDK's genuine per-track EOS",
+          Result, h_cv_movie_read_samples, void *self, void *buffer, int track) {
+    typedef Result (*read_fn)(void *, void *, int);
+    static read_fn real;
+    if (!real && !(real = (read_fn)guest_sym("_ZN2nn5movie14MediaExtractor11ReadSamplesEPNS0_6BufferEi")))
+        die("movie: MediaExtractor::ReadSamples missing");
+
+    Result cached = 0;
+    int selected = cv_skip_extractor_state(self, track, buffer, &cached);
+    if (selected == 2) return cached;
+    Result r = real(self, buffer, track);
+    if (selected != 1) return r;
+
+    uint32_t flags = cv_movie_buffer_flags(buffer);
+    unsigned discarded = 0;
+    while (r == 0 && !(flags & CV_MOVIE_EOS_FLAG) && discarded < CV_MOVIE_DRAIN_BATCH) {
+        r = real(self, buffer, track);
+        flags = cv_movie_buffer_flags(buffer);
+        discarded++;
+    }
+    if (flags & CV_MOVIE_EOS_FLAG) {
+        cv_skip_extractor_record_eos(self, track, buffer);
+        LOG("[movie] extractor %p track %d: genuine EOS after discarding %u sample(s), result %#x", self, track, discarded, r);
+    } else if (discarded == CV_MOVIE_DRAIN_BATCH) {
+        LOG("[movie] extractor %p track %d: discarded %u samples; yielding one genuine sample before the next bounded batch", self, track, discarded);
+    } else if (r != 0) {
+        LOG("[movie] extractor %p track %d: drain stopped after %u samples at result %#x, flags %#x", self, track, discarded, r, flags);
+    }
+    return r;
+}
+
+HLE_FORCE("_ZN2nn5movie14MediaExtractor4StopEv",
+          "selected AV1 movies: clear the bounded extractor-drain selection before pass-through",
+          Result, h_cv_movie_extractor_stop, void *self) {
+    typedef Result (*stop_fn)(void *);
+    static stop_fn real;
+    cv_skip_extractor_clear(self);
+    if (!real && !(real = (stop_fn)guest_sym("_ZN2nn5movie14MediaExtractor4StopEv")))
+        die("movie: MediaExtractor::Stop missing");
+    return real(self);
+}
+
+HLE_FORCE("_ZN2nn5movie14MediaExtractor6SeekToENS_8TimeSpanENS0_8SeekModeE",
+          "selected AV1 movies: a real seek re-arms the bounded extractor drain",
+          Result, h_cv_movie_extractor_seek, void *self, int64_t timestamp, uint32_t mode) {
+    typedef Result (*seek_fn)(void *, int64_t, uint32_t);
+    static seek_fn real;
+    cv_skip_extractor_clear(self);
+    if (!real && !(real = (seek_fn)guest_sym("_ZN2nn5movie14MediaExtractor6SeekToENS_8TimeSpanENS0_8SeekModeE")))
+        die("movie: MediaExtractor::SeekTo missing");
+    return real(self, timestamp, mode);
+}
+
+HLE_FORCE("_ZN2nn5movie14MediaExtractor8FinalizeEv",
+          "selected AV1 movies: forget the extractor before pass-through finalization",
+          Result, h_cv_movie_extractor_finalize, void *self) {
+    typedef Result (*finalize_fn)(void *);
+    static finalize_fn real;
+    cv_skip_extractor_clear(self);
+    if (!real && !(real = (finalize_fn)guest_sym("_ZN2nn5movie14MediaExtractor8FinalizeEv")))
+        die("movie: MediaExtractor::Finalize missing");
+    return real(self);
+}
+
+// Opt-in, pass-through telemetry for NintendoSDK_movie's separate audio
+// decoder.  Cycle108 proved that selected AV1 streams and their extractor
+// input reach EOS quickly while the outer player remains on its audio clock.
+// Keep this probe behind the same development selector: ordinary runs do not
+// log, and no Buffer or AudioFrame state is changed here.
+typedef struct {
+    void *self;
+    uint32_t ordinal;
+    uint64_t decodes, acquires;
+} cv_audio_probe;
+static cv_audio_probe g_cv_audio_probe[16];
+static uint32_t g_cv_audio_ordinal;
+static pthread_mutex_t g_cv_audio_probe_mu = PTHREAD_MUTEX_INITIALIZER;
+
+static int cv_audio_probe_enabled(void) {
+    const char *s = getenv("DM_CODEC_SKIP_AV1");
+    return s && *s;
+}
+
+static uint32_t cv_audio_probe_initialize(void *self) {
+    uint32_t ordinal = 0;
+    pthread_mutex_lock(&g_cv_audio_probe_mu);
+    for (int i = 0; i < 16; i++) if (g_cv_audio_probe[i].self == self) {
+        ordinal = g_cv_audio_probe[i].ordinal;
+        pthread_mutex_unlock(&g_cv_audio_probe_mu);
+        return ordinal;
+    }
+    for (int i = 0; i < 16; i++) if (!g_cv_audio_probe[i].self) {
+        ordinal = ++g_cv_audio_ordinal;
+        g_cv_audio_probe[i] = (cv_audio_probe){.self = self, .ordinal = ordinal};
+        break;
+    }
+    pthread_mutex_unlock(&g_cv_audio_probe_mu);
+    return ordinal;
+}
+
+static void cv_audio_probe_count(void *self, int acquire, uint32_t *ordinal, uint64_t *count) {
+    *ordinal = 0; *count = 0;
+    pthread_mutex_lock(&g_cv_audio_probe_mu);
+    for (int i = 0; i < 16; i++) if (g_cv_audio_probe[i].self == self) {
+        *ordinal = g_cv_audio_probe[i].ordinal;
+        *count = acquire ? ++g_cv_audio_probe[i].acquires : ++g_cv_audio_probe[i].decodes;
+        break;
+    }
+    pthread_mutex_unlock(&g_cv_audio_probe_mu);
+}
+
+static cv_audio_probe cv_audio_probe_finalize(void *self) {
+    cv_audio_probe old = {0};
+    pthread_mutex_lock(&g_cv_audio_probe_mu);
+    for (int i = 0; i < 16; i++) if (g_cv_audio_probe[i].self == self) {
+        old = g_cv_audio_probe[i];
+        memset(&g_cv_audio_probe[i], 0, sizeof g_cv_audio_probe[i]);
+        break;
+    }
+    pthread_mutex_unlock(&g_cv_audio_probe_mu);
+    return old;
+}
+
+HLE_FORCE("_ZN5movie12AudioDecoder10InitializeEPvmN2nn5movie13MediaMimeTypeENS_24AudioDecoderOutputFormatENS_14AudioCodecModeE",
+          "selected AV1 movies: pass-through telemetry for the remaining audio-timeline gate",
+          Result, h_cv_movie_audio_initialize, void *self, void *work, size_t work_size,
+          uint32_t mime, uint32_t output_format, uint32_t mode) {
+    typedef Result (*init_fn)(void *, void *, size_t, uint32_t, uint32_t, uint32_t);
+    static init_fn real;
+    if (!real && !(real = (init_fn)guest_sym("_ZN5movie12AudioDecoder10InitializeEPvmN2nn5movie13MediaMimeTypeENS_24AudioDecoderOutputFormatENS_14AudioCodecModeE")))
+        die("movie: AudioDecoder::Initialize missing");
+    Result r = real(self, work, work_size, mime, output_format, mode);
+    if (cv_audio_probe_enabled()) {
+        uint32_t ordinal = cv_audio_probe_initialize(self);
+        LOG("[movie] audio decoder creation #%u: initialize result %#x, mime %u, output %u, mode %u, work %zu bytes",
+            ordinal, r, mime, output_format, mode, work_size);
+    }
+    return r;
+}
+
+HLE_FORCE("_ZN5movie12AudioDecoder11DecodeAsyncEPKN2nn5movie6BufferE",
+          "selected AV1 movies: pass-through telemetry for the remaining audio-timeline gate",
+          Result, h_cv_movie_audio_decode_async, void *self, const void *buffer) {
+    typedef Result (*decode_fn)(void *, const void *);
+    static decode_fn real;
+    if (!real && !(real = (decode_fn)guest_sym("_ZN5movie12AudioDecoder11DecodeAsyncEPKN2nn5movie6BufferE")))
+        die("movie: AudioDecoder::DecodeAsync missing");
+    uint64_t filled; int64_t timestamp; uint32_t flags;
+    cv_movie_buffer_meta(buffer, &filled, &timestamp, &flags);
+    Result r = real(self, buffer);
+    if (cv_audio_probe_enabled()) {
+        uint32_t ordinal; uint64_t count;
+        cv_audio_probe_count(self, 0, &ordinal, &count);
+        if (count == 1 || !(count % 1000) || (flags & CV_MOVIE_EOS_FLAG) || r)
+            LOG("[movie] audio decoder creation #%u: decode %llu result %#x, filled %llu, timestamp %lld, flags %#x, AV1 selected %d",
+                ordinal, (unsigned long long)count, r, (unsigned long long)filled,
+                (long long)timestamp, flags, cv_skip_av1_active());
+    }
+    return r;
+}
+
+HLE_FORCE("_ZN5movie12AudioDecoder17AcquireAudioFrameEPPNS_10AudioFrameEPi",
+          "selected AV1 movies: pass-through telemetry for the remaining audio-timeline gate",
+          Result, h_cv_movie_audio_acquire, void *self, void **frame, int *remaining) {
+    typedef Result (*acquire_fn)(void *, void **, int *);
+    static acquire_fn real;
+    if (!real && !(real = (acquire_fn)guest_sym("_ZN5movie12AudioDecoder17AcquireAudioFrameEPPNS_10AudioFrameEPi")))
+        die("movie: AudioDecoder::AcquireAudioFrame missing");
+    Result r = real(self, frame, remaining);
+    if (cv_audio_probe_enabled()) {
+        uint32_t ordinal; uint64_t count;
+        cv_audio_probe_count(self, 1, &ordinal, &count);
+        void *f = frame ? *frame : NULL;
+        int eos = f ? *(const uint8_t *)((const uint8_t *)f + 16) : 0;
+        if (count == 1 || !(count % 1000) || eos || r)
+            LOG("[movie] audio decoder creation #%u: acquire %llu result %#x, frame %p, remaining %d, EOS %d, AV1 selected %d",
+                ordinal, (unsigned long long)count, r, f, remaining ? *remaining : -1,
+                eos, cv_skip_av1_active());
+    }
+    return r;
+}
+
+HLE_FORCE("_ZN5movie12AudioDecoder8FinalizeEv",
+          "selected AV1 movies: finish pass-through audio-timeline telemetry",
+          Result, h_cv_movie_audio_finalize, void *self) {
+    typedef Result (*finalize_fn)(void *);
+    static finalize_fn real;
+    if (!real && !(real = (finalize_fn)guest_sym("_ZN5movie12AudioDecoder8FinalizeEv")))
+        die("movie: AudioDecoder::Finalize missing");
+    Result r = real(self);
+    if (cv_audio_probe_enabled()) {
+        cv_audio_probe old = cv_audio_probe_finalize(self);
+        LOG("[movie] audio decoder creation #%u: finalize result %#x after %llu decodes / %llu acquires",
+            old.ordinal, r, (unsigned long long)old.decodes, (unsigned long long)old.acquires);
+    }
+    return r;
+}
 
 static vpx_image_t *img_copy(const vpx_image_t *im) {   // an owned I420 copy of a libvpx picture (its buffers are reused by the next decode)
     vpx_image_t *c = vpx_img_alloc(NULL, VPX_IMG_FMT_I420, im->d_w, im->d_h, 1);
@@ -142,6 +591,15 @@ static cv_pool *g_cv_pools[256];   // what a native image handle names (g_cv_mu)
 static Result cv_pool_init(void *t, void *mem, uint64_t size, const cv_pref *p, uint32_t n) {
     cv_pool *o = calloc(1, sizeof *o); o->magic = CV_MAGIC; o->w = p->w; o->h = p->h; o->fmt = p->fmt; o->count = n ? n : 1; o->img = calloc(o->count, sizeof *o->img); o->mem = mem; o->size = size;
     *(cv_pool **)t = o;
+    // Ocarina's NintendoSDK_movie wrapper reads the initialized pool's display
+    // size directly at +0x20/+0x22 when it builds the NV12 presentation frame.
+    // The generic host state above is private and does not otherwise populate
+    // those SDK-visible fields, leaving that frame at its black initializer.
+    if (getenv("DM_CODEC_OOT_POOL_DIMS")) {
+        dm_guest_write_prepare((uint8_t *)t + 0x20, 4);
+        memcpy((uint8_t *)t + 0x20, &p->w, 2);
+        memcpy((uint8_t *)t + 0x22, &p->h, 2);
+    }
     static int once; if (!once++) LOG("[codec] image pool %ux%u format %u, tiling or mode %u, %u picture(s): the host keeps the decoded pictures", p->w, p->h, p->fmt, p->mode, o->count);
     return 0;
 }
@@ -161,6 +619,10 @@ HLE_FORCE("_ZN2nn5codec24FinalizeDecoderImagePoolEPNS0_25VideoDecoderImagePoolTy
 HLE_FORCE("_ZN2nn5codec36GetDecoderImagePoolNativeImageHandleEPKNS0_25VideoDecoderImagePoolTypeEj", "a handle the host's nvnNativeImage knows; the pool keeps its pictures as RGBA from now on",
           uint32_t, h_cv_native, const void *t, uint32_t i) {
     cv_pool *p = pool_of(t); if (!p || i >= p->count) return 0;
+    if (getenv("DM_CODEC_NO_NATIVE_IMAGE")) {
+        static int once; if (!once++) LOG("[codec] DM_CODEC_NO_NATIVE_IMAGE: decoder native images disabled; the player uses ReadDecoderOutputImageNv12");
+        return 0;
+    }
     pthread_mutex_lock(&g_cv_mu);
     if (!p->slot) for (int k = 0; k < 256; k++) if (!g_cv_pools[k]) { g_cv_pools[k] = p; p->slot = k + 1; break; }
     pthread_mutex_unlock(&g_cv_mu);
@@ -226,11 +688,38 @@ HLE_FORCE("_ZN2nn5codec26ReadDecoderOutputImageRgbaEPKNS0_25VideoDecoderImagePoo
 HLE_FORCE("_ZN2nn5codec26ReadDecoderOutputImageNv12EPKNS0_25VideoDecoderImagePoolTypeEjttttPvmmS4_mm", "converts the host's picture (md_nv12)",
           Result, h_cv_nv12, const void *t, uint32_t i, uint16_t x, uint16_t y, uint16_t w, uint16_t h, void *ydst, uint64_t ystride, uint64_t ysize, void *uvdst, uint64_t uvstride, uint64_t uvsize) {
     cv_pool *p = pool_of(t); const vpx_image_t *im = p && i < p->count ? p->img[i] : NULL;
+    if (cv_trace_on()) {
+        static unsigned reads;
+        unsigned n = __atomic_add_fetch(&reads, 1, __ATOMIC_RELAXED);
+        if (n <= 16 || !(n % 60)) {
+            unsigned lo = 255, hi = 0; uint64_t sum = 0, samples = 0;
+            if (im && im->planes[0]) for (unsigned yy = 0; yy < im->d_h; yy += 32)
+                for (unsigned xx = 0; xx < im->d_w; xx += 32) {
+                    unsigned v = im->planes[0][(size_t)yy * im->stride[0] + xx];
+                    if (v < lo) lo = v; if (v > hi) hi = v; sum += v; samples++;
+                }
+            LOG("[codec-trace] nv12 read %u pool %p image %u/%u -> Y %p UV %p: %s, luma %u..%u mean %.2f",
+                n, (void *)p, i, p ? p->count : 0, ydst, uvdst, im ? "decoded" : "missing",
+                samples ? lo : 0, samples ? hi : 0, samples ? (double)sum / samples : 0.0);
+        }
+    }
     if (x || y || ystride != w || uvstride != w || ysize < (uint64_t)w * h || uvsize < (uint64_t)w * h / 2) { static int once; if (!once++) LOG("[RED] nn::codec::ReadDecoderOutputImageNv12: region %u,%u strides %llu / %llu: only whole tight pictures are served", x, y, (unsigned long long)ystride, (unsigned long long)uvstride); return 0; }
+    // These are guest buffers.  The graphics layer can have their pages
+    // write-protected for dirty tracking after an earlier buffer-to-texture
+    // upload; announce the host write before touching them so the next B2T
+    // sees this decoded frame instead of the buffers' initial black contents.
+    dm_guest_write_prepare(ydst, (size_t)w * h);
+    dm_guest_write_prepare(uvdst, (size_t)w * h / 2);
     if (!im) { memset(ydst, 16, ysize); memset(uvdst, 128, uvsize); return 0; }
-    if ((uint8_t *)uvdst == (uint8_t *)ydst + (size_t)w * h) { md_nv12(im, ydst, w, h); return 0; }
+    if ((uint8_t *)uvdst == (uint8_t *)ydst + (size_t)w * h) {
+        md_nv12(im, ydst, w, h);
+        cv_present_remember(ydst, w, h);
+        return 0;
+    }
     uint8_t *tmp = malloc((size_t)w * h * 3 / 2); md_nv12(im, tmp, w, h);
-    memcpy(ydst, tmp, (size_t)w * h); memcpy(uvdst, tmp + (size_t)w * h, (size_t)w * h / 2); free(tmp);
+    memcpy(ydst, tmp, (size_t)w * h); memcpy(uvdst, tmp + (size_t)w * h, (size_t)w * h / 2);
+    cv_present_remember(tmp, w, h);
+    free(tmp);
     return 0;
 }
 
@@ -250,17 +739,27 @@ static void cv_open(cv_dec *d) {   // (re)creates the codec state: a new stream 
 }
 static Result cv_dec_init(void *t, int codec, uint16_t w, uint16_t h, uint32_t in, uint32_t out, const void *csd, uint64_t csd_n) {
     cv_dec *d = calloc(1, sizeof *d);
-    d->magic = CV_MAGIC; d->codec = codec; d->w = w; d->h = h; pthread_mutex_init(&d->mu, NULL);
+    d->magic = CV_MAGIC; d->codec = codec; d->w = w; d->h = h; d->acquire_reserves = (uint8_t)cv_acquire_reserves_enabled(); pthread_mutex_init(&d->mu, NULL);
     if (csd && csd_n && csd_n < (1u << 20)) { d->csd = malloc((size_t)csd_n); memcpy(d->csd, csd, (size_t)csd_n); d->csd_n = (size_t)csd_n; }
     cv_open(d);
     pthread_mutex_lock(&g_cv_mu);
+    if (codec == CV_AV1) {
+        d->av1_ordinal = ++g_cv_av1_ordinal;
+        d->skip_av1 = cv_skip_av1_selected(d->av1_ordinal);   // set before g_cv publishes the decoder to other threads
+    }
     for (int i = 0; i < 16; i++) if (!g_cv[i]) { g_cv[i] = d; d->id = (uint32_t)i + 1; break; }
     pthread_mutex_unlock(&g_cv_mu);
+    // A later unselected AV1 creation closes the finite selector window. Clear
+    // any remembered extractor even if this title omitted Stop / Finalize, so
+    // an address reused by an in-game movie cannot inherit cached EOS.
+    if (codec == CV_AV1 && !d->skip_av1) cv_skip_extractor_clear_all();
     if (!d->id) die("nn::codec: more than 16 video decoders");
     d->event = (uint8_t *)t + CV_EVENT_OFF; hle_bind_system_event(d->event, 0); hle_signal_system_event(d->event);
     *(cv_dec **)t = d;
     LOG("[codec] %s decoder %u: %ux%u, input format %u, output format %u%s (%s on the host)", k_cv_name[codec], d->id, w, h, in, out,
         d->csd_n ? ", with parameter sets" : "", codec == CV_AV1 ? mav1_backend(d->av1) : codec == CV_H264 ? "VideoToolbox" : "libvpx");
+    if (d->acquire_reserves) LOG("[codec] decoder %u: DM_CODEC_ACQUIRE_RESERVES enabled; Acquire waits for the next picture, Release frees it", d->id);
+    if (d->skip_av1) LOG("[codec] AV1 decoder creation #%u (slot %u) selected by DM_CODEC_SKIP_AV1: fast EOS on first submit", d->av1_ordinal, d->id);
     return 0;
 }
 static Result cv_dec_fin(void *t) {
@@ -281,7 +780,7 @@ static Result cv_dec_fin(void *t) {
 static Result cv_dec_reg(void *t, uint32_t i, void *pool, uint32_t pidx) {
     cv_dec *d = cv_of(t); if (!d || i >= CV_BUFS) { LOG("[RED] nn::codec::Register…DecoderBuffer index %u", i); return CV_R(2004); }
     pthread_mutex_lock(&d->mu);
-    d->buf[i].pool = pool_of(pool); d->buf[i].pidx = pidx; d->buf[i].reg = 1; d->buf[i].filled = 0; d->buf[i].gen = 0; d->buf[i].filled_gen = 0;
+    d->buf[i].pool = pool_of(pool); d->buf[i].pidx = pidx; d->buf[i].reg = 1; d->buf[i].filled = 0; d->buf[i].reserved = 0; d->buf[i].gen = 0; d->buf[i].filled_gen = 0;
     if (d->fcount < 8) { d->fifo[(d->fhead + d->fcount) % 8] = i; d->fcount++; } else LOG("[RED] nn::codec: acquirable queue full at register %u", i);
     pthread_mutex_unlock(&d->mu);
     return 0;
@@ -295,7 +794,7 @@ static void cv_drop_index(uint32_t *q, uint32_t *head, uint32_t *count, uint32_t
 static Result cv_dec_unreg(void *t, uint32_t i) {   // the buffer leaves the decoder: no longer acquirable, filled or waited for
     cv_dec *d = cv_of(t); if (!d || i >= CV_BUFS) return CV_R(2004);
     pthread_mutex_lock(&d->mu);
-    d->buf[i].reg = 0; d->buf[i].filled = 0; d->buf[i].pool = NULL; d->buf[i].gen++;
+    d->buf[i].reg = 0; d->buf[i].filled = 0; d->buf[i].reserved = 0; d->buf[i].pool = NULL; d->buf[i].gen++;
     cv_drop_index(d->fifo, &d->fhead, &d->fcount, 8, i); cv_drop_index(d->pend, &d->phead, &d->pcount, CV_BUFS, i);
     pthread_mutex_unlock(&d->mu);
     return 0;
@@ -304,7 +803,7 @@ static Result cv_dec_reset(void *t) {   // Stop / Flush: pictures not yet given 
     cv_dec *d = cv_of(t); if (!d) return 0;
     pthread_mutex_lock(&d->mu);
     for (int i = 0; i < d->nheld; i++) vpx_img_free(d->held[i]);
-    d->nheld = 0; d->eos_pending = 0;
+    d->nheld = 0; d->eos_pending = 0; d->skip_eos_sent = 0;
     cv_open(d);
     if (d->event) hle_signal_system_event(d->event);
     pthread_mutex_unlock(&d->mu);
@@ -350,6 +849,18 @@ static vpx_image_t *av1_to_i420(const mav1_picture *p) {   // the decoder's NV12
 static Result cv_dec_submit(uint64_t *out, void *t, const void *data, uint64_t size, int64_t ts, bool eos) {
     cv_dec *d = cv_of(t); if (!d) return CV_R(2004);
     pthread_mutex_lock(&d->mu);
+    if (cv_trace_take()) LOG("[codec-trace] submit dec %u size %llu ts %lld eos %d; held %d pend %u free %u",
+                             d->id, (unsigned long long)size, (long long)ts, eos, d->nheld, d->pcount, d->fcount);
+    if (d->skip_av1) {
+        *out = ++d->submits;
+        if (!d->skip_eos_sent) {
+            d->skip_eos_sent = 1; d->eos_pending = 1;
+            LOG("[codec] AV1 decoder creation #%u (slot %u): fast EOS delivered after 0 pictures", d->av1_ordinal, d->id);
+        }
+        drain(d, 1);   // keep submission-ready signalled until the client observes EOS; no further EOS is queued
+        pthread_mutex_unlock(&d->mu);
+        return 0;
+    }
     if (d->nheld >= CV_HOLD) { static int n; if (n++ < 4) LOG("nn::codec %s: busy (result 3603), a packet refused with %d pictures waiting for a released buffer",k_cv_name[d->codec], d->nheld); if (d->event) hle_clear_system_event(d->event); pthread_mutex_unlock(&d->mu); return CV_BUSY; }
     int got = 0;
     if (d->codec == CV_H264 && d->avc) {   // VideoToolbox reorders: pictures leave in presentation order, all of them at the end of the stream
@@ -378,13 +889,40 @@ static Result cv_dec_acq(uint32_t *idx, cv_sync *sync, void *t) {
     pthread_mutex_lock(&d->mu);
     if (!d->fcount) { pthread_mutex_unlock(&d->mu); return CV_NONE; }
     uint32_t i = d->fifo[d->fhead]; d->fhead = (d->fhead + 1) % 8; d->fcount--;
+    if (d->acquire_reserves) {
+        d->buf[i].gen++; d->buf[i].filled = 0; d->buf[i].reserved = 1;
+        if (d->pcount < CV_BUFS) { d->pend[(d->phead + d->pcount) % CV_BUFS] = i; d->pcount++; }
+        else {   // Cannot happen with CV_BUFS registered buffers, but do not strand the index if state was corrupted.
+            d->buf[i].reserved = 0;
+            d->fifo[(d->fhead + d->fcount) % 8] = i; d->fcount++;
+            pthread_mutex_unlock(&d->mu);
+            return CV_NONE;
+        }
+        drain(d, 0);   // a picture submitted before this reservation can satisfy it immediately
+    }
     *idx = i; *sync = (cv_sync){CV_SYNC, d->id, i, d->buf[i].gen};
+    if (cv_trace_take()) LOG("[codec-trace] acquire dec %u index %u gen %u filled %d; held %d pend %u free %u",
+                             d->id, i, d->buf[i].gen, d->buf[i].filled, d->nheld, d->pcount, d->fcount);
     pthread_mutex_unlock(&d->mu);
     return 0;
 }
 static void cv_dec_rel(void *t, uint32_t i, cv_sync sync) {
     (void)sync; cv_dec *d = cv_of(t); if (!d || i >= CV_BUFS || !d->buf[i].reg) { LOG("[RED] nn::codec::Release…DecoderOutputBuffer index %u", i); return; }
     pthread_mutex_lock(&d->mu);
+    if (cv_trace_take()) LOG("[codec-trace] release dec %u index %u handle-gen %u current-gen %u filled %d; held %d pend %u free %u",
+                             d->id, i, sync.gen, d->buf[i].gen, d->buf[i].filled, d->nheld, d->pcount, d->fcount);
+    if (d->acquire_reserves) {
+        if (d->buf[i].reserved) {
+            if (!d->buf[i].filled) cv_drop_index(d->pend, &d->phead, &d->pcount, CV_BUFS, i);
+            d->buf[i].reserved = 0; d->buf[i].filled = 0;
+            // A release also completes a stale/cancelled wait for this generation.
+            d->buf[i].filled_gen = d->buf[i].gen; spt_fire(d, i);
+            if (d->fcount < 8) { d->fifo[(d->fhead + d->fcount) % 8] = i; d->fcount++; }
+            else LOG("[RED] nn::codec: acquirable queue full at release %u", i);
+        }
+        pthread_mutex_unlock(&d->mu);
+        return;
+    }
     d->buf[i].gen++; d->buf[i].filled = 0;
     if (d->pcount < CV_BUFS) { d->pend[(d->phead + d->pcount) % CV_BUFS] = i; d->pcount++; }
     if (d->fcount < 8) { d->fifo[(d->fhead + d->fcount) % 8] = i; d->fcount++; } else LOG("[RED] nn::codec: acquirable queue full at release %u", i);
@@ -396,6 +934,9 @@ static Result cv_dec_props(uint16_t *w, uint16_t *h, uint16_t *cw, uint16_t *ch,
     pthread_mutex_lock(&d->mu);
     int ok = d->buf[i].filled;
     if (ok) { *w = *cw = d->buf[i].w; *h = *ch = d->buf[i].h; *ts = d->buf[i].ts; *eos = d->buf[i].eos != 0; }
+    if (cv_trace_take()) LOG("[codec-trace] props dec %u index %u: %s gen %u filled-gen %u ts %lld; held %d pend %u free %u",
+                             d->id, i, ok ? "filled" : "empty", d->buf[i].gen, d->buf[i].filled_gen,
+                             ok ? (long long)d->buf[i].ts : -1ll, d->nheld, d->pcount, d->fcount);
     pthread_mutex_unlock(&d->mu);
     return ok ? 0 : CV_NONE;
 }
@@ -524,12 +1065,18 @@ static bool sync_reached(const cv_sync *s) {
     pthread_mutex_lock(&g_cv_mu);   // held until the decoder's lock is: FinalizeVp9Decoder cannot free it in between
     cv_dec *d = s->dec && s->dec <= 16 ? g_cv[s->dec - 1] : NULL;
     bool r = true;
-    if (d && s->idx < CV_BUFS) { pthread_mutex_lock(&d->mu); r = d->buf[s->idx].filled && d->buf[s->idx].filled_gen >= s->gen; pthread_mutex_unlock(&d->mu); }
+    if (d && s->idx < CV_BUFS) {
+        pthread_mutex_lock(&d->mu);
+        r = d->buf[s->idx].filled_gen >= s->gen && (d->buf[s->idx].filled || (d->acquire_reserves && !d->buf[s->idx].reserved));
+        pthread_mutex_unlock(&d->mu);
+    }
     pthread_mutex_unlock(&g_cv_mu);
     return r;
 }
 HLE_FORCE("_ZN2nn2gs17TryWaitNativeSyncERKNS0_16NativeSyncHandleE", "decoder sync handles are the host's (hle_codec_video.c)", bool, h_gs_trywait, const cv_sync *s) {
-    return sync_reached(s);
+    bool r = sync_reached(s);
+    if (cv_trace_take()) LOG("[codec-trace] trywait sync %#x dec %u index %u gen %u: %s", s->magic, s->dec, s->idx, s->gen, r ? "ready" : "waiting");
+    return r;
 }
 HLE_FORCE("_ZN2nn6syncpt3sdk20CreateSyncPointEventEPNS1_18SyncPointEventTypeE", "a host-bound SystemEvent inside the event type", Result, h_spt_create, void *e) {
     memset(e, 0, 0x58); hle_bind_system_event(e, 0); SPT(e)->magic = CV_SYNC;
@@ -541,6 +1088,7 @@ HLE_FORCE("_ZN2nn6syncpt3sdk25InitializeMultiWaitHolderEPNS_2os19MultiWaitHolder
 }
 HLE_FORCE("_ZN2nn6syncpt3sdk21RequestSyncPointEventEPNS1_18SyncPointEventTypeERKNS1_15SyncPointHandleE", "signalled when the decoder fills the awaited buffer",
           Result, h_spt_request, void *e, const cv_sync *s) {
+    if (cv_trace_take()) LOG("[codec-trace] syncpoint request %#x dec %u index %u gen %u", s->magic, s->dec, s->idx, s->gen);
     spt_unarm(e); hle_clear_system_event(e);
     SPT(e)->want = *s; SPT(e)->armed = 1;
     pthread_mutex_lock(&g_spt_mu); int k = 0; while (k < 64 && g_spt[k]) k++; if (k < 64) g_spt[k] = e; pthread_mutex_unlock(&g_spt_mu);

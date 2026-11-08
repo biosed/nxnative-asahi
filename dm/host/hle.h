@@ -67,6 +67,12 @@ typedef struct { const char *name; void *fn; const char *why; } hle_force_ent;
             DM_ASM_ADDR("x16", cname) "    b " DM_ASM_SYM(dm_bigstack_enter) "\n"); \
     __attribute__((used, DM_SECTION(swforce))) static const hle_force_ent hle_force_##cname = {mangled, (void *)(uintptr_t)cname##_bs, why}; \
     static ret cname(__VA_ARGS__)
+// Hibernation registration tables used by the newer cross-platform host
+// sources.  Ordinary runs leave their hooks disabled, but the tables must
+// remain present and serializable when hibernation is compiled in.
+typedef struct { void *p; size_t n; const char *name; } hib_static_ent;
+#define HLE_HIB_STATIC(var) __attribute__((used, DM_SECTION(swhibst))) static const hib_static_ent hib_static_##var = {(void *)&(var), sizeof(var), #var};
+#define HLE_HIB_RESTARTABLE(cname) __attribute__((used, DM_SECTION(swrestart))) static void *const hib_restart_##cname = (void *)cname;
 // The game's call site inside a HLE_FORCE_BIG implementation: pass __builtin_return_address(0), which after a stack switch is the entry's own (hle_bigstack.c)
 void *dm_bigstack_caller(void *ra);
 

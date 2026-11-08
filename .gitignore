@@ -11,3 +11,6 @@ dm/games/*/cb_extent.tsv
 .coverage
 .coverage.*
 /coverage.json
+
+# Build output of the Linux tree: never committed
+dm/linux/gen/

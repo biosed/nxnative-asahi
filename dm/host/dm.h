@@ -61,6 +61,7 @@ typedef struct {
     uint64_t back_off, back_len;   // a second patch area after the image (patch_nso.py TWO: a text longer than a B reaches), inside size; 0 = none
     char build_id[33];         // First 16 bytes of the NSO build ID (hex); empty for older build outputs
     unsigned key_idx[4];       // key page index of each thread slot (K18, KTLS, KTLR, KGATE)
+    unsigned tp_slot;          // fixups TP_SLOT: 0 = pthread TSD, 2 = behind Android's TLS_SLOT_APP
     const Elf64_Dyn *dyn;
     const Elf64_Sym *symtab;
     const char *strtab;
@@ -83,6 +84,36 @@ extern int g_nmod;
 static inline const char *dm_main_build(void) { for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, "main")) return g_mod[i].build_id; return ""; }
 // Four thread-local slots: K18 = the Switch's x18, KTLS = tpidr_el0, KTLR = tpidrro_el0 (ThreadLocalRegion), KGATE = host gate entry; the actual key numbers are written into the key page by the loader
 extern pthread_key_t g_key18, g_keytls, g_keytlr, g_keygate;
+#ifdef __ANDROID__
+void dm_slot_set(pthread_key_t k, const void *v);
+static inline void *dm_slot_get(pthread_key_t k) { void **tp; __asm__ volatile("mrs %0, tpidr_el0" : "=r"(tp)); void **b = tp[2]; return b ? b[k] : NULL; }
+#else
+#define dm_slot_set pthread_setspecific
+#define dm_slot_get pthread_getspecific
+#endif
+
+// Optional hibernation hooks.  These weak defaults leave ordinary runs on the
+// existing allocation/mapping path; hle_hib installs them before main when
+// hibernation is enabled.
+__attribute__((weak)) void *(*dm_hib_alloc_hook)(size_t size) = 0;
+__attribute__((weak)) int (*dm_hib_free_hook)(void *p) = 0;
+static inline void *dm_hib_calloc(size_t size) { return dm_hib_alloc_hook ? dm_hib_alloc_hook(size) : NULL; }
+static inline int dm_hib_free(void *p) { return p && dm_hib_free_hook && dm_hib_free_hook(p); }
+__attribute__((weak)) void *(*dm_hib_guest_as_hook)(size_t len) = 0;
+__attribute__((weak)) void *(*dm_hib_module_map_hook)(size_t len) = 0;
+__attribute__((weak)) void *(*dm_hib_thunk_hook)(void *fn) = 0;
+__attribute__((weak)) void (*dm_hib_ctl_hook)(const char *cmd) = 0;
+__attribute__((weak)) void (*dm_hib_call_hook)(void (*fn)(void *), void *arg) = 0;
+__attribute__((weak)) void (*dm_hib_native_hold_hook)(pthread_mutex_t *held) = 0;
+static inline void dm_hib_hold_here(pthread_mutex_t *held) { if (dm_hib_native_hold_hook) dm_hib_native_hold_hook(held); }
+__attribute__((weak)) void (*dm_hib_suspend_hook)(int on) = 0;
+__attribute__((weak)) void (*dm_hib_kick_hook)(void) = 0;
+__attribute__((weak)) void (*dm_hib_forget_hook)(void) = 0;
+__attribute__((weak)) void (*dm_hib_flush_hook)(void) = 0;
+__attribute__((weak)) void (*dm_hib_refused_hook)(void) = 0;
+__attribute__((weak)) void (*dm_hib_resume_frame_hook)(const uint64_t *frame, int mode) = 0;
+static inline void dm_hib_suspend(int on) { if (dm_hib_suspend_hook) dm_hib_suspend_hook(on); }
+__attribute__((weak)) _Atomic int dm_hib_parking_now = 0;
 
 void load_modules(const char *dir, const char **names, int n);
 const char *dm_module_dir(void);   // the folder load_modules read the modules and the rewriter's tables from (the cheat engine reads main.changed.tsv there)

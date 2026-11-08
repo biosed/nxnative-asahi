@@ -16,7 +16,7 @@
 # An update's RomFS is packed on its own, never laid over the base: the dumps NUPs are packed from hold the patched RomFS of an update (pack_dump.py); an update with no romfs/ uses the base's.
 # Every file read is checked against its SHA-256. A repeat run keeps code modules whose content is the same and an image made from the same container tree by the same packer.
 # Needs the zstd module: compression.zstd (Python 3.14+) or backports.zstd, as the NSP script.
-# Usage: pack_nup.py <game.nup> [--version N] [--work-dir DIR]   (exit 1 on error)
+# Usage: pack_nup.py <game.nup> [--version N] [--work-dir DIR] [--exefs-only]   (exit 1 on error)
 import argparse, hashlib, mmap, os, shutil, struct, sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'dm/tools'))
@@ -300,13 +300,13 @@ def romfs_of(k, base):   # the RomFS folder a version runs with: its own, or the
     return d
 
 
-def pack_version(n, k, base, app, out, say=print):   # one version (the base package, or an update package) → out/ExeFS, out/RomFS.img and its control data
+def pack_version(n, k, base, app, out, say=print, exefs_only=False):   # one version (the base package, or an update package) → out/ExeFS, out/RomFS.img and its control data
     if k.exefs == NO_DIR or n.child(k.exefs, b'main') is None or n.child(k.exefs, b'main.npdm') is None: raise Error(f'{k.name}: no exefs/main and exefs/main.npdm')
     if (pid := program_id(n.read(n.child(k.exefs, b'main.npdm')), f'{k.name} exefs/main.npdm')) != app: raise Error(f'{k.name}: program ID {pid:016X}, the base is {app:016X}')
     d = romfs_of(k, base)
     out.mkdir(parents=True, exist_ok=True)
     exefs(n, k, out / 'ExeFS')
-    pack(n, d, out / 'RomFS.img', say)
+    if not exefs_only: pack(n, d, out / 'RomFS.img', say)
     control(k, out, app_package(n) if base is None else None)
 
 
@@ -323,6 +323,7 @@ def main():
     ap.add_argument('nup', type=Path, help='the .nup file')
     ap.add_argument('--version', type=int, help='the update version to pack (default: the newest in the container; 0 = the base game)')
     ap.add_argument('--work-dir', type=Path, help='the build folder (default: <folder of the .nup>/<title ID>_build)')
+    ap.add_argument('--exefs-only', action='store_true', help='extract only ExeFS and control metadata, without the large RomFS/DLC images')
     a = ap.parse_args()
     path = a.nup.resolve()
     try:
@@ -337,10 +338,10 @@ def main():
             out = work / 'extract' / f'v{ver}'
             print(f'{app:016X} version {ver}: {k.name}', flush=True)
             say = lambda s: print(s, flush=True)
-            pack_version(n, k, base, app, out, say)
-            pack_dlc(n, app, dlc, work / 'aoc', say)
+            pack_version(n, k, base, app, out, say, a.exefs_only)
+            if not a.exefs_only: pack_dlc(n, app, dlc, work / 'aoc', say)
     except (Error, OSError) as e: sys.exit(f'[RED] {e}')
-    print(f'done: {out}' + (f', {len(dlc)} DLC in {work / "aoc"}' if dlc else ''))
+    print(f'done: {out}' + (' (ExeFS only)' if a.exefs_only else f', {len(dlc)} DLC in {work / "aoc"}' if dlc else ''))
 
 
 if __name__ == '__main__':

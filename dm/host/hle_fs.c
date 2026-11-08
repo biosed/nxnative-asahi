@@ -18,6 +18,7 @@
 #include <sys/xattr.h>
 #include "romfs_image.h"
 #include "save_sync.h"
+#include "fs_error_rate.h"
 
 // Every take-over in this file runs on the big host stack (hle_bigstack.c): path buffers are sized by PATH_MAX and one file open takes 6-7 KB of stack, while a game's save thread can have as little as 8 KB (Super Mario 3D World + Bowser's Fury)
 #undef HLE_FORCE
@@ -468,7 +469,12 @@ static void save_old_names(const char *from, const char *to) {
 static Result err_res(const char *op, const char *path) {
     if (errno == ENOENT || errno == ENOTDIR) { if (g_flag.fs) LOG("fs %s not found: %s", op, path); return RES_PATH_NOT_FOUND; }   // Logged under DM_FS=1 (the game often probes with "not found", not logged by default)
     if (errno == EEXIST) return RES_PATH_EXISTS;
-    LOG("fs %s %s failed errno=%d", op, path, errno); return RES_FAIL;
+    int e = errno; static fs_error_rate rate = FS_ERROR_RATE_INIT; uint64_t count;
+    if (fs_error_rate_hit(&rate, op, path, e, &count)) {
+        if (count == 1) LOG("fs %s %s failed errno=%d", op, path, e);
+        else LOG("fs %s %s failed errno=%d (identical failure #%llu; intervening repeats suppressed)", op, path, e, (unsigned long long)count);
+    }
+    errno = e; return RES_FAIL;
 }
 // Name resolution shares one lock with create/rename/enumerate, aliases and xattr are published to the guest together.
 #define HP_EX(path, create) PATH_LOCK(); char hp[1024]; int ro = 0; if (!host_path_ex(path, hp, sizeof hp, &ro, create)) return err_res("path", path)
@@ -784,9 +790,31 @@ HLE_FORCE("_ZN2nn2fs7UnmountEPKc", "fsp-srv; host mounts are permanent, a no-op;
 }
 
 // ---------- Files ----------
+// Development option for reaching gameplay without entering the title's movie
+// player.  Ocarina opens each WebM through nn::fs before it constructs the
+// video and audio decoders; PathNotFound is its ordinary "no movie" path.  The
+// check is deliberately limited to read-only mounts and exact .webm names.
+// DM_MOVIES=off hides every movie; DM_MOVIES=opening hides only the long New
+// Game opening, retaining the title/menu movies.  Normal game audio is not
+// touched.
+static int fs_movie_off(const char *path) {
+    if (!path) return 0;
+    size_t n = strlen(path);
+    if (n < 5 || strcmp(path + n - 5, ".webm")) return 0;
+    const char *mode = getenv("DM_MOVIES");
+    if (!mode) return 0;
+    if (!strcmp(mode, "off")) return 1;
+    static const char opening[] = "Dm_Kokiri_0000.webm";
+    return !strcmp(mode, "opening") && n >= sizeof opening - 1 && !strcmp(path + n - (sizeof opening - 1), opening);
+}
+
 HLE_FORCE("_ZN2nn2fs8OpenFileEPNS0_10FileHandleEPKci", "fsp-srv → open(2)", Result, h_fs_OpenFile, uint64_t *out, const char *path, int mode) { dm_thread_service_request();
     int mi; int64_t k;
     if (img_path(path, &mi, &k)) {
+        if (g_mnt[mi].ro && fs_movie_off(path)) {
+            LOG("fs movie skipped by DM_MOVIES=%s: %s", getenv("DM_MOVIES"), path);
+            return RES_PATH_NOT_FOUND;
+        }
         if (k < 0) return err_res("open", path);
         if (!g_mnt[mi].img->e[k].type) return RES_PATH_NOT_FOUND;
         if (mode & (MODE_WRITE | MODE_APPEND)) { LOG("fs write to a read-only mount: %s", path); return RES_FAIL; }
@@ -798,6 +826,10 @@ HLE_FORCE("_ZN2nn2fs8OpenFileEPNS0_10FileHandleEPKci", "fsp-srv → open(2)", Re
         return RES_OK;
     }
     HP(path);
+    if (ro && fs_movie_off(path)) {
+        LOG("fs movie skipped by DM_MOVIES=%s: %s", getenv("DM_MOVIES"), path);
+        return RES_PATH_NOT_FOUND;
+    }
     if (mode & (MODE_WRITE | MODE_APPEND)) RW();
     int fd = open(hp, (mode & (MODE_WRITE | MODE_APPEND)) ? ((mode & MODE_READ) ? O_RDWR : O_WRONLY) : O_RDONLY);
     if (fd < 0) return err_res("open", hp);
