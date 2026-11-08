@@ -160,8 +160,23 @@ namespace Ryujinx.Graphics.Shader.Translation
 
         internal int GetDepthRegister()
         {
-            // The depth register is always two registers after the last color output.
-            return BitOperations.PopCount((uint)Definitions.OmapTargets) + 1;
+            // nxnative: colours occupy four registers per render target with
+            // any component enabled. They are followed by the sample-mask
+            // register and then depth. Counting enabled components agreed
+            // only when every enabled target wrote all four. Ocarina of
+            // Time's agl_common depth pass maps RT0 RGBA and RT2 R (0x10f),
+            // and consequently writes depth to R9 rather than R6.
+            int targets = 0;
+
+            for (int rt = 0; rt < 8; rt++)
+            {
+                if ((Definitions.OmapTargets & (0xf << (rt * 4))) != 0)
+                {
+                    targets++;
+                }
+            }
+
+            return targets * 4 + 1;
         }
 
         public void SetLayerOutputAttribute(int attr)
