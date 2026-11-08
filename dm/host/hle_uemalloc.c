@@ -25,6 +25,7 @@
 #include "hle.h"
 #include <malloc/malloc.h>
 #include <mach/mach.h>
+#include <stdbool.h>
 #include <stdatomic.h>
 
 // Slot layouts: which slots the host fills and which do nothing (up to 6; 0 ends the list); the others keep the guest's own functions

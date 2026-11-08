@@ -19,7 +19,30 @@ void hle_signal_system_event(void *e) { g_ev[ev_slot(e)].set = 1; }
 void hle_clear_system_event(void *e) { g_ev[ev_slot(e)].set = 0; }
 static int ev_set(void *e) { return g_ev[ev_slot(e)].set; }
 static void destroy_ev(void *e) { g_ev[ev_slot(e)].bound = g_ev[ev_slot(e)].set = 0; }   // nn::os::DestroySystemEvent: closing the handle unbinds the event
-void *guest_sym(const char *n) { return !strcmp(n, "_ZN2nn2os18DestroySystemEventEPNS0_15SystemEventTypeE") ? (void *)destroy_ev : NULL; }
+static int movie_read_calls[2], movie_read_pos[2], movie_read_past_eos, movie_stop_calls, movie_seek_calls, movie_finalize_calls;
+static Result movie_read(void *self, void *buffer, int track) {
+    (void)self; assert(track >= 0 && track < 2); movie_read_calls[track]++;
+    int p = ++movie_read_pos[track];
+    if (p > 4) movie_read_past_eos++;
+    uint64_t filled = p <= 3 ? (uint64_t)p * 17 : 0;
+    int64_t timestamp = p <= 3 ? (int64_t)p * 1000000 : -1000;
+    uint32_t flags = p >= 3 ? CV_MOVIE_EOS_FLAG : 0;   // final data sample first, then the empty terminal response
+    cv_movie_buffer_set_meta(buffer, filled, timestamp, flags);
+    return p <= 3 ? 0 : CV_MOVIE_EOS_RESULT;
+}
+static Result movie_stop(void *self) { (void)self; movie_stop_calls++; memset(movie_read_pos, 0, sizeof movie_read_pos); return 0; }
+static Result movie_seek(void *self, int64_t timestamp, uint32_t mode) {
+    (void)self; assert(timestamp == 123456789 && mode == 2); movie_seek_calls++; memset(movie_read_pos, 0, sizeof movie_read_pos); return 0;
+}
+static Result movie_finalize(void *self) { (void)self; movie_finalize_calls++; memset(movie_read_pos, 0, sizeof movie_read_pos); return 0; }
+void *guest_sym(const char *n) {
+    if (!strcmp(n, "_ZN2nn2os18DestroySystemEventEPNS0_15SystemEventTypeE")) return (void *)destroy_ev;
+    if (!strcmp(n, "_ZN2nn5movie14MediaExtractor11ReadSamplesEPNS0_6BufferEi")) return (void *)movie_read;
+    if (!strcmp(n, "_ZN2nn5movie14MediaExtractor4StopEv")) return (void *)movie_stop;
+    if (!strcmp(n, "_ZN2nn5movie14MediaExtractor6SeekToENS_8TimeSpanENS0_8SeekModeE")) return (void *)movie_seek;
+    if (!strcmp(n, "_ZN2nn5movie14MediaExtractor8FinalizeEv")) return (void *)movie_finalize;
+    return NULL;
+}
 static vpx_image_t *black_i420(unsigned w, unsigned h) {
     vpx_image_t *c = vpx_img_alloc(NULL, VPX_IMG_FMT_I420, w, h, 1); if (!c) return NULL;
     memset(c->planes[0], 16, (size_t)c->stride[0] * h);
@@ -136,6 +159,37 @@ int main(void) {
     assert(!h_cv_vp9init2(dec, 0x10000, 16, 16, 1, 1, 3) && cv_of(dec) && g_ev[ev_slot(ev)].bound && ev_set(ev));
     assert(!h_cv_vp9fin(dec) && !cv_of(dec) && !g_ev[ev_slot(ev)].bound);
     for (int i = 0; i < 3; i += 2) { h_cv_poolfin(pool[i]); assert(!pool_of(pool[i])); }
+    // Opt-in AV1 fast-forward: a selected decoder turns only its first input into one empty EOS. Later queued inputs are swallowed,
+    // and Stop / Flush re-arms that same selected decoder for a loop or seek. With the variable absent, the ordinary AV1 test below decodes normally.
+    {   uint8_t ds[0x400] = {0}, ps[0x40] = {0}; void *pm = NULL; uint64_t sz, al, sid; uint32_t si; cv_sync ss;
+        cv_pref sp = h_cv_pref(64, 64, 3, 0); assert(!h_cv_poolsize(&sz, &al, &sp, 1)); assert(!posix_memalign(&pm, al, sz)); memset(pm, 0, sz);
+        assert(!h_cv_pool(ps, pm, sz, &sp, 1, 0)); setenv("DM_CODEC_SKIP_AV1", "1", 1);
+        assert(!cv_dec_init(ds, CV_AV1, 64, 64, 3, 3, NULL, 0)); cv_dec *sd = cv_of(ds); assert(sd && sd->av1_ordinal == 1 && sd->skip_av1);
+        assert(!cv_dec_reg(ds, 0, ps, 0) && !cv_dec_acq(&si, &ss, ds) && si == 0); cv_dec_rel(ds, 0, ss); assert(!cv_dec_acq(&si, &ss, ds) && !h_gs_trywait(&ss));
+        assert(!cv_dec_submit(&sid, ds, av1, sizeof av1, 1234, false) && sid == 1 && !sd->nheld && !sd->eos_pending && h_gs_trywait(&ss));
+        assert(!cv_dec_props(&w, &h, &cw, &ch, &ts, &eos, ds, 0) && eos && !w && !h && sd->pictures == 0);
+        assert(!cv_dec_submit(&sid, ds, av1, sizeof av1, 5678, false) && sid == 2 && sd->pictures == 0);   // no second EOS or picture
+        assert(!cv_dec_reset(ds) && !sd->skip_eos_sent); cv_dec_rel(ds, 0, ss); assert(!cv_dec_acq(&si, &ss, ds) && !h_gs_trywait(&ss));
+        assert(!cv_dec_submit(&sid, ds, av1, sizeof av1, 9012, false) && sid == 3 && h_gs_trywait(&ss));
+        assert(!cv_dec_props(&w, &h, &cw, &ch, &ts, &eos, ds, 0) && eos && !w && !h);
+        // The selected decoder marks its feeding MediaExtractor. Each track is advanced to the real SDK EOS; a later
+        // read replays that exact EOS without calling the extractor past end. Seek / Stop clear and re-arm the record.
+        uint8_t extractor[16] = {0}, mbuf[40] = {0}; uint64_t mf; int64_t mt; uint32_t mflags;
+        assert(!h_cv_movie_read_samples(extractor, mbuf, 0) && movie_read_calls[0] == 3);
+        cv_movie_buffer_meta(mbuf, &mf, &mt, &mflags); assert(mf == 51 && mt == 3000000 && mflags == CV_MOVIE_EOS_FLAG);
+        memset(mbuf + 16, 0, 24); assert(h_cv_movie_read_samples(extractor, mbuf, 0) == CV_MOVIE_EOS_RESULT && movie_read_calls[0] == 3 && !movie_read_past_eos);
+        cv_movie_buffer_meta(mbuf, &mf, &mt, &mflags); assert(!mf && mt == 3000000 && mflags == CV_MOVIE_EOS_FLAG);
+        assert(!h_cv_movie_read_samples(extractor, mbuf, 1) && movie_read_calls[1] == 3 && !movie_read_past_eos);
+        assert(!h_cv_movie_extractor_seek(extractor, 123456789, 2) && movie_seek_calls == 1);
+        assert(!h_cv_movie_read_samples(extractor, mbuf, 0) && movie_read_calls[0] == 6 && !movie_read_past_eos);
+        assert(!h_cv_movie_extractor_stop(extractor) && movie_stop_calls == 1);
+        assert(!h_cv_movie_read_samples(extractor, mbuf, 0) && movie_read_calls[0] == 9 && !movie_read_past_eos);
+        assert(!cv_dec_fin(ds));
+        assert(!h_cv_movie_extractor_finalize(extractor) && movie_finalize_calls == 1);
+        // With no selected AV1 decoder and no remembered extractor, the default path is exactly one pass-through read.
+        assert(!h_cv_movie_read_samples(extractor, mbuf, 0) && movie_read_calls[0] == 10 && !movie_read_past_eos);
+        h_cv_poolfin(ps); free(pm); unsetenv("DM_CODEC_SKIP_AV1");
+    }
     // VP8 (libvpx) and H.264 (VideoToolbox) take the same protocol: one released buffer, one key frame, its picture read back red
     {   _Alignas(16) static uint8_t d8[0x400], p8[0x40], m8[16 * 16 * 4];
         assert(!h_cv_poolsize(&size, &align, &pref, 1) && !h_cv_pool(p8, m8, size, &pref, 1, 0));

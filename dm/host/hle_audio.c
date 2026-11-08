@@ -277,7 +277,14 @@ static void au_halt(aout *a) {
     }
     a->stalled = 0; a->retry_ms = 0; a->retry_at = 0;
 }
-static int real_audio(void) { const char *e = getenv("DM_AUDIO"); return e ? atoi(e) != 0 : TARGET_OS_IPHONE; }
+static int real_audio(void) {
+    const char *e = getenv("DM_AUDIO");
+#ifdef __linux__
+    return e ? atoi(e) != 0 : 1;
+#else
+    return e ? atoi(e) != 0 : TARGET_OS_IPHONE;
+#endif
+}
 static void au_retry(aout *a, uint64_t now) {
     a->stalled = 1;
     a->retry_ms = a->retry_ms ? (a->retry_ms < 8000 ? a->retry_ms * 2 : 8000) : 1000;
