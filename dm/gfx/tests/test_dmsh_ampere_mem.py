@@ -163,9 +163,9 @@ class PixelCovered(unittest.TestCase):
     OTHER = (0x040e0200000e8000, 0x0000000000007925)   # bits 78..80 = 2, not seen
     SPH = struct.pack('<32I', *([0x000c5482] + [0] * 4 + [0xb0000000] + [0] * 12 + [0xf] + [0] * 13))   # the game's: writes colour 0
 
-    def run_job(self, op):
+    def run_job(self, *ops):
         with tempfile.TemporaryDirectory(prefix='ampere_px_') as d:
-            work = Path(d); (work / 'k.bin').write_bytes(self.SPH + inst(*op) + inst(*EXIT))
+            work = Path(d); (work / 'k.bin').write_bytes(self.SPH + b''.join(inst(*op) for op in ops) + inst(*EXIT))
             (work / 'jobs.json').write_text(json.dumps([dict(key='k', stage='ps', arch='sm86', code=str(work / 'k.bin'), tex={}, img={}, attr={}, fout={}, debug=True)]))
             r = subprocess.run([os.environ['DMSH_TEST_XLATE'], str(work / 'jobs.json'), d], capture_output=True, text=True)
             if not (work / 'k.spv').exists(): return None, r.stdout + r.stderr
@@ -185,6 +185,28 @@ class PixelCovered(unittest.TestCase):
         msl, log = self.run_job(self.OTHER)
         self.assertIsNone(msl)
         self.assertIn('0x925 form 2', log)
+
+
+@unittest.skipUnless(os.environ.get('DMSH_TEST_XLATE'), 'set DMSH_TEST_XLATE to the offline translator')
+class DepthRegister(unittest.TestCase):
+    """Depth follows four registers per enabled colour target and the sample mask. OoT's 0x10f map writes it to R9."""
+    SPH = struct.pack('<32I', *([0x000c5482] + [0] * 4 + [0xb0000000] + [0] * 12 + [0x10f, 0x2] + [0] * 12))
+
+    @staticmethod
+    def mov(reg, value): return (0x000fe20000000f00, value << 32 | reg << 16 | 0x7802)
+
+    def test_depth_comes_after_the_last_target_block(self):
+        with tempfile.TemporaryDirectory(prefix='ampere_depth_') as d:
+            work = Path(d)
+            ops = (self.mov(6, 0x3e800000), self.mov(9, 0x3f400000))
+            (work / 'k.bin').write_bytes(self.SPH + b''.join(inst(*op) for op in ops) + inst(*EXIT))
+            (work / 'jobs.json').write_text(json.dumps([dict(key='k', stage='ps', arch='sm86', code=str(work / 'k.bin'), tex={}, img={}, attr={}, fout={}, debug=True)]))
+            r = subprocess.run([os.environ['DMSH_TEST_XLATE'], str(work / 'jobs.json'), d], capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertTrue((work / 'k.spv').exists(), r.stdout + r.stderr)
+            dis = subprocess.run([os.environ.get('DMSH_TEST_SPIRV_DIS', 'spirv-dis'), str(work / 'k.spv')], capture_output=True, text=True)
+            self.assertEqual(dis.returncode, 0, dis.stderr)
+            self.assertRegex(dis.stdout, r'OpStore %gl_FragDepth %float_0_75')
 
 
 class MufuF16(Translated):

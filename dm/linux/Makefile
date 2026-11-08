@@ -152,6 +152,11 @@ $(OUT)/t_vk_descriptor_pool: vk/tests/t_vk_descriptor_pool.c vk/vk_draw.h | prof
 	$(CC) $(CPPFLAGS) -std=gnu11 -O1 -g -Wall -Wextra -Werror -Ivk $$($(PKG_CONFIG) --cflags vulkan) -o $@ $<
 t_vk_descriptor_pool: $(OUT)/t_vk_descriptor_pool
 	$<
+$(OUT)/t_vk_omap: vk/tests/t_vk_omap.c vk/vk_omap.h | profile
+	@mkdir -p $(dir $@)
+	$(CC) $(CPPFLAGS) -std=gnu11 -O1 -g -Wall -Wextra -Werror -Ivk -o $@ $<
+t_vk_omap: $(OUT)/t_vk_omap
+	$<
 $(OUT)/t_vk_mesh_coverage: vk/tests/t_vk_mesh_coverage.c vk/spv_reflect.c vk/spv_reflect.h | profile
 	@mkdir -p $(dir $@)
 	$(CC) $(CPPFLAGS) -std=gnu11 -O1 -g -Wall -Wextra -Werror -Ivk $$($(PKG_CONFIG) --cflags vulkan) -o $@ vk/tests/t_vk_mesh_coverage.c vk/spv_reflect.c

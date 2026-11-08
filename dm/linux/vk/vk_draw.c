@@ -19,6 +19,7 @@
 #include "vk_stage.h"
 #include "vk_shader_resolve.h"
 #include "vk_mesh_trace.h"
+#include "vk_omap.h"
 #include "vk_tonemap_spv.h"
 #include <stdatomic.h>
 #include <errno.h>
@@ -51,6 +52,10 @@ typedef struct {
     // intermediate that stage normally samples.
     int gameplay_scene_id;
     uint64_t gameplay_scene_serial;
+    // SPH fragment output map for the program prepared by the current draw:
+    // four RGBA bits per colour target.  Maxwell preserves target components
+    // outside this map even when the NVN channel mask enables them.
+    uint32_t frag_out_map;
 } vkx_bind_st;   // prog: the program bound to each stage (vkx_bind_program)
 static vkx_bind_st g_bind[VKX_NQ]; static vkx_bind_st *g_bindp = &g_bind[0];
 #define S (*g_bindp)
@@ -67,6 +72,7 @@ typedef struct vks {
     VkShaderEXT sh_gl; uint32_t *spv; size_t nspv; int gl_none;   // the GL-depth variant (spvr_gl_depth), made the first time it is needed from the fitted SPIR-V kept here
     int nb; vkbind bd[NBIND_MAX];
     VkBuffer c1; VkDeviceMemory c1m; uint32_t c1_len;
+    uint32_t frag_out_map;       // pixel SPH word 18; 4 RGBA bits per target
     vkx_mesh_stage_meta mesh_meta;   // actual stage and native task/mesh job limits; host slot remains separate
 } vks;
 static vks *g_sh[1024]; static pthread_mutex_t g_shmu = PTHREAD_MUTEX_INITIALIZER;
@@ -350,6 +356,20 @@ static uint32_t *sh_code(const char *key, int *st_out, size_t *nw, vks *s, unsig
           uint8_t *oc = NULL; size_t on = 0; if (read_file(f, &oc, &on)) { free(code); code = oc; ncode = on; if (s) LOG("vulkan draws: shader %s replaced by %s", key, f); } } }
     int st = have ? rr.stage : -1;
     if (!have || st < 0) { free(code); free(vkb); free(job); return NULL; }
+    if (s) {
+        // Older packages have no Vulkan reflection sidecar.  Preserve their
+        // historical all-components behaviour; a present pixel reflection
+        // may legitimately contain zero for a depth-only shader.
+        s->frag_out_map = 0xffffffffu;
+        if (st == VKX_STAGE_PS) {
+            uint8_t *refl = NULL; size_t nrefl = 0;
+            snprintf(path, sizeof path, "%s/%s.vk.json", rr.dir, key);
+            if (read_file(path, &refl, &nrefl)) {
+                s->frag_out_map = vkx_json_u32_or((const char *)refl, "\"frag_out_map\"", 0xffffffffu);
+                free(refl);
+            }
+        }
+    }
     if (s || st == VKX_STAGE_TS || st == VKX_STAGE_MS) {
         if (rr.job[0]) read_file(rr.job, &job, &njob);
         else { snprintf(path, sizeof path, "%s/%s.job.json", rr.dir, key); read_file(path, &job, &njob); }
@@ -1303,6 +1323,7 @@ int vkx_prepare_draw(VkCommandBuffer c) {
     VkDescriptorSet sets[5] = {0};
     for (int st = 0; st < 5; st++) if (sh[st]) { sets[st] = stage_set(st, sh[st]); if (!sets[st]) return 0; }
     for (int st = 0; st < 5; st++) if (sets[st]) vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_GRAPHICS, g_pl_gfx, (uint32_t)st, 1, &sets[st], 0, NULL);
+    S.frag_out_map = sh[1] ? sh[1]->frag_out_map : 0xffffffffu;
     // Shader-object bindings persist in a command buffer.  Explicitly clear
     // the mutually exclusive task/mesh path when returning to a vertex draw;
     // otherwise Honeykrisp sees the stale mesh raster shader on the following
@@ -1523,6 +1544,7 @@ int vkx_prepare_mesh_program(VkCommandBuffer c, vkx_mesh_program_plan *plan_out)
     VkShaderEXT objects[] = {VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE,
                              task_obj, mesh_obj, fs->sh};
     g_vkd.bind_shaders(c, sizeof stages / sizeof *stages, stages, objects);
+    S.frag_out_map = fs->frag_out_map;
     return 1;
 }
 
@@ -1721,7 +1743,11 @@ static void set_state(VkCommandBuffer c, int ncolor, uint32_t rt_w, uint32_t rt_
             en[i] = (D.color.blend_en >> i) & 1;
             eq[i] = (VkColorBlendEquationEXT){bfac((int)b->src_rgb), bfac((int)b->dst_rgb), bop((int)b->eq_rgb), bfac((int)b->src_a), bfac((int)b->dst_a), bop((int)b->eq_a)};
             if (!b->src_rgb) eq[i] = (VkColorBlendEquationEXT){VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ZERO, VK_BLEND_OP_ADD, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ZERO, VK_BLEND_OP_ADD};   // never set: NVN's default
-            wm[i] = (D.chmask.mask >> (4 * i)) & 0xF;   // r 1, g 2, b 4, a 8 as Vulkan's bits
+            // The fixed-function NVN mask and the fragment SPH output map
+            // both apply.  Vulkan otherwise writes undefined values for
+            // components the translated shader has no Store for, while the
+            // original GPU leaves those attachment components untouched.
+            wm[i] = vkx_fragment_write_mask(D.chmask.mask, S.frag_out_map, (unsigned)i);   // r 1, g 2, b 4, a 8 as Vulkan's bits
         }
         p_cbe(c, 0, (uint32_t)ncolor, en); p_cbq(c, 0, (uint32_t)ncolor, eq); p_cwm(c, 0, (uint32_t)ncolor, wm);
     }
