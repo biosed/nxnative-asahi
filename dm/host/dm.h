@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "thread_slots.h"
 #include "game_profile.h"   // constants of the current game profile (generated from dm/games/<id>/game.tsv, chosen by the Makefile's GAME)
 
 // Explicit host work does not occupy a guest core (Metal submission, or a blocked native codec lock). A contended host mutex must count as blocked: a signal's same-core handoff
@@ -60,6 +61,7 @@ typedef struct {
     uint64_t image_size, file_image_len, patch_len;   // only with the patch area before the base: whole image (with bss and key page), length of the image part of the file, patch area length
     uint64_t back_off, back_len;   // a second patch area after the image (patch_nso.py TWO: a text longer than a B reaches), inside size; 0 = none
     char build_id[33];         // First 16 bytes of the NSO build ID (hex); empty for older build outputs
+    uint32_t host_tp_mrs;      // Host thread-pointer instruction recorded by the rewriter (TPIDRRO_EL0 on Apple, TPIDR_EL0 on Linux)
     unsigned key_idx[4];       // key page index of each thread slot (K18, KTLS, KTLR, KGATE)
     const Elf64_Dyn *dyn;
     const Elf64_Sym *symtab;
@@ -82,7 +84,7 @@ extern int g_nmod;
 // main's build ID (empty if none): code with fixed addresses in a game's module runs only on the build they were found in
 static inline const char *dm_main_build(void) { for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, "main")) return g_mod[i].build_id; return ""; }
 // Four thread-local slots: K18 = the Switch's x18, KTLS = tpidr_el0, KTLR = tpidrro_el0 (ThreadLocalRegion), KGATE = host gate entry; the actual key numbers are written into the key page by the loader
-extern pthread_key_t g_key18, g_keytls, g_keytlr, g_keygate;
+extern dm_thread_slot_t g_key18, g_keytls, g_keytlr, g_keygate;
 
 void load_modules(const char *dir, const char **names, int n);
 const char *dm_module_dir(void);   // the folder load_modules read the modules and the rewriter's tables from (the cheat engine reads main.changed.tsv there)

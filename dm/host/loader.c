@@ -8,8 +8,6 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <limits.h>
-#include <mach-o/getsect.h>
-#include <mach-o/ldsyms.h>
 #include "hle.h"
 #if TARGET_OS_IPHONE
 #include <mach/mach.h>
@@ -20,32 +18,34 @@ int g_nmod;
 // Stable module addresses live in g_mod; lookup order follows activation, including unload/reload.
 static module_t **g_loaded; static int g_nloaded, g_mod_capacity;
 static pthread_rwlock_t g_modules_mu = PTHREAD_RWLOCK_INITIALIZER;
-pthread_key_t g_key18, g_keytls, g_keytlr, g_keygate;
+dm_thread_slot_t g_key18, g_keytls, g_keytlr, g_keygate;
 enum { KEY_K18, KEY_KTLS, KEY_KTLR, KEY_KGATE, KEY_N };
 
 uint64_t resolve_import(module_t *m, const char *name);
 int hle_implements(const char *name);
 void gate_register(uint64_t ret_addr, const char *kind, int arg, uint64_t orig);
 
-static pthread_key_t key_value(unsigned i) {
+static dm_thread_slot_t key_value(unsigned i) {
     switch (i) {
     case KEY_K18: return g_key18; case KEY_KTLS: return g_keytls; case KEY_KTLR: return g_keytlr;
     default: return g_keygate;
     }
 }
 static void create_keys(void) {
-    if (pthread_key_create(&g_key18, NULL) || pthread_key_create(&g_keytls, NULL) ||
-        pthread_key_create(&g_keytlr, NULL) || pthread_key_create(&g_keygate, NULL)) die("cannot create the host key");
-    LOG("key numbers K18=%lu KTLS=%lu KTLR=%lu KGATE=%lu", g_key18, g_keytls, g_keytlr, g_keygate);
+    if (dm_thread_slots_init()) die("cannot create the host thread slots");
+    g_key18 = DM_SLOT_K18; g_keytls = DM_SLOT_KTLS; g_keytlr = DM_SLOT_KTLR; g_keygate = DM_SLOT_KGATE;
+    LOG("thread slot offsets K18=%lld KTLS=%lld KTLR=%lld KGATE=%lld",
+        (long long)dm_thread_slot_offset(g_key18), (long long)dm_thread_slot_offset(g_keytls),
+        (long long)dm_thread_slot_offset(g_keytlr), (long long)dm_thread_slot_offset(g_keygate));
 }
 
 // K slot check: the pthread TSD layout is fixed, slot = tpidrro_el0 + 8*key
 static void tsd_check(void) {
-    pthread_setspecific(g_key18, (void *)0x1234);
-    uint64_t base; __asm__ volatile("mrs %0, tpidrro_el0" : "=r"(base));
-    uint64_t off = *(uint64_t *)(g_mod[0].base + g_mod[0].key_page_off + g_mod[0].key_idx[KEY_K18] * 8);
-    if (((uint64_t *)(base & ~7ull))[off / 8] != 0x1234) die("TSD layout mismatch");
-    pthread_setspecific(g_key18, 0);
+    dm_thread_slot_set(g_key18, (void *)0x1234);
+    uintptr_t base = dm_thread_pointer();
+    int64_t off = (int64_t)*(uint64_t *)(g_mod[0].base + g_mod[0].key_page_off + g_mod[0].key_idx[KEY_K18] * 8);
+    if (*(void **)((intptr_t)base + off) != (void *)0x1234) die("host thread slot layout mismatch");
+    dm_thread_slot_set(g_key18, NULL);
 }
 
 static void build_symhash(module_t *m);
@@ -214,8 +214,7 @@ static uint64_t resolve_sym(module_t *m, const char *name) {
 static const hle_force_ent *g_force; static unsigned g_nforce; static unsigned *g_force_hits;
 static unsigned *g_fidx, g_fmask;   // name hash over the table: force_lookup runs for every named relocation, and each lookup used to strcmp its way through all 722 entries (the swhle table's scan is hashed the same way, hle.c)
 static void force_init(void) {
-    unsigned long sz; g_force = (const hle_force_ent *)getsectiondata(&_mh_execute_header, "__DATA", "swforce", &sz);
-    g_nforce = g_force ? (unsigned)(sz / sizeof *g_force) : 0;
+    DM_SECTION_BOUNDS(swforce, hle_force_ent, g_force, g_nforce);
     g_force_hits = calloc(g_nforce + 1, sizeof *g_force_hits);
     unsigned cap = 16; while (cap < g_nforce * 2) cap <<= 1;
     g_fidx = calloc(cap, sizeof *g_fidx); g_fmask = cap - 1;
@@ -264,6 +263,7 @@ static void read_layout(module_t *m, const char *dir) {
         else if (!strcmp(key, "TEXT_END")) m->text_end = v;
         else if (!strcmp(key, "RO_OFF")) m->ro_off = v;
         else if (!strcmp(key, "DATA_OFF")) m->data_off = v;
+        else if (!strcmp(key, "HOST_TP_MRS")) m->host_tp_mrs = (uint32_t)v;
         else if (!strcmp(key, "FPS_STATE_OFF")) m->fps_state_off = v;
         else if (!strcmp(key, "UE_MALLOC_VT")) m->ue_malloc_vt = v;
         else if (!strcmp(key, "UE_MALLOC_SLOT")) m->ue_malloc_slot = (unsigned)v;
@@ -284,6 +284,13 @@ static void read_layout(module_t *m, const char *dir) {
     fclose(f);
     if (!m->patch_off || m->key_page_off % 0x4000 || m->key_page_size != 0x4000 || seen != (1u << KEY_N) - 1)
         die("%s: the output comes from an old rewriter; rewrite the modules again with dm/tools/patch_nso.py", path);
+#if defined(__linux__) && defined(__aarch64__)
+    if (m->host_tp_mrs != 0xd53bd040u)
+        die("%s: module was not rewritten for Linux TPIDR_EL0; use DM_PATCH_TP=linux", path);
+#elif defined(__APPLE__) && defined(__aarch64__)
+    if (m->host_tp_mrs && m->host_tp_mrs != 0xd53bd060u)
+        die("%s: module was rewritten for another host thread pointer", path);
+#endif
     if (m->patch_off < 0 && (!m->image_size || !m->file_image_len || m->file_image_len % 0x4000 || m->patch_off % 0x4000 || m->key_page_off + m->key_page_size > m->image_size))
         die("%s: patch area before the base, but IMAGE_SIZE / FILE_IMAGE_LEN missing or wrong", path);
     if ((m->back_off || m->back_len) && (m->patch_off >= 0 || !m->back_len || m->back_off % 0x4000 || m->back_len % 0x4000 || m->back_off < m->key_page_off + m->key_page_size
@@ -355,7 +362,7 @@ static void install_key_page(module_t *m) {
     if (m->key_page_off + m->key_page_size > m->size) die("%s: key page out of range", m->name);
     uint64_t *page = (uint64_t *)(m->base + m->key_page_off);
     memset(page, 0, m->key_page_size);
-    for (unsigned i = 0; i < KEY_N; i++) page[m->key_idx[i]] = (uint64_t)key_value(i) * 8;
+    for (unsigned i = 0; i < KEY_N; i++) page[m->key_idx[i]] = (uint64_t)dm_thread_slot_offset(key_value(i));
     for (int k = 0; k < KEY_N; k++) if (!page[m->key_idx[k]]) die("%s: key page entry %d is 0 (host key not created) -- the game would read TSD slot 0", m->name, k);
     if (mprotect(m->base + m->key_page_off, m->key_page_size, PROT_READ)) die("%s key page mprotect", m->name);
     if (m->fps_state_off) install_fps_state(m);
@@ -371,7 +378,9 @@ static void register_gates(module_t *m, const char *dir) {
             if (sscanf(line, "%lx %15s %d %lx", &ret, kind, &arg, &orig) == 4) { gate_register((uint64_t)m->base + ret, kind, arg, orig); ng++; }
         fclose(f);
     }
-    LOG("%s: gates %d patch_off %#llx keys %lu/%lu/%lu/%lu", m->name, ng, m->patch_off, g_key18, g_keytls, g_keytlr, g_keygate);
+    LOG("%s: gates %d patch_off %#llx slot offsets %lld/%lld/%lld/%lld", m->name, ng, m->patch_off,
+        (long long)dm_thread_slot_offset(g_key18), (long long)dm_thread_slot_offset(g_keytls),
+        (long long)dm_thread_slot_offset(g_keytlr), (long long)dm_thread_slot_offset(g_keygate));
 }
 
 // DT_RELR (from SDK 20; all three modules of The Legend of Zelda: Breath of the Wild 1.9.0 have it): a compact table of relative relocations with the addend in the slot (*slot += base).
