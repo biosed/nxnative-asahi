@@ -155,8 +155,8 @@ static int cap_enc_obj(void *ctx, int kind, uint64_t *field, uint8_t *payload, u
             const prog_t *p = (const prog_t *)(uintptr_t)v; uint64_t k[2] = {v, p->serial};
             void *have = nvn_hm_get(&g_cap_prog, k); if (have) { *field = cap_obj(CAP_K_PROG, (uint64_t)(uintptr_t)have - 1); return 1; }
             uint32_t idx = g_cap_nprog++; nvn_hm_put(&g_cap_prog, k, (void *)(uintptr_t)(idx + 1));
-            cap_prog o = {idx, p->nstage, p->serial, {{0}}, 0, {0}, {0}};
-            for (unsigned s = 0; s < p->nstage && s < 6; s++) if (prog_key(p, s, o.key[s])) o.ok |= (uint8_t)(1u << s);
+            cap_prog o = {.index = idx, .nstage = p->nstage, .serial = p->serial};
+            for (unsigned s = 0; s < p->nstage && s < 6; s++) { int st = -1; if (prog_key_info(p, s, o.key[s], &st)) { o.ok |= (uint8_t)(1u << s); o.stage[s] = st >= 0 ? (uint8_t)(st + 1) : 0; } }
             cap_iface(prog_get(p), o.iface);
             cap_buf_put(&g_cap_progb, &o, sizeof o); *field = cap_obj(CAP_K_PROG, idx); return 1;
         }

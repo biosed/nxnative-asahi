@@ -6,6 +6,7 @@
 #include "../../host/dm.h"
 #include <stdatomic.h>
 #include <pthread.h>
+#include <stdio.h>
 #include <sys/mman.h>
 #include <unistd.h>
 #include <mach/mach_time.h>
@@ -203,6 +204,13 @@ void nvn_dirty_protect(const void *addr, size_t len) {
     }
     pthread_mutex_unlock(&g_slot_mu);
 }
+// A placed Vulkan mapping swaps the pages under a tracked pool. Release its
+// protected pages first and keep the tracker stable until the swap completes.
+void nvn_dirty_hold(const void *addr, size_t len) {
+    pthread_mutex_lock(&g_slot_mu);
+    if (g_pg) prep_write((void *)addr, len);
+}
+void nvn_dirty_unhold(void) { pthread_mutex_unlock(&g_slot_mu); }
 // As nvn_dirty_protect, for the pages behind a placement sparse tile: a write to one of them moves nvn_dirty_sparse_writes, which nothing else moves, so its textures need no look at their tiles
 // until one is written (the page table's walk per look is what this replaces; nvn_mtl.m sparse_look)
 void nvn_dirty_protect_sparse(const void *addr, size_t len) {
@@ -231,6 +239,31 @@ int nvn_dirty_since_cached(const void **span, const void *addr, size_t len, uint
     return 0;
 }
 int nvn_dirty_since_span(const void *span, const void *addr, size_t len, uint64_t stamp) { return nvn_dirty_since_cached(&span, addr, len, stamp); }
+int nvn_dirty_bounds_since(const void *span, const void *addr, size_t len, uint64_t stamp, size_t *lo, size_t *hi) {
+    *lo = 0; *hi = len;
+    if (!len) return 0;
+    range_t *r = (range_t *)span; uintptr_t a = (uintptr_t)addr;
+    if (!r || !atomic_load_explicit(&r->live, memory_order_acquire) || a < r->base || a + len > r->end) r = find_span(a, len);
+    if (!r) return 1;
+    uintptr_t p = (a - r->base) >> g_shift, q = (a + len - 1 - r->base) >> g_shift, first = UINTPTR_MAX, last = 0;
+    for (uintptr_t i = p; i <= q; i++) if (atomic_load(&r->gen[i]) > stamp) { if (first == UINTPTR_MAX) first = i; last = i; }
+    if (first == UINTPTR_MAX) return 0;
+    uintptr_t b0 = r->base + (first << g_shift), b1 = r->base + ((last + 1) << g_shift);
+    *lo = b0 > a ? b0 - a : 0; *hi = b1 - a < len ? b1 - a : len;
+    return 1;
+}
+void nvn_dirty_debug(const void *span, const void *addr, size_t len, uint64_t stamp, char *out, size_t n) {
+    range_t *kept = (range_t *)span, *r = find_span((uintptr_t)addr, len);
+    int live = kept && atomic_load(&kept->live), protected = 0, writable = 0, busy = 0, pages = 0; uint64_t newest = 0;
+    if (r) {
+        uintptr_t a = (uintptr_t)addr, p = (a - r->base) >> g_shift, q = (a + len - 1 - r->base) >> g_shift;
+        for (uintptr_t i = p; i <= q; i++) { uint8_t state = atomic_load(&r->state[i]); protected += state == PG_PROT; writable += state == PG_NONE; busy += state == PG_BUSY; uint64_t gen = atomic_load(&r->gen[i]); if (gen > newest) newest = gen; pages++; }
+    }
+    snprintf(out, n, "kept range %p (%s, %#lx-%#lx), range now %p (%#lx-%#lx, base mem %#lx); %d pages: %d protected, %d writable, %d busy; newest page generation %llu, stamp %llu, clock %llu",
+             span, live ? "live" : "dead", kept ? (unsigned long)kept->base : 0ul, kept ? (unsigned long)kept->end : 0ul,
+             (void *)r, r ? (unsigned long)r->base : 0ul, r ? (unsigned long)r->end : 0ul, r ? (unsigned long)r->mem : 0ul,
+             pages, protected, writable, busy, (unsigned long long)newest, (unsigned long long)stamp, (unsigned long long)atomic_load(&g_now));
+}
 int nvn_dirty_since(const void *addr, size_t len, uint64_t stamp) { return nvn_dirty_since_span(NULL, addr, len, stamp); }
 void nvn_dirty_slot_stats(int *live, int *used_slots, uint64_t *adds_total) {
     int n = atomic_load(&g_nr), active = 0;

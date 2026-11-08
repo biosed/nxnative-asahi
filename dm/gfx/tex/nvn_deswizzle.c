@@ -45,7 +45,7 @@ int nvn_deswizzle_geom(const nvn_texdesc *d, unsigned level, unsigned layer,
     return 0;
 }
 
-static int move(const nvn_texdesc *d, unsigned level, unsigned layer, uint8_t *bl, uint64_t bl_at, uint8_t *lin, size_t pitch, int to_linear) {   // bl: the storage from byte bl_at on
+static int move(const nvn_texdesc *d, unsigned level, unsigned layer, uint8_t *bl, uint64_t bl_at, uint8_t *lin, size_t pitch, int to_linear, uint32_t y0, uint32_t y1) {   // bl: the storage from byte bl_at on
     uint32_t row_bytes, rows, slices, bpb; uint64_t base; unsigned th, td;
     if (nvn_deswizzle_geom(d, level, layer, &row_bytes, &rows, &slices, &base, &th, &td, &bpb)) return -1;
     if (pitch < row_bytes || base < bl_at) return -1;
@@ -63,7 +63,7 @@ static int move(const nvn_texdesc *d, unsigned level, unsigned layer, uint8_t *b
     uint64_t block = 512ull * bh * bd, gobs_x = (uint64_t)(lb + 63) >> 6, blocks_y = ((uint64_t)rows + 8 * bh - 1) >> (3 + th);
     for (uint32_t z = 0; z < slices; z++) {
         uint64_t zb = (uint64_t)(z >> td) * gobs_x * blocks_y * block + (uint64_t)(z & (bd - 1)) * bh * 512;
-        for (uint32_t y = 0; y < rows; y++) {
+        for (uint32_t y = y0; y < rows && y < y1; y++) {
             uint64_t p = (uint64_t)(y >> (3 + th)) * gobs_x * block + (uint64_t)((y & (8 * bh - 1)) >> 3) * 512 + koy[y & 7];
             uint8_t *row = lin + ((size_t)z * rows + y) * pitch;
             uint64_t yb = zb + p;   // the row's segments: block column (j >> 2) at yb + j>>2 times block + kox[j & 3]
@@ -83,10 +83,24 @@ static int move(const nvn_texdesc *d, unsigned level, unsigned layer, uint8_t *b
 }
 
 int nvn_deswizzle(const nvn_texdesc *d, unsigned level, unsigned layer, const void *src, void *dst, size_t dst_pitch) {
-    return move(d, level, layer, (uint8_t *)src, 0, (uint8_t *)dst, dst_pitch, 1);
+    return move(d, level, layer, (uint8_t *)src, 0, (uint8_t *)dst, dst_pitch, 1, 0, UINT32_MAX);
+}
+int nvn_deswizzle_rows(const nvn_texdesc *d, unsigned level, unsigned layer, const void *src, void *dst, size_t dst_pitch, uint32_t y0, uint32_t y1) {
+    return move(d, level, layer, (uint8_t *)src, 0, (uint8_t *)dst, dst_pitch, 1, y0, y1);
+}
+int nvn_deswizzle_block_rows(const nvn_texdesc *d, unsigned level) {
+    uint32_t row_bytes, rows, slices, bpb; uint64_t base; unsigned th, td;
+    return nvn_deswizzle_geom(d, level, 0, &row_bytes, &rows, &slices, &base, &th, &td, &bpb) ? -1 : (int)rows;
+}
+int nvn_deswizzle_bands(const nvn_texdesc *d, unsigned level, uint32_t *band_rows, uint64_t *band_bytes) {
+    uint32_t row_bytes, rows, slices, bpb; uint64_t base; unsigned th, td;
+    if (d->target == 2 || nvn_deswizzle_geom(d, level, 0, &row_bytes, &rows, &slices, &base, &th, &td, &bpb)) return -1;
+    uint32_t layout_bytes = nvn_tex_level_gobs(d, level) * 64; if (layout_bytes < row_bytes) layout_bytes = row_bytes;
+    *band_rows = 8u << th; *band_bytes = (uint64_t)((layout_bytes + 63) / 64) * (512ull << th);
+    return 0;
 }
 int nvn_swizzle(const nvn_texdesc *d, unsigned level, unsigned layer, const void *src, size_t src_pitch, void *dst) {
-    return move(d, level, layer, (uint8_t *)dst, 0, (uint8_t *)src, src_pitch, 0);
+    return move(d, level, layer, (uint8_t *)dst, 0, (uint8_t *)src, src_pitch, 0, 0, UINT32_MAX);
 }
 
 // One 64 KB tile of a sparse texture's tiled level (2D, one slice). Such a level is laid out with its width padded to whole tiles (nvn_tex.c level_walk), and a tile is one block row of
@@ -108,5 +122,5 @@ int nvn_deswizzle_tile(const nvn_texdesc *d, unsigned level, uint32_t tx, uint32
 }
 // nvn_deswizzle with the storage given from byte src_at on (a sparse texture's mip tail gathered on its own): the level must lie at or after it
 int nvn_deswizzle_from(const nvn_texdesc *d, unsigned level, unsigned layer, const void *src, uint64_t src_at, void *dst, size_t dst_pitch) {
-    return move(d, level, layer, (uint8_t *)src, src_at, (uint8_t *)dst, dst_pitch, 1);
+    return move(d, level, layer, (uint8_t *)src, src_at, (uint8_t *)dst, dst_pitch, 1, 0, UINT32_MAX);
 }

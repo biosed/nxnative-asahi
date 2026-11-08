@@ -2893,6 +2893,68 @@ def ue_shaders(d, label):
         out.append((f'{label}#UE{i}', st, ctl, code))
     return out
 
+def mesh_facts(key, st, ctl, code, keys, mesh_pairs):
+    """Describe an NVN2 task/mesh program for the native translator.
+
+    The layout is the workgroup from the control section and a compact list of
+    mesh output planes. ``-1`` separates per-primitive values; ``-2`` marks
+    generic vectors read by a paired pixel shader but written by neither the
+    per-vertex nor per-primitive output map. The latter need the same padded
+    ``(0, 0, 0, 1)`` treatment as absent vertex outputs.
+    """
+    def warn(why):
+        print(f'[RED] {st} program {key}: {why}', flush=True)
+        return {'local': [max(threads, 1), 1, 1], 'shared': 0, 'pair': pairs}
+
+    threads, payload = struct.unpack_from('<HH', ctl, 0x58)
+    maxv, maxp = struct.unpack_from('<HH', ctl, 0x60)
+    pairs = sorted(b for a, b, _ in mesh_pairs if a == key)
+    if not threads: return warn('control +0x58 thread count is 0')
+    if st == 'ts':
+        return {'local': [threads, 1, 1], 'shared': 0,
+                'mesh': [0, 0, payload], 'pair': pairs}
+
+    # The first SPH output map describes per-vertex position and generic
+    # vectors. Other output classes would shift this plane numbering and are
+    # deliberately rejected until their layout is known.
+    if any(code[0x30:0x35]) or code[0x35] & 0xf or any(code[0x46:0x50]):
+        return warn('its SPH output map has outputs besides position and the generic vectors, whose planes are not known')
+    planes = ([c for c in range(4) if code[0x35] >> (4 + c) & 1] +
+              [4 + i for i in range(128)
+               if code[0x36 + i // 8] >> (i % 8) & 1])
+    layout = [maxv, maxp, payload, *planes]
+
+    flats, reads = set(), set()
+    for ps in pairs:
+        pcode = keys[ps][3] if ps in keys else b''
+        if len(pcode) < 0x38: continue
+        imap = [(pcode[0x18 + i // 4] >> (i % 4 * 2)) & 3
+                for i in range(128)]
+        flats.add(tuple(4 + i for i in range(128)
+                        if imap[i] == 1 and 4 + i not in planes))
+        reads |= {i // 4 for i in range(128) if imap[i]}
+    if len(flats) > 1:
+        print(f'[RED] mesh program {key}: its pixel shaders {pairs} differ in flat inputs, one per-primitive layout cannot serve them', flush=True)
+
+    second = struct.unpack_from('<I', ctl, 0x64)[0]
+    if second and len(code) < second + 0x50:
+        return warn(f'control +0x64 {second:#x} is past its code area ({len(code):#x} bytes)')
+    h = code[second:second + 0x50] if second else bytes(0x50)
+    if any(h[0x30:0x35]) or h[0x35] & 0xf or any(h[0x46:0x50]):
+        return warn('its per-primitive header has outputs besides position and the generic vectors')
+    prim = (tuple(c for c in range(4) if h[0x35] >> (4 + c) & 1) +
+            tuple(4 + i for i in range(128)
+                  if h[0x36 + i // 8] >> (i % 8) & 1))
+    if flats and next(iter(flats)) != prim:
+        print(f'[RED] mesh program {key}: per-primitive values {list(prim)} (second header) are not the flat inputs {list(next(iter(flats)))} of its pixel shaders {pairs}', flush=True)
+    if prim: layout += [-1, *prim]
+
+    have = {(c - 4) // 4 for c in planes + list(prim) if c >= 4}
+    pad = sorted(reads - have)
+    if pad: layout += [-2, *pad]
+    return {'local': [threads, 1, 1], 'shared': 0,
+            'mesh': layout, 'pair': pairs}
+
 def var_pairs(found):
     """(vertex key, pixel key) within the same BNSH variation; (vertex key, pixel key, 'prog') within the same BAHS program variation (bahs_variations).
     The tables stay separate; dmsh_build.py pads against both, as the pipeline prebuild uses both."""
@@ -2900,7 +2962,12 @@ def var_pairs(found):
     for where, st, ctl, code in found:
         g = where if '#var' in where else BAHS_VAR.get(where)
         if g: var[g][st] = skey(ctl, code)
-    return {(v['vs'], v['ps']) + (('prog',) if '#BAHS#prog' in g else ()) for g, v in var.items() if 'vs' in v and 'ps' in v}
+    out = {(v['vs'], v['ps']) + (('prog',) if '#BAHS#prog' in g else ())
+           for g, v in var.items() if 'vs' in v and 'ps' in v}
+    out |= {(v['ms'], v['ps'], 'mesh') for v in var.values()
+            if 'ms' in v and 'ps' in v}
+    return out | {(v['ts'], v['ms'], 'task') for v in var.values()
+                  if 'ts' in v and 'ms' in v}
 
 def unreadable_why(e, name):
     why = str(e).removeprefix('[RED] ') if isinstance(e, SystemExit) else f'{type(e).__name__}: {e}'
@@ -3166,6 +3233,9 @@ def main():
                 if not same_shader(keys[key][2:4], v[2:4]): red(f'key {key} is the same but the control section or code area differs ({v[0]} / {keys[key][0]})')
                 continue
             keys[key] = v; per_src[group(v[0])] += 1
+    # Task→mesh and mesh→pixel variation pairs feed native mesh layout facts,
+    # not the legacy vertex/pixel padding tables written below.
+    mesh_pairs = {x for x in pairs if x[2:] in (('mesh',), ('task',))}; pairs -= mesh_pairs
     prog = {(a, b) for a, b, *t in pairs if t} - pairs; pairs = {x for x in pairs if len(x) == 2}
     sp, cover = separable_pairs(keys); pairs |= sp
     if cover: print(f'single-stage programs: {len({v for v, _ in sp}):,} vertex shaders are paired with a cover of {len(cover)} pixel shader(s) ({" ".join(cover)})')
@@ -3186,6 +3256,8 @@ def main():
             x, y, z = struct.unpack_from('<3I', ctl, at[0]); sh = struct.unpack_from('<I', ctl, at[1])[0]
             if not x * y * z: red(f'compute shader {key}: control +{at[0]:#x} thread group is 0 ({where})')
             facts[key] = {'local': [x, y, z], 'shared': (sh + 15) // 16 * 16}
+        if st in ('ts', 'ms'):
+            facts[key] = mesh_facts(key, st, ctl, code, keys, mesh_pairs)
     for name, rr in recs.items():
         with open(os.path.join(pkg, name), 'wb') as f: f.write(b''.join(rr))
     with open(mapout, 'w') as f:

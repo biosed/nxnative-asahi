@@ -9,6 +9,11 @@
 // 3D textures: all depth slices of this level are decoded at once; slice k is at dst_linear + k × dst_pitch × block row count of this level.
 // Not supported: multisampling, the LINEAR flag (already linear), BUFFER; returns -1 on these, 0 on success.
 int nvn_deswizzle(const nvn_texdesc *d, unsigned level, unsigned layer, const void *src_storage, void *dst_linear, size_t dst_pitch);
+// The same for block rows [y0, y1) of every slice, written at their normal offsets in dst_linear.
+int nvn_deswizzle_rows(const nvn_texdesc *d, unsigned level, unsigned layer, const void *src_storage, void *dst_linear, size_t dst_pitch, uint32_t y0, uint32_t y1);
+int nvn_deswizzle_block_rows(const nvn_texdesc *d, unsigned level);
+// One block-row band's geometry for sparse/parallel uploads; unsupported for 3D textures.
+int nvn_deswizzle_bands(const nvn_texdesc *d, unsigned level, uint32_t *band_rows, uint64_t *band_bytes);
 // Reverse (for unit test round trips): linear src_linear → written into the corresponding level / layer of the whole-texture storage dst_storage
 int nvn_swizzle(const nvn_texdesc *d, unsigned level, unsigned layer, const void *src_linear, size_t src_pitch, void *dst_storage);
 // One 64 KB tile (tx, ty) of a sparse texture's tiled level, given as its own 64 KB, into dst (block rows of dst_pitch bytes): *wb bytes of *rows block rows, the part inside the level

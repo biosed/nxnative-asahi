@@ -19,6 +19,7 @@
 #include "nvn_timestamp.h"
 #include "../../host/front.h"
 #include "nvn_dirty.h"
+#include "nvn_shader_stage.h"
 #include <mach/mach_time.h>
 #include <CommonCrypto/CommonDigest.h>
 #include <CoreFoundation/CoreFoundation.h>
@@ -38,8 +39,6 @@
 #include <mach/thread_policy.h>
 #include <assert.h>
 #include <stdatomic.h>
-#include <mach-o/getsect.h>
-#include <mach-o/ldsyms.h>
 
 // ---------- Slot table, thunks, unimplemented stubs ----------
 typedef struct { _Atomic uint64_t cnt; void *fn; } nvn_slot_t;
@@ -75,12 +74,12 @@ typedef struct { const char *name; void *fn; } nvn_impl;
 #define NVN(name, ret, ...)                                                                       \
     static ret h_##name(__VA_ARGS__);                                                             \
     static const NVNT_##name chk_##name __attribute__((unused)) = h_##name;                       \
-    __attribute__((used, section("__DATA,swnvn"))) static const nvn_impl e_##name = {#name, (void *)h_##name}; \
+    __attribute__((used, DM_SECTION(swnvn))) static const nvn_impl e_##name = {#name, (void *)h_##name}; \
     static ret h_##name(__VA_ARGS__)
 // Newer interfaces without prototypes: no signature check
 #define NVN_NOPROTO(name, ret, ...)                                                               \
     static ret h_##name(__VA_ARGS__);                                                             \
-    __attribute__((used, section("__DATA,swnvn"))) static const nvn_impl e_##name = {#name, (void *)h_##name}; \
+    __attribute__((used, DM_SECTION(swnvn))) static const nvn_impl e_##name = {#name, (void *)h_##name}; \
     static ret h_##name(__VA_ARGS__)
 
 static int g_log;
@@ -95,7 +94,7 @@ static void nvn_init_slots(void) {
     static int done; if (done) return; done = 1;
     g_log = getenv("DM_NVN_LOG") != NULL;
     unsigned long sz;
-    const nvn_impl *im = (const nvn_impl *)getsectiondata(&_mh_execute_header, "__DATA", "swnvn", &sz);
+    const nvn_impl *im = (const nvn_impl *)DM_SECTION_DATA(swnvn, &sz);
     unsigned nim = im ? (unsigned)(sz / sizeof *im) : 0, hit = 0;
     for (unsigned i = 0; i < NVN_NFUNC; i++) nvn_slot[i].fn = (void *)nvn_unimpl_entry;
     for (unsigned k = 0; k < nim; k++) {
@@ -664,7 +663,7 @@ NVN(nvnProgramFinalize, void, NVNprogram *p) {
     mtl_prog_release((prog_t *)p); ((prog_t *)p)->magic = 0; pk_drop(p);
 }
 // a program's per-stage keys (side table: guest NVNprogram address → host object; bit i of ok = stage i computed)
-typedef struct { uint8_t key[6][8]; uint8_t ok; } prog_keys_t;
+typedef struct { uint8_t key[6][8], stage[6]; uint8_t ok; } prog_keys_t;   // stage: actual NVN stage + 1, zero = unknown
 static pthread_mutex_t g_pk_mu = PTHREAD_MUTEX_INITIALIZER; static CFMutableDictionaryRef g_pk;   // a dedicated table (keys not shared with other side tables)
 static prog_keys_t *pk_get(const void *p, int make) {
     pthread_mutex_lock(&g_pk_mu);
@@ -714,13 +713,20 @@ static int keys_hash(const NVNshaderData *sd, int mapped, uint8_t out[8]) {
     CC_SHA256_Final(md, &hc); memcpy(out, md, 8);
     return 1;
 }
-int prog_key(const prog_t *p, unsigned st, uint8_t key[8]) {
+int prog_key_info(const prog_t *p, unsigned st, uint8_t key[8], int *stage) {
     if (st >= p->nstage) return 0;
     prog_keys_t *k = pk_get(p, 1);
-    if (!(k->ok >> st & 1)) { keys_hash(&p->sd[st], 0, k->key[st]); k->ok |= (uint8_t)(1u << st); }
+    if (!(k->ok >> st & 1)) {
+        if (!keys_hash(&p->sd[st], 0, k->key[st])) return 0;
+        int actual = nvn2_shader_stage(p->sd[st].control, (const void *)(uintptr_t)p->sd[st].data);
+        k->stage[st] = actual >= 0 ? (uint8_t)(actual + 1) : 0;
+        k->ok |= (uint8_t)(1u << st);
+    }
     memcpy(key, k->key[st], 8);
+    if (stage) *stage = k->stage[st] ? k->stage[st] - 1 : -1;
     return 1;
 }
+int prog_key(const prog_t *p, unsigned st, uint8_t key[8]) { return prog_key_info(p, st, key, NULL); }
 NVN(nvnProgramSetShaders, NVNboolean, NVNprogram *p, int n, const NVNshaderData *sd) {
     prog_t *o = (prog_t *)p;
     if (n < 0 || n > 6) { LOG("[RED] ProgramSetShaders stage count %d", n); return 0; }
@@ -730,9 +736,13 @@ NVN(nvnProgramSetShaders, NVNboolean, NVNprogram *p, int n, const NVNshaderData 
     static const char *trace; static int trace_init;
     if (!trace_init) { trace = getenv("DM_NVN_PROGTRACE"); trace_init = 1; }
     prog_keys_t *k = pk_get(p, 1);
-    k->ok = 0;
+    k->ok = 0; memset(k->stage, 0, sizeof k->stage);
     for (int i = 0; i < n; i++) {
-        if (keys_hash(&sd[i], 1, k->key[i])) k->ok |= (uint8_t)(1u << i);
+        if (keys_hash(&sd[i], 1, k->key[i])) {
+            int actual = nvn2_shader_stage(sd[i].control, (const void *)(uintptr_t)sd[i].data);
+            k->stage[i] = actual >= 0 ? (uint8_t)(actual + 1) : 0;
+            k->ok |= (uint8_t)(1u << i);
+        }
         // Diagnostic: trace the loader of selected shader keys (comma-separated hex).
         if (trace && (k->ok & (1u << i))) {
             char key[17]; for (int j = 0; j < 8; j++) snprintf(key + j * 2, 3, "%02x", k->key[i][j]);

@@ -261,6 +261,14 @@ namespace Ryujinx.Graphics.Shader.Instructions
             Operand g = compute ? null : context.ShiftRightU32(lane, Const(2));
             Operand t = compute ? null : context.BitwiseAnd(lane, Const(3));
 
+            // LDSM is warp-collective and commonly reads rows just written by
+            // other lanes without an explicit BAR. Preserve Ampere's ordered
+            // warp shared-memory behavior on hosts that require an explicit
+            // subgroup fence around those cross-lane reads. In compute
+            // shaders the fences remain around the MatrixLoads after
+            // TensorPass lowers them to their per-lane implementation.
+            context.SubgroupBarrier();
+
             // nxnative: in a compute shader, one MatrixLoad a matrix (sources: shared memory id, mode, row address, matrix), which TensorPass lowers to the same per-lane code
             // (LdsmLane) once it knows whether the HMMAs it feeds read their A straight from where it reads (Ampere HMMA through simdgroup_matrix). One destination each:
             // the optimizer's dead code removal takes an operation whose destination nothing reads as dead, sources included
@@ -270,6 +278,8 @@ namespace Ryujinx.Graphics.Shader.Instructions
 
                 context.Copy(Register(x.Rd + m, RegisterType.Gpr), result);
             }
+
+            context.SubgroupBarrier();
         }
 
         // LDSM per lane: lane L's register of matrix m (g = L / 4, t = L % 4), from the row addresses (bytes in shared memory `id`) the lanes hold in addr

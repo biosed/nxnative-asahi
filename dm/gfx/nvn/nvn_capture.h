@@ -62,7 +62,8 @@ typedef struct { uint64_t mem, size; } cap_padd;                             // 
 typedef struct { uint32_t index, flags; uint64_t mem, size; int32_t vmode, pad; } cap_pobj;
 // ok: bit i = stage i has a key; iface[s]: fingerprint of the bindings and vertex inputs the replay layer resolved for NVN stage s (0 = none), so a replay
 // whose translated shaders take other bindings than the records were made for stops (nvn_replay) instead of drawing with them
-typedef struct { uint32_t index, nstage; uint64_t serial; uint8_t key[6][8]; uint8_t ok, pad[7]; uint64_t iface[6]; } cap_prog;
+typedef struct { uint32_t index, nstage; uint64_t serial; uint8_t key[6][8]; uint8_t ok, stage[6], pad; uint64_t iface[6]; } cap_prog;   // stage: actual NVN stage + 1, zero = unknown/legacy capture
+_Static_assert(sizeof(cap_prog) == 120, "cap_prog padding repurpose must not change capture layout");
 typedef struct { uint32_t index; int32_t n; uint64_t pool; int64_t off; int32_t tex_base, samp_base; } cap_dpol;   // pool: CAP_OBJ(CAP_K_POOL)
 // gone: the ID stays registered but its memory pool was finalized (treg_drop_pool_views): t keeps neither its pool nor its storage address, which name memory the game has since reused
 typedef struct { int32_t tid; uint8_t ok, has_v, gone, pad; tex_t t; view_t v; } cap_treg;
