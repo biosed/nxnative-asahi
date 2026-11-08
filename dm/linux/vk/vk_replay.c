@@ -931,7 +931,7 @@ static ulog_t *g_ulog; static size_t g_nulog, g_culog;   // the updates the GPU 
 typedef struct { uint64_t dst, n; const uint8_t *data; } ubd_t;
 static ubd_t *g_ubd; static size_t g_nubd, g_cubd;      // deferred in the pass in progress (data: in the command memory being replayed)
 static uint64_t g_ub_deferred, g_ub_shadows;
-static stage_buf *g_shr, *g_shr_all; static uint8_t *g_shr_map; static size_t g_shr_off, g_shr_cap; static uint64_t g_shr_after;   // the shadows' ring for this submission
+static stage_buf *g_shr, *g_shr_all; static uint8_t *g_shr_map; static size_t g_shr_off, g_shr_cap;   // append-only shadow ring; each piece retires after its latest submission
 static int ub_defer_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("DM_VK_UB_DEFER"); on = !e || atoi(e) != 0; } return on; }
 static void ulog_add(uint64_t dst, uint64_t n, const uint8_t *data) {
     uint64_t done = done_value(); size_t k = 0;
@@ -956,7 +956,7 @@ int vkr_ub_shadow(uint64_t addr, uint64_t size, VkBuffer *b, VkDeviceSize *off) 
     if (!hit || !size || size > 65536) return 0;
     size_t need = (size + 255) & ~(size_t)255;
     uint64_t after = atomic_load(&g_fence) + 1;
-    if (!g_shr || g_shr_after != after || g_shr_off + need > g_shr_cap) {   // a new ring piece: one submission's, freed once the GPU is past it
+    if (!g_shr || g_shr_off + need > g_shr_cap) {   // a new ring piece, freed once the GPU is past its latest user
         uint64_t done = done_value();
         for (stage_buf **q = &g_shr_all; *q;) { stage_buf *o = *q; if (o->after <= done && o != g_shr) { *q = o->next; vkDestroyBuffer(g_vkd.dev, o->buf, NULL); vkFreeMemory(g_vkd.dev, o->mem, NULL); free(o); } else q = &o->next; }
         size_t cap = need > (1u << 20) ? need : (1u << 20);
@@ -969,7 +969,7 @@ int vkr_ub_shadow(uint64_t addr, uint64_t size, VkBuffer *b, VkDeviceSize *off) 
         if (ma.memoryTypeIndex == UINT32_MAX || vkAllocateMemory(g_vkd.dev, &ma, NULL, &sb->mem) || vkBindBufferMemory(g_vkd.dev, sb->buf, sb->mem, 0) || vkMapMemory(g_vkd.dev, sb->mem, 0, VK_WHOLE_SIZE, 0, &map)) {
             vkDestroyBuffer(g_vkd.dev, sb->buf, NULL); if (sb->mem) vkFreeMemory(g_vkd.dev, sb->mem, NULL); free(sb); return 0; }
         sb->after = after; sb->next = g_shr_all; g_shr_all = sb;   // a list of their own: the draw path may hold g_tmu here (the staging list's lock)
-        g_shr = sb; g_shr_map = map; g_shr_off = 0; g_shr_cap = cap; g_shr_after = after;
+        g_shr = sb; g_shr_map = map; g_shr_off = 0; g_shr_cap = cap;
     }
     uint8_t *dst = g_shr_map + g_shr_off;
     memcpy(dst, (const void *)(uintptr_t)addr, size);   // memory as the CPU sees it, then every update not executed yet, in order (the deferred ones are among them)
@@ -977,7 +977,7 @@ int vkr_ub_shadow(uint64_t addr, uint64_t size, VkBuffer *b, VkDeviceSize *off) 
         const ulog_t *u = &g_ulog[i]; uint64_t lo = u->dst > addr ? u->dst : addr, hi = u->dst + u->n < addr + size ? u->dst + u->n : addr + size;
         if (lo < hi) memcpy(dst + (lo - addr), u->data + (lo - u->dst), hi - lo);
     }
-    *b = g_shr->buf; *off = g_shr_off; g_shr_off += need; g_ub_shadows++;
+    *b = g_shr->buf; *off = g_shr_off; g_shr_off += need; g_shr->after = after; g_ub_shadows++;
     return 1;
 }
 static uint64_t g_rp_kept;   // target sets that kept the pass going (rt_same)
