@@ -399,17 +399,22 @@ fail_bindless:
 // slot binds a separate host-visible bitmap, so the host reads and clears it
 // only after that slot's timeline value has completed.
 enum {
+    FOpTypeVoid = 19, FOpTypeBool = 20, FOpTypeFunction = 33,
+    FOpFunction = 54, FOpFunctionParameter = 55, FOpFunctionEnd = 56,
+    FOpFunctionCall = 57, FOpLoad = 61, FOpIEqual = 170,
     FOpShiftRightLogical = 194, FOpShiftLeftLogical = 196,
     FOpBitwiseAnd = 199, FOpAtomicOr = 241,
+    FOpSelectionMerge = 247, FOpLabel = 248, FOpBranch = 249,
+    FOpBranchConditional = 250, FOpReturn = 253,
 };
-typedef struct { size_t at; uint32_t index, index_type; } bindless_feedback_patch;
+typedef struct { size_t at; uint32_t index, index_type, label; } bindless_feedback_patch;
 
 uint32_t *spvr_bindless_feedback(const uint32_t *code, size_t words,
                                  uint32_t bindless_set, uint32_t feedback_set,
                                  size_t *out_words, unsigned *patched) {
     *out_words = 0; *patched = 0;
     if (words < 5 || code[0] != 0x07230203 || !code[3]) return NULL;
-    uint32_t bound = code[3], first_fn = 0, first_dec = 0, uint_t = 0;
+    uint32_t bound = code[3], first_fn = 0, first_dec = 0, uint_t = 0, void_t = 0, bool_t = 0, fn_t = 0;
     uint32_t *set = malloc((size_t)bound * sizeof *set), *binding = malloc((size_t)bound * sizeof *binding);
     uint16_t *op = calloc(bound, sizeof *op); uint32_t *id_type = calloc(bound, sizeof *id_type);
     uint8_t *texture_var = calloc(bound, 1);
@@ -422,8 +427,10 @@ uint32_t *spvr_bindless_feedback(const uint32_t *code, size_t words,
             if (!first_dec) first_dec = (uint32_t)i;
             if (w[1] < bound && w[2] == DecBinding) binding[w[1]] = w[3];
             else if (w[1] < bound && w[2] == DecDescriptorSet) set[w[1]] = w[3];
-        } else if (x == OpTypeInt && n >= 4 && w[2] == 32 && !w[3] && !uint_t) uint_t = w[1];
-        else if (x == 54 /* OpFunction */ && !first_fn) first_fn = (uint32_t)i;
+        } else if (x == FOpTypeVoid && n >= 2 && !void_t) void_t = w[1];
+        else if (x == FOpTypeBool && n >= 2 && !bool_t) bool_t = w[1];
+        else if (x == OpTypeInt && n >= 4 && w[2] == 32 && !w[3] && !uint_t) uint_t = w[1];
+        else if (x == FOpFunction && !first_fn) first_fn = (uint32_t)i;
         if ((x == OpTypeImage || x == OpTypeSampler || x == OpTypeArray || x == OpTypePointer) && n >= 2 && w[1] < bound) op[w[1]] = (uint16_t)x;
         else if ((x == OpConstant || x == OpVariable) && n >= 3 && w[2] < bound) op[w[2]] = (uint16_t)x;
         // All value-producing integer operations used by the translator put
@@ -443,23 +450,44 @@ uint32_t *spvr_bindless_feedback(const uint32_t *code, size_t words,
         i += n;
     }
     if (!first_fn || !first_dec || !uint_t) goto fail;
+    if (void_t) {
+        for (size_t i = 5; i < first_fn;) {
+            const uint32_t *w = code + i; uint32_t x = w[0] & 0xffff, n = w[0] >> 16;
+            if (x == FOpTypeFunction && n == 4 && w[2] == void_t && w[3] == uint_t && !fn_t) { fn_t = w[1]; break; }
+            i += n;
+        }
+    }
     for (uint32_t id = 1; id < bound; id++)
         if (op[id] == OpVariable && set[id] == bindless_set && binding[id] <= 2) texture_var[id] = 1;
 
     bindless_feedback_patch p[512]; unsigned np = 0;
+    uint32_t cur_label = 0;
     for (size_t i = 5; i < words;) {
         const uint32_t *w = code + i; uint32_t x = w[0] & 0xffff, n = w[0] >> 16;
         if (!n || i + n > words) goto fail;
-        if ((x == OpAccessChain || x == OpInBoundsAccessChain) && n == 5 && w[3] < bound && texture_var[w[3]]) {
-            if (np == 512 || w[4] >= bound || !id_type[w[4]]) goto fail;
-            p[np++] = (bindless_feedback_patch){i, w[4], id_type[w[4]]};
+        if (x == FOpLabel && n >= 2) cur_label = w[1];
+        else if ((x == OpAccessChain || x == OpInBoundsAccessChain) && n == 5 && w[3] < bound && texture_var[w[3]]) {
+            if (w[4] >= bound || !id_type[w[4]]) goto fail;
+            int dup = 0;
+            for (unsigned j = np; j > 0 && p[j - 1].label == cur_label; j--)
+                if (p[j - 1].index == w[4]) { dup = 1; break; }
+            if (!dup) {
+                if (np == 512) goto fail;
+                p[np++] = (bindless_feedback_patch){i, w[4], id_type[w[4]], cur_label};
+            }
         }
         i += n;
     }
     if (!np) goto fail;
 
+    int need_void = !void_t, need_bool = !bool_t, need_fn_t = !fn_t;
+    if (need_void) void_t = bound++;
+    if (need_bool) bool_t = bound++;
+    if (need_fn_t) fn_t = bound++;
     uint32_t arr_t = bound++, block_t = bound++, block_ptr_t = bound++, uint_ptr_t = bound++, var = bound++;
     uint32_t c0 = bound++, c1 = bound++, c5 = bound++, c31 = bound++;
+    uint32_t fn_id = bound++, param_idx = bound++, lbl_entry = bound++, lbl_set = bound++, lbl_merge = bound++;
+    uint32_t word = bound++, bit = bound++, mask = bound++, ptr = bound++, cur = bound++, masked = bound++, unset = bound++, old = bound++;
     uint32_t ann[] = {
         (4u << 16) | OpDecorate, arr_t, DecArrayStride, 4,
         (3u << 16) | OpDecorate, block_t, DecBlock,
@@ -478,23 +506,48 @@ uint32_t *spvr_bindless_feedback(const uint32_t *code, size_t words,
         (4u << 16) | OpConstant, uint_t, c31, 31,
         (4u << 16) | OpVariable, block_ptr_t, var, SCStorageBuffer,
     };
-    size_t cap = words + sizeof ann / 4 + sizeof decl / 4 + 32u * np + 16;
+    // Guard OpAtomicOr with a plain-load pre-check inside a helper function so
+    // already-marked bits do not contend on global atomics and caller basic
+    // blocks (OpLoopMerge / OpSelectionMerge / OpPhi) are never split.
+    uint32_t helper_fn[] = {
+        (5u << 16) | FOpFunction, void_t, fn_id, 0, fn_t,
+        (3u << 16) | FOpFunctionParameter, uint_t, param_idx,
+        (2u << 16) | FOpLabel, lbl_entry,
+        (5u << 16) | FOpShiftRightLogical, uint_t, word, param_idx, c5,
+        (5u << 16) | FOpBitwiseAnd, uint_t, bit, param_idx, c31,
+        (5u << 16) | FOpShiftLeftLogical, uint_t, mask, c1, bit,
+        (6u << 16) | OpAccessChain, uint_ptr_t, ptr, var, c0, word,
+        (4u << 16) | FOpLoad, uint_t, cur, ptr,
+        (5u << 16) | FOpBitwiseAnd, uint_t, masked, cur, mask,
+        (5u << 16) | FOpIEqual, bool_t, unset, masked, c0,
+        (3u << 16) | FOpSelectionMerge, lbl_merge, 0,
+        (4u << 16) | FOpBranchConditional, unset, lbl_set, lbl_merge,
+        (2u << 16) | FOpLabel, lbl_set,
+        (7u << 16) | FOpAtomicOr, uint_t, old, ptr, c1, c0, mask,
+        (2u << 16) | FOpBranch, lbl_merge,
+        (2u << 16) | FOpLabel, lbl_merge,
+        (1u << 16) | FOpReturn,
+        (1u << 16) | FOpFunctionEnd,
+    };
+    size_t cap = words + sizeof ann / 4 + sizeof decl / 4 + sizeof helper_fn / 4 + 16u * np + 32;
     uint32_t *out = malloc(cap * sizeof *out); if (!out) goto fail;
     size_t k = 0; unsigned pi = 0;
 #define FPUT(...) do { uint32_t q_[] = {__VA_ARGS__}; size_t nq_ = sizeof q_ / sizeof *q_; memcpy(out + k, q_, nq_ * sizeof *out); k += nq_; } while (0)
     for (size_t i = 0; i < words;) {
         if (i == first_dec) { memcpy(out + k, ann, sizeof ann); k += sizeof ann / 4; }
-        if (i == first_fn) { memcpy(out + k, decl, sizeof decl); k += sizeof decl / 4; }
+        if (i == first_fn) {
+            if (need_void) FPUT((2u << 16) | FOpTypeVoid, void_t);
+            if (need_bool) FPUT((2u << 16) | FOpTypeBool, bool_t);
+            if (need_fn_t) FPUT((4u << 16) | FOpTypeFunction, fn_t, void_t, uint_t);
+            memcpy(out + k, decl, sizeof decl); k += sizeof decl / 4;
+            memcpy(out + k, helper_fn, sizeof helper_fn); k += sizeof helper_fn / 4;
+        }
         const uint32_t *w = code + i; uint32_t n = i < 5 ? 5 : w[0] >> 16;
         if (pi < np && i == p[pi].at) {
             uint32_t idx = p[pi].index;
             if (p[pi].index_type != uint_t) { uint32_t cast = bound++; FPUT((4u << 16) | OpBitcast, uint_t, cast, idx); idx = cast; }
-            uint32_t word = bound++, bit = bound++, mask = bound++, ptr = bound++, old = bound++;
-            FPUT((5u << 16) | FOpShiftRightLogical, uint_t, word, idx, c5);
-            FPUT((5u << 16) | FOpBitwiseAnd, uint_t, bit, idx, c31);
-            FPUT((5u << 16) | FOpShiftLeftLogical, uint_t, mask, c1, bit);
-            FPUT((6u << 16) | OpAccessChain, uint_ptr_t, ptr, var, c0, word);
-            FPUT((7u << 16) | FOpAtomicOr, uint_t, old, ptr, c1, c0, mask);
+            uint32_t call_id = bound++;
+            FPUT((5u << 16) | FOpFunctionCall, void_t, call_id, fn_id, idx);
             pi++;
         }
         // Since SPIR-V 1.4, OpEntryPoint's interface must name every global

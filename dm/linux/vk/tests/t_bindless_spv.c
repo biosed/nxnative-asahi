@@ -44,6 +44,7 @@ static size_t feedback_module(uint32_t *w) {
     FEMIT((2u<<16)|17, 1);                         // Shader capability
     FEMIT((3u<<16)|14, 0, 1);                     // Logical, GLSL450
     FEMIT((5u<<16)|15, 4, 20, 0x6e69616d, 0);    // Fragment main, no interface yet
+    FEMIT((3u<<16)|16, 20, 7);                    // OriginUpperLeft
     FEMIT((4u<<16)|71, 30, 34, 5);               // pool set 5
     FEMIT((4u<<16)|71, 30, 33, 0);               // texture-array binding 0
     FEMIT((2u<<16)|19, 2);                        // void
@@ -61,9 +62,27 @@ static size_t feedback_module(uint32_t *w) {
     FEMIT((2u<<16)|248, 21);                      // label
     FEMIT((5u<<16)|128, 1, 40, 5, 6);            // dynamic-typed index
     FEMIT((5u<<16)|65, 14, 41, 30, 40);          // pool[index]
+    FEMIT((5u<<16)|65, 14, 42, 30, 40);          // duplicate pool[index] in same block
     FEMIT((1u<<16)|253); FEMIT((1u<<16)|56);
 #undef FEMIT
     return n;
+}
+
+static int has_prechecked_atomic(const uint32_t *w, size_t n, unsigned *calls, unsigned *atomics) {
+    *calls = 0; *atomics = 0;
+    size_t load_at = 0, ieq_at = 0, merge_at = 0, bcond_at = 0, atomic_at = 0;
+    for (size_t i = 5; i < n;) {
+        uint32_t z = w[i] >> 16, op = w[i] & 0xffff; if (!z) break;
+        if (op == 57) (*calls)++;
+        else if (op == 61 && !load_at) load_at = i;
+        else if (op == 170 && load_at && !ieq_at) ieq_at = i;
+        else if (op == 247 && ieq_at && !merge_at) merge_at = i;
+        else if (op == 250 && merge_at && !bcond_at) bcond_at = i;
+        else if (op == 241) { (*atomics)++; if (bcond_at && !atomic_at) atomic_at = i; }
+        i += z;
+    }
+    return load_at && ieq_at && merge_at && bcond_at && atomic_at &&
+           load_at < ieq_at && ieq_at < merge_at && merge_at < bcond_at && bcond_at < atomic_at;
 }
 
 static uint32_t feedback_var(const uint32_t *w, size_t n) {
@@ -96,22 +115,30 @@ static uint32_t constant(const uint32_t *w, size_t n, uint32_t id) {
     return UINT32_MAX;
 }
 
-static int rewrite_file(const char *src, const char *dst) {
+static int rewrite_file(int feedback, const char *src, const char *dst) {
     FILE *f = fopen(src, "rb"); if (!f) return 2;
     fseek(f, 0, SEEK_END); long nb = ftell(f); fseek(f, 0, SEEK_SET);
     uint32_t *w = malloc((size_t)nb); size_t got = w ? fread(w, 1, (size_t)nb, f) : 0; fclose(f);
     if (!w || got != (size_t)nb || nb % 4) { free(w); return 2; }
     size_t no = 0; unsigned patched = 0; uint32_t *o = spvr_bindless(w, (size_t)nb / 4, 5, 32768, &no, &patched); free(w);
     if (!o) return 3;
+    if (feedback) {
+        size_t fno = 0; unsigned fp = 0;
+        uint32_t *fo = spvr_bindless_feedback(o, no, 5, 6, &fno, &fp);
+        free(o);
+        if (!fo) return 3;
+        o = fo; no = fno; patched = fp;
+    }
     f = fopen(dst, "wb"); int ok = 0;
     if (f) { ok = fwrite(o, 4, no, f) == no; if (fclose(f)) ok = 0; }
     free(o); if (!ok) return 4;
-    printf("t_bindless_spv: rewrote %u pool variables in %s -> %s\n", patched, src, dst);
+    printf("t_bindless_spv: rewrote %u %s in %s -> %s\n", patched, feedback ? "feedback accesses" : "pool variables", src, dst);
     return 0;
 }
 
 int main(int argc, char **argv) {
-    if (argc == 3) return rewrite_file(argv[1], argv[2]);
+    if (argc == 3) return rewrite_file(0, argv[1], argv[2]);
+    if (argc == 4 && !strcmp(argv[1], "--feedback")) return rewrite_file(1, argv[2], argv[3]);
     uint32_t w[256]; size_t n = module(w), no = 0; unsigned patched = 0;
     uint32_t *o = spvr_bindless(w, n, 5, 32768, &no, &patched);
     check(o && no == n && patched == 4, "all four pool variables recognised");
@@ -126,8 +153,11 @@ int main(int argc, char **argv) {
     uint32_t fw[256]; size_t fn = feedback_module(fw), fno = 0; patched = 0;
     o = spvr_bindless_feedback(fw, fn, 5, 6, &fno, &patched);
     uint32_t fv = o ? feedback_var(o, fno) : 0;
-    check(o && patched == 1 && fv, "one bindless texture access receives feedback instrumentation");
+    unsigned calls = 0, atomics = 0;
+    check(o && patched == 1 && fv, "intra-block duplicate bindless accesses collapse to one feedback patch");
     check(o && entry_has(o, fno, fv), "SPIR-V 1.4 entry point names the injected feedback SSBO");
+    check(o && has_prechecked_atomic(o, fno, &calls, &atomics) && calls == 1 && atomics == 1,
+          "plain-load pre-check guards OpAtomicOr via helper function");
     free(o);
     printf("t_bindless_spv: %s (%d failures)\n", bad ? "FAILED" : "passed", bad);
     return bad != 0;
