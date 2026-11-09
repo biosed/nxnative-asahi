@@ -68,3 +68,5 @@ void vkx_queue_forget(uint64_t serial);
 uint64_t vkx_skipcs_count(void);
 // Compute shader keys dispatched since the last call, most first, " <key>:<count>"...; the DM_VK_OPS line (vk_replay.c)
 int vkx_dispatch_keys_log(char *out, size_t n);
+// Shader compiles in flight for 2 s or more, "N compiling, oldest <key> ... for S s" (vk_compile_watch.h); 0 = none. The GPU heartbeat appends it (vk_replay.c gp_thread)
+int vkx_compile_text(char *out, size_t n);

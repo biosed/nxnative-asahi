@@ -38,7 +38,7 @@ OBJ := $(NVN_OBJ) \
        $(patsubst %,$(OUT)/obj/linux/%.o,$(NULL_SRC))
 
 .DEFAULT_GOAL := null-renderer
-.PHONY: profile null-renderer vulkan-replay-objects nxasahi-renderer-objects nxasahi-renderer nxasahi-front vulkan-selftest vk-mem-selftest t_push t_skipcs t_gpstamp t_focus t_gmem_trace t_missing_log t_counter_report t_vk_stage t_vk_format t_vk_cs_gpu_lifecycle t_vk_mesh t_vk_mesh_compile t_vk_descriptor_pool t_vk_mesh_coverage t_vk_shader_resolve dmhost dmhost-vulkan t_fs_linux clean
+.PHONY: profile null-renderer vulkan-replay-objects nxasahi-renderer-objects nxasahi-renderer nxasahi-front vulkan-selftest vk-mem-selftest t_push t_skipcs t_gpstamp t_focus t_gmem_trace t_missing_log t_counter_report t_vk_stage t_vk_compile_watch t_vk_format t_vk_cs_gpu_lifecycle t_vk_image_refs t_vk_gmem_map t_vk_bindless_lru t_vk_mesh t_vk_mesh_compile t_vk_descriptor_pool t_vk_mesh_coverage t_vk_shader_resolve t_vk_movie dmhost dmhost-vulkan t_fs_linux clean
 
 # The consolidated asahi branch also carries the Linux host. Keep its object
 # namespace and rules separate so renderer-only checks remain bounded and a
@@ -111,6 +111,11 @@ $(OUT)/t_skipcs: vk/tests/t_skipcs.c vk/vk_skipcs.h | profile
 	$(CC) $(CPPFLAGS) -std=gnu11 -O1 -g -Wall -Wextra -Werror -Ivk -o $@ $<
 t_skipcs: $(OUT)/t_skipcs
 	$<
+$(OUT)/t_vk_movie: vk/tests/t_vk_movie.c vk/vk_movie.h | profile
+	@mkdir -p $(dir $@)
+	$(CC) $(CPPFLAGS) -std=gnu11 -O1 -g -Wall -Wextra -Werror -Ivk -o $@ $<
+t_vk_movie: $(OUT)/t_vk_movie
+	$<
 $(OUT)/t_gpstamp: vk/tests/t_gpstamp.c vk/vk_gpstamp.h | profile
 	@mkdir -p $(dir $@)
 	$(CC) $(CPPFLAGS) -std=gnu11 -O1 -g -Wall -Wextra -Werror -Ivk -o $@ $<
@@ -145,6 +150,29 @@ $(OUT)/t_vk_stage: vk/tests/t_vk_stage.c vk/vk_stage.h | profile
 	@mkdir -p $(dir $@)
 	$(CC) $(CPPFLAGS) -std=gnu11 -O1 -g -Wall -Wextra -Werror -Ivk $$($(PKG_CONFIG) --cflags vulkan) -o $@ $<
 t_vk_stage: $(OUT)/t_vk_stage
+	$<
+$(OUT)/t_vk_compile_watch: vk/tests/t_vk_compile_watch.c vk/vk_compile_watch.h | profile
+	@mkdir -p $(dir $@)
+	$(CC) $(CPPFLAGS) -std=gnu11 -O1 -g -Wall -Wextra -Werror -Ivk -o $@ $<
+t_vk_compile_watch: $(OUT)/t_vk_compile_watch
+	$<
+
+$(OUT)/t_vk_image_refs: vk/tests/t_vk_image_refs.c vk/vk_image_refs.h vk/vk_tex_lifetime.h | profile
+	@mkdir -p $(dir $@)
+	$(CC) $(CPPFLAGS) -std=gnu11 -O1 -g -Wall -Wextra -Werror -Ivk -o $@ $<
+t_vk_image_refs: $(OUT)/t_vk_image_refs
+	$<
+
+$(OUT)/t_vk_gmem_map: vk/tests/t_vk_gmem_map.c vk/vk_gmem_map.h ../gfx/nvn/dmsh_abi.h | profile
+	@mkdir -p $(dir $@)
+	$(CC) $(CPPFLAGS) -std=gnu11 -O1 -g -Wall -Wextra -Werror -Ivk -o $@ $<
+t_vk_gmem_map: $(OUT)/t_vk_gmem_map
+	$<
+
+$(OUT)/t_vk_bindless_lru: vk/tests/t_vk_bindless_lru.c vk/vk_bindless_lru.h | profile
+	@mkdir -p $(dir $@)
+	$(CC) $(CPPFLAGS) -std=gnu11 -O1 -g -Wall -Wextra -Werror -Ivk -o $@ $<
+t_vk_bindless_lru: $(OUT)/t_vk_bindless_lru
 	$<
 
 $(OUT)/t_vk_format: vk/tests/t_vk_format.c vk/vk_replay.h vk/vk_fmt.c vk/vk_fmt.h ../gfx/tex/nvn_fmt_mtl.c ../gfx/tex/nvn_fmt_mtl.h | profile

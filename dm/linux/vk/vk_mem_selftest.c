@@ -132,6 +132,28 @@ int main(void) {
     dm_gpu_commit(guest + test_chunk, COPY_SIZE);
     if (!vkm_pool_commit(guest + test_chunk, COPY_SIZE))
         die("vk_mem selftest: second pool commit failed");
+    // Read a page the CPU has never opened through the sparse Vulkan buffer
+    // before faulting it into the guest mapping.  In demand-zero mode this is
+    // the important physical contract: Honeykrisp must expose fresh placed
+    // memory as zero to the GPU without vk_mem prefaulting every guest page.
+    if (!vkm_lookup(guest + test_chunk, COPY_SIZE, &src, &src_off, &src_gpu))
+        die("vk_mem selftest: demand-zero page is not GPU-visible");
+    memset(dst_map, 0xa5, COPY_SIZE);
+    VK_CHECK(vkResetCommandPool(g_vkd.dev, pool, 0));
+    VK_CHECK(vkResetFences(g_vkd.dev, 1, &fence));
+    VK_CHECK(vkBeginCommandBuffer(cb, &cbi));
+    copy.srcOffset = src_off;
+    vkCmdCopyBuffer(cb, src, dst, 1, &copy);
+    VK_CHECK(vkEndCommandBuffer(cb));
+    pthread_mutex_lock(&g_vkd_qlock);
+    qr = vkQueueSubmit(g_vkd.q, 1, &si, fence);
+    pthread_mutex_unlock(&g_vkd_qlock);
+    if (qr != VK_SUCCESS)
+        die("vk_mem selftest: demand-zero copy submit failed (%d)", qr);
+    VK_CHECK(vkWaitForFences(g_vkd.dev, 1, &fence, VK_TRUE, UINT64_MAX));
+    for (size_t i = 0; i < COPY_SIZE; i++)
+        if (((const uint8_t *)dst_map)[i])
+            die("vk_mem selftest: GPU saw nonzero fresh memory at byte %zu", i);
     // A closed page was deliberately never populated by vk_mem in demand-zero
     // mode.  Opening it must still expose the guest OS's fresh-memory value.
     if (mprotect(guest + test_chunk, pg, PROT_READ | PROT_WRITE))

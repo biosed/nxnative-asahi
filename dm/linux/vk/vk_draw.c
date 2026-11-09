@@ -14,12 +14,14 @@
 #include "spv_reflect.h"
 #include "vk_draw.h"
 #include "vk_skipcs.h"
+#include "vk_movie.h"
 #include "vk_gmem_trace.h"
 #include "vk_missing_log.h"
 #include "vk_stage.h"
 #include "vk_shader_resolve.h"
 #include "vk_mesh_trace.h"
 #include "vk_omap.h"
+#include "vk_compile_watch.h"
 #include <stdatomic.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -63,6 +65,14 @@ typedef struct vks {
     uint32_t frag_out_map;       // pixel SPH word 18; 4 RGBA bits per target
     vkx_mesh_stage_meta mesh_meta;   // actual stage and native task/mesh job limits; host slot remains separate
 } vks;
+typedef struct {
+    char key[17];
+    int kind;
+    vkbind input, output;
+} vkx_movie_shader;
+#define VKX_MOVIE_SHADERS_MAX 64
+static vkx_movie_shader g_movie_shader[VKX_MOVIE_SHADERS_MAX];
+static int g_nmovie_shader;
 static vks *g_sh[1024]; static pthread_mutex_t g_shmu = PTHREAD_MUTEX_INITIALIZER;
 enum { VKX_BINDLESS_SET = 5, VKX_FEEDBACK_SET = 6, VKX_BINDLESS_2D = 0, VKX_BINDLESS_2DA = 1, VKX_BINDLESS_DEPTH = 2, VKX_BINDLESS_SAMP = 3 };
 static VkDescriptorSetLayout g_dsl, g_bindless_dsl; static VkDescriptorPool g_bindless_pool; static VkDescriptorSet g_bindless_set;
@@ -166,9 +176,39 @@ static VkShaderStageFlagBits vstage_of(int st) {
 }
 static void parse_vkb(vks *s, const char *txt);
 static int bindless_vkb(const vkbind *b);
+static int movie_named(const char key[17]) {
+    const char *p = DM_GAME_MOVIE_NET_KEYS;
+    while (*p) {
+        if (!strncmp(p, key, 16) && (p[16] == ',' || !p[16])) return 1;
+        p = strchr(p, ','); if (!p) break; p++;
+    }
+    return 0;
+}
+static void movie_reflect(const char key[17], const vks *s) {
+    if (!movie_named(key)) return;
+    int nt = 0, ni = 0, ns = 0; const vkbind *input = NULL, *output = NULL;
+    for (int i = 0; i < s->nb; i++) {
+        const vkbind *b = &s->bd[i];
+        if (b->desc == 't') { nt++; input = b; }
+        else if (b->desc == 'i') { ni++; output = b; }
+        else if (b->k == BK_SBUF || b->k == BK_UBO_PTR) ns++;
+    }
+    int kind = vkx_movie_classify(1, nt, ni, ns);
+    if (kind == VKX_MOVIE_NONE) return;
+    if (g_nmovie_shader == VKX_MOVIE_SHADERS_MAX) {
+        static int warned; if (!warned++) LOG("[RED] vulkan draws: movie network reflection exceeds its %d-shader bound", VKX_MOVIE_SHADERS_MAX);
+        return;
+    }
+    vkx_movie_shader *m = &g_movie_shader[g_nmovie_shader++];
+    snprintf(m->key, sizeof m->key, "%s", key); m->kind = kind;
+    if (input) m->input = *input;
+    if (output) m->output = *output;
+}
 static void shc_init(uint64_t layout_hash); static void precompile_start(void);
 static char (*g_keys)[17]; static int g_nkeys;   // every standard and native-mesh shader key (draw_init)
+static void cw_start(void);   // the compile watcher thread (below sh_object)
 static int draw_init(void) {
+    cw_start();
     if (g_init >= 0) return g_init;
     g_feedback_enabled = getenv("DM_VK_BINDLESS_FEEDBACK") && atoi(getenv("DM_VK_BINDLESS_FEEDBACK"));
     const char *seed = getenv("DM_VK_BINDLESS_SEED");
@@ -213,6 +253,7 @@ static int draw_init(void) {
             if (!vkx_shader_resolve(g_spv, g_mesh_spv, key, -1, &rr) || rr.mesh_ext != di) continue;
             uint8_t *txt; size_t nt; if (!read_file(rr.vkb, &txt, &nt)) continue;
             static vks tmp; tmp.nb = 0; parse_vkb(&tmp, (const char *)txt); free(txt); nfiles++; if (di) nmesh++;
+            if (!di) movie_reflect(key, &tmp);
             if (!(g_nkeys & 1023)) g_keys = realloc(g_keys, (g_nkeys + 1024) * sizeof *g_keys);
             memcpy(g_keys[g_nkeys], key, 17); g_nkeys++;
             for (int i = 0; i < tmp.nb; i++) { const vkbind *b = &tmp.bd[i]; if (b->b >= 1024 || bindless_vkb(b)) continue;
@@ -301,6 +342,29 @@ static int bindless_vkb(const vkbind *b) {
 // Shader objects made and the time they took (the long-frame log's "new pipelines + shader libraries": shaders as libraries, GL-depth variants as pipelines)
 static _Atomic uint64_t g_mk_sh, g_mk_sh_ns, g_mk_var, g_mk_var_ns;
 static uint64_t mk_now(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec; }
+// ---- compile visibility (vk_compile_watch.h) ----
+// A first-use compile of a large kernel holds the replay thread for the driver's whole compile (Ocarina's NDVE d15370a382630d4e: 57 s on Honeykrisp), which the
+// log showed only as a GPU heartbeat with nothing submitted. The table below holds every SPIR-V compile in flight; the watcher thread prints those older than 2 s
+// every 5 s, the heartbeat appends them (vkx_compile_text), and a finished compile of 1 s or more is logged by default. DM_VK_COMPILE_WATCH=0 leaves the thread out.
+static vkx_cw_table g_cw;
+enum { CW_REPORT_NS = 2000000000, CW_PERIOD_NS = 5000000000 };
+int vkx_compile_text(char *out, size_t n) { return vkx_cw_text(&g_cw, mk_now(), CW_REPORT_NS, out, n); }
+static void *cw_thread(void *arg) {
+    (void)arg; uint64_t last = 0; char line[160];
+    for (;;) {
+        usleep(1000000);
+        uint64_t now = mk_now();
+        if (now - last < CW_PERIOD_NS) continue;
+        if (vkx_cw_text(&g_cw, now, CW_REPORT_NS, line, sizeof line)) { last = now; LOG("vulkan shader compile: %s", line); }
+    }
+    return NULL;
+}
+static void cw_start(void) {   // from draw_init, once, before any thread compiles
+    static _Atomic int started;
+    if (atomic_exchange(&started, 1)) return;
+    const char *e = getenv("DM_VK_COMPILE_WATCH"); if (e && atoi(e) == 0) return;
+    pthread_t t; if (!pthread_create(&t, NULL, cw_thread, NULL)) pthread_detach(t); else LOG("[RED] vulkan draws: no compile watcher thread (long compiles are logged only when they finish)");
+}
 void mtl_create_stats(uint64_t *lib, uint64_t *pso) { *lib = atomic_load(&g_mk_sh); *pso = atomic_load(&g_mk_var); }
 void mtl_create_ns(uint64_t *lib_ns, uint64_t *pso_ns) { *lib_ns = atomic_load(&g_mk_sh_ns); *pso_ns = atomic_load(&g_mk_var_ns); }
 static int drawlog(void) { static int v = -1; if (v < 0) v = getenv("DM_VK_DRAWLOG") != NULL; return v; }   // DM_VK_DRAWLOG: draw counters at powers of two
@@ -380,7 +444,9 @@ static uint32_t *sh_code(const char *key, int *st_out, size_t *nw, vks *s, unsig
         s->mesh_meta = stage_meta;
         const char *c1 = job ? strstr((const char *)job, "\"c1\": \"") : NULL;   // c1: the shader's own constants, from its translation job
         uint8_t *c1d = NULL; size_t c1n = 0;
-        if (c1) { c1 += 7; const char *e = strchr(c1, '"'); c1n = e ? (size_t)(e - c1) / 2 : 0; c1d = malloc(c1n ? c1n : 1); for (size_t i = 0; i < c1n; i++) c1d[i] = (uint8_t)hexbyte(c1 + 2 * i); }
+        if (c1) { c1 += 7; const char *e = strchr(c1, '"'); c1n = e ? (size_t)(e - c1) / 2 : 0; c1d = calloc(1, c1n ? c1n : 256); for (size_t i = 0; i < c1n; i++) c1d[i] = (uint8_t)hexbyte(c1 + 2 * i); }
+        if (!c1d) c1d = calloc(1, 256);   // no c1 in the job: 256 zero bytes. The buffer below copied 256 bytes from a 1-byte block (or from NULL), a read past the
+                                          // heap block that faulted when it ended a mapped page (SIGSEGV in sh_code at the first shader of a new scene)
         buffer_with(c1d, c1n > 65536 ? 65536 : (c1n ? c1n : 256), &s->c1, &s->c1m); s->c1_len = (uint32_t)c1n; free(c1d);
     }
     static int nanp = -1;   // the driver keeps NaN and infinities when the module asks (SignedZeroInfNanPreserve for 32-bit floats)
@@ -484,11 +550,15 @@ static VkShaderEXT sh_object(const char *key, int st, int gl, const uint32_t *sp
     if (compile_log)
         LOG("vulkan shader compile: key=%s stage=%d gl=%d fence-next=%llu begin",
             key, st, gl, (unsigned long long)vkr_fence_next());
+    int cw = vkx_cw_begin(&g_cw, key, st, gl, ci.codeSize, compile_t0);
     VkResult r = g_vkd.create_shaders(g_vkd.dev, 1, &ci, NULL, &o); free(g);
+    vkx_cw_end(&g_cw, cw);
+    uint64_t compile_ns = mk_now() - compile_t0;
     if (compile_log)
         LOG("vulkan shader compile: key=%s stage=%d gl=%d fence-next=%llu result=%d elapsed=%.3f s",
-            key, st, gl, (unsigned long long)vkr_fence_next(), (int)r,
-            (mk_now() - compile_t0) / 1e9);
+            key, st, gl, (unsigned long long)vkr_fence_next(), (int)r, compile_ns / 1e9);
+    else if (compile_ns >= 1000000000ull)   // a compile that held a frame: always in the log, with what reproduces it
+        LOG("vulkan shader compile: key=%s stage=%d gl=%d %zu bytes SPIR-V result=%d took %.1f s", key, st, gl, ci.codeSize, (int)r, compile_ns / 1e9);
     if (r) return VK_NULL_HANDLE;
     if (compiled) *compiled = 1;
     if (g_shc_on && g_vkd.shader_binary) {   // into the cache: written to a temporary name and renamed, so a reader never sees half a file
@@ -812,6 +882,14 @@ static void bindless_update(VkCommandBuffer c) {
         }
         vkUpdateDescriptorSets(g_vkd.dev, (uint32_t)nw, wr, 0, NULL); samp_writes += (uint64_t)n;
     }
+    {   // The pool's standing state, every 4096 submissions and loud while texture IDs draws may sample still hold the blank placeholder: a run with
+        // thousands of them pending drew black models and empty text with nothing in the log (Ocarina of Time: 2520 of 8041 after seven minutes)
+        static uint64_t calls; calls++;
+        if (!(calls & 4095)) { unsigned real = 0; for (int i = 1; i < VKR_BINDLESS_TEXTURES; i++) real += g_bindless_real[i];
+            LOG("%svulkan draws: bindless pool after %llu submissions: %llu texture IDs written, %u hold a real image, %u pending retry behind the %.0f MiB speculative budget (%llu placeholder writes, %llu repaired)",
+                g_bindless_retry_n ? "[RED] " : "", (unsigned long long)calls, (unsigned long long)tex_writes, real, g_bindless_retry_n, budget / 1048576.0,
+                (unsigned long long)tex_deferred, (unsigned long long)tex_retried); }
+    }
     static int shown;
     if ((tex_writes != tex_before || samp_writes != samp_before || tex_retried != retry_before) &&
         (!shown++ || tex_writes + samp_writes <= 64 || !((tex_writes + samp_writes) & (tex_writes + samp_writes - 1))))
@@ -850,6 +928,7 @@ void vkx_sub_begin(int slot, VkCommandBuffer c, uint64_t done) {
     gmem_log_poll(done);   // before a completed slot's mapped arena is reused
     res_init(c);
     bindless_feedback_scan(slot);
+    vkr_cpu_written_refresh();
     bindless_update(c);
     vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_GRAPHICS, g_pl_gfx, VKX_BINDLESS_SET, 1, &g_bindless_set, 0, NULL);
     vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_COMPUTE, g_pl_cs, VKX_BINDLESS_SET, 1, &g_bindless_set, 0, NULL);
@@ -1862,6 +1941,99 @@ int vkx_draw(VkCommandBuffer c, uint32_t op, const void *a, uint32_t size, int n
 // ---- compute dispatches ----
 static uint64_t g_st_dispatched, g_st_dskip;
 
+// nn::movie's NDVE shaders contain colour conversion plus a storage-buffer
+// enhancement network.  DM_MOVIE_ENHANCE=0 keeps colour conversion, replaces
+// the network's final one-texture/one-image dispatch with a Vulkan copy/blit,
+// and only then permits the next frame's intermediate stages to be omitted.
+// A refused copy disables the substitution and restores the full network.
+static vkx_movie_state g_movie_state;
+static uint64_t g_movie_copied;
+static int movie_enh_off(void) {
+    static int value = -1;
+    if (value >= 0) return value;
+    const char *e = getenv("DM_MOVIE_ENHANCE");
+    value = e && !strcmp(e, "0");
+    if (e && strcmp(e, "0") && strcmp(e, "1")) LOG("[RED] vulkan draws: DM_MOVIE_ENHANCE=%s: expected 1 or 0; keeping movie enhancement", e);
+    if (value) LOG("vulkan draws: movie enhancement off: %d profile shaders, %d reflected network stages; decoded frames replace the network output", DM_GAME_MOVIE_NET_N, g_nmovie_shader);
+    return value;
+}
+static vkx_movie_shader *movie_shader(const char key[17]) {
+    for (int i = 0; i < g_nmovie_shader; i++) if (!strcmp(g_movie_shader[i].key, key)) return &g_movie_shader[i];
+    return NULL;
+}
+static int movie_texture_id(const vkbind *b) {
+    if (b->k == BK_TEX && b->reg >= 0 && b->reg < 256) return (int)(S.tex[5][b->reg] & 0xfffff);
+    if (b->k == BK_TEX_UBO) {
+        uint32_t h = ubo_word(5, b->reg, b->off); int id = (int)(h & 0xfffff);
+        return id ? id + S.tex_base : 0;
+    }
+    return 0;
+}
+static int movie_copy(VkCommandBuffer c, const vkx_movie_shader *m,
+                      uint32_t *width, uint32_t *height,
+                      VkFormat *src_format, VkFormat *dst_format) {
+    int sid = movie_texture_id(&m->input);
+    int did = m->output.reg >= 0 && m->output.reg < 32 ? (int)(S.img[5][m->output.reg] & 0xfffff) : 0;
+    if (!sid || !did) return 0;
+    tex_t so = {0}, dso = {0}; view_t sv = {0}, dv = {0}; int shv = 0, dhv = 0;
+    pthread_mutex_lock(&g_tmu);
+    int ok = vkr_treg(sid, &so, &sv, &shv) && vkr_treg(did, &dso, &dv, &dhv);
+    vtex *src = ok ? vkr_tex_sampled(&so, VK_NULL_HANDLE) : NULL;
+    vtex *dst = ok ? vkr_tex_target(&dso) : NULL;
+    ok = src && dst && src != dst && src->img != dst->img &&
+         src->target == NVN_TEXTURE_TARGET_2D && dst->target == NVN_TEXTURE_TARGET_2D &&
+         src->d == 1 && dst->d == 1 && src->layers == 1 && dst->layers == 1 &&
+         src->samples == 1 && dst->samples == 1 && src->w == dst->w && src->h == dst->h &&
+         (src->aspect & VK_IMAGE_ASPECT_COLOR_BIT) && (dst->aspect & VK_IMAGE_ASPECT_COLOR_BIT) &&
+         (src->usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) && (dst->usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT) &&
+         (!shv || (!sv.set_levels && !sv.set_layers && vkr_view_format(src->fmt, &sv, shv) == src->fmt)) &&
+         (!dhv || (!dv.set_levels && !dv.set_layers && vkr_view_format(dst->fmt, &dv, dhv) == dst->fmt));
+    if (ok && src->fmt == dst->fmt) {
+        VkImageCopy copy = {
+            .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+            .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+            .extent = {src->w, src->h, 1},
+        };
+        vkCmdCopyImage(c, src->img, VK_IMAGE_LAYOUT_GENERAL, dst->img, VK_IMAGE_LAYOUT_GENERAL, 1, &copy);
+    } else if (ok) {
+        VkFormatProperties sf, df; vkGetPhysicalDeviceFormatProperties(g_vkd.pd, src->fmt, &sf); vkGetPhysicalDeviceFormatProperties(g_vkd.pd, dst->fmt, &df);
+        ok = (sf.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_SRC_BIT) && (df.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_DST_BIT);
+        if (ok) {
+            VkImageBlit blit = {
+                .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .srcOffsets = {{0, 0, 0}, {(int32_t)src->w, (int32_t)src->h, 1}},
+                .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .dstOffsets = {{0, 0, 0}, {(int32_t)dst->w, (int32_t)dst->h, 1}},
+            };
+            vkCmdBlitImage(c, src->img, VK_IMAGE_LAYOUT_GENERAL, dst->img, VK_IMAGE_LAYOUT_GENERAL, 1, &blit, VK_FILTER_NEAREST);
+        }
+    }
+    if (ok) {
+        vkr_tex_gpu_write(dst); *width = src->w; *height = src->h;
+        *src_format = src->fmt; *dst_format = dst->fmt;
+    }
+    pthread_mutex_unlock(&g_tmu);
+    return ok;
+}
+static int movie_net_dispatch(VkCommandBuffer c, const char key[17], const p_dispatch *p) {
+    if (!DM_GAME_MOVIE_NET_N || p->ind || !movie_enh_off()) return 0;
+    vkx_movie_shader *m = movie_shader(key); if (!m || m->kind == VKX_MOVIE_NONE) return 0;
+    if (m->kind == VKX_MOVIE_STAGE) {
+        if (!vkx_movie_skip_stage(&g_movie_state)) return 0;
+        return 1;
+    }
+    uint32_t w = 0, h = 0; VkFormat sf = VK_FORMAT_UNDEFINED, df = VK_FORMAT_UNDEFINED;
+    unsigned left = g_movie_state.stages_left;
+    int ok = movie_copy(c, m, &w, &h, &sf, &df);
+    vkx_movie_copy_result(&g_movie_state, ok);
+    if (!ok) {
+        if (left) LOG("[RED] vulkan draws: movie network %s copy refused after %u intermediate stages were omitted; this frame is incomplete and the full network is restored", key, left);
+        else LOG("[RED] vulkan draws: movie network %s copy refused; the full network remains active", key);
+        m->kind = VKX_MOVIE_NONE;
+        return 0;
+    }
+    if (!g_movie_copied++) LOG("vulkan draws: first movie frame without enhancement: %ux%u Vulkan format %d -> %d; later intermediate stages may now be omitted", w, h, (int)sf, (int)df);
+    return 1;
+}
+
 // Compute shaders left out on purpose (vk_skipcs.h: DM_VK_SKIP_CS exact keys): read once, each selected key logged once. The key is checked before shader_get,
 // so this dispatch neither requests a shader object nor reaches the command buffer (background prewarming may still compile it). Unset follows the original path.
 static vkx_skipcs g_skipcs; static int g_skipcs_read;
@@ -1905,6 +2077,8 @@ void vkx_dispatch(VkCommandBuffer c, const p_dispatch *p) {
     if (!draw_init() || g_pool_slot < 0 || !S.prog[5]) DSKIP(0);
     vks *s = NULL; uint8_t k8[8];
     for (int i = 0; i < NST && !s && prog_key(S.prog[5], (unsigned)i, k8); i++) {
+        char key[17]; key_hex(k8, key);
+        if (movie_net_dispatch(c, key, p)) return;
         if (skipcs(k8)) { g_st_dskip++; return; }
         vks *t = shader_get(S.prog[5], i); if (t && t->stage == 5) s = t;
     }

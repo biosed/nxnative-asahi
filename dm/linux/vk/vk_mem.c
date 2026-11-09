@@ -9,6 +9,7 @@
 #include "dmsh_abi.h"
 #include "vk_dev.h"
 #include "vk_mem.h"
+#include "vk_gmem_map.h"
 #include "nvn_dirty.h"
 #include <sys/mman.h>
 #include <sys/syscall.h>
@@ -411,13 +412,9 @@ int vkm_gmem_map(void *dst, size_t size, uint64_t *generation) {
     uint64_t gen; int n;
     do { gen = vkm_generation(); n = vkm_segments(lo, hi, gpu, DMSH_GMEM_MAP_ENTRIES - 1); }
     while (gen != vkm_generation());
-    uint8_t *d = dst;
-    memset(d, 0xff, need); memset(d, 0, DMSH_GMEM_MAP_ENTRY);
-    for (int i = 0; i < n; i++) {
-        uint64_t e[4] = {lo[i], hi[i], gpu[i] - lo[i], 0};
-        memcpy(d + (size_t)(i + 1) * DMSH_GMEM_MAP_ENTRY, e, sizeof e);
-    }
+    int out = vkx_gmem_map_pack(dst, size, lo, hi, gpu, n);
+    if (out < 0) return -1;
     if (generation) *generation = gen;
-    return n;
+    return out;
 }
 void vkm_stats(uint64_t *chunks, uint64_t *bytes) { pthread_mutex_lock(&g_mu); *chunks = g_chunks; *bytes = g_bytes; pthread_mutex_unlock(&g_mu); }

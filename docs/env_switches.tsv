@@ -103,6 +103,7 @@ DM_MOTION_AXES	switch	`=<map>` such as `x,-z,y`: maps Apple's controller axes to
 DM_MOTION_GAIN	switch	`=<gain>`: how fast the orientation is pulled toward the measured gravity, in rad/s per unit error (default 0.5; `0` integrates the gyro alone)
 DM_MOTION_HID	switch	On the Mac, `0` disables the passive Switch Pro Controller HID motion fallback (`motion_pro_mac.h`); enabled by default when exactly one physical Pro and one GameController Pro can use the same player slot; usable GameController motion takes priority
 DM_MOTION_LOG	diagnostic	`=1` logs player 1's mapped motion sample once a second per source (phone / GameController / controller HID; acceleration in G, gyro in revolutions/s), for checking the axes: flat and still reads acc 0 0 -1
+DM_MOVIE_ENHANCE	player	`0` leaves out the storage-buffer stages of an nn::movie NDVE enhancement network only after its final one-texture/one-image step has been replaced successfully by a decoded-frame copy; `1` or unset runs the complete network (`vk_draw.c` `movie_net_dispatch`)
 DM_MOVIE_TRACE	diagnostic	When set, the movie decoder logs every call with its thread and decoder (by default the first 12 calls, then every 2^k-th)
 DM_MSL_DIR	path	Parent folder of the shader libraries: NVN loads from `b-<chain version>/` or the one file `b-<chain version>.img` beneath it, Vulkan from `vk/`, GL from `gl/`; the app and the Mac launcher set it
 DM_NICK	switch	The account nickname the game sees (default `Player`)
@@ -354,9 +355,12 @@ DM_UE_SHADERS	path	Folder of the Unreal shader code archives decoded by `uepak.p
 DM_UE_TEXTURE_POOL	switch	Megabytes Unreal's texture streaming pool (`r.Streaming.PoolSize`) is raised to, overriding the profile's `ue_texture_pool`; `0` keeps the game's own pool. On iOS only this switch turns it on (`Documents/env.txt`)
 DM_UPSCALER	player	`metalfx` draws the game's own upscaler shaders (agl's NDSR network, found by the shader map) with MetalFX's spatial scaler; `game` (the default) runs them
 DM_VK_CAPTURE	path	`=<dir>` (Mac) writes every SPIR-V module the game creates to `<dir>/<key>.spv`; the NSP script's Vulkan shader capture stage sets it
+DM_VK_COMPILE_WATCH	switch	`=0` leaves out the compile watcher thread that logs shader compiles in flight for 2 s or more every 5 s (vk_draw.c; the GPU heartbeat appends the same text); default on
 DM_VK_CS_GPU	diagnostic	`=1` timestamps Vulkan compute dispatches in place and logs `[vk-cs-gpu]` lines with frame, shader key, workgroup dimensions and GPU time; no submissions, waits or barriers are added (4,096 samples by default, at most 512 per command buffer)
 DM_VK_CS_GPU_LIMIT	diagnostic	With `DM_VK_CS_GPU=1`, sets the bounded total number of dispatch samples to log (1..65,536; default 4,096)
+DM_VK_GPU_HEARTBEAT	diagnostic	`=1` logs `vulkan GPU heartbeat: submitted/done/report-wait` once a second from the GPU-value thread (vk_replay.c), with any shader compile in flight for 2 s or more
 DM_VK_LOG	diagnostic	`=1` logs Vulkan object creation in the Vulkan-on-Metal layer
+DM_VK_SHADER_COMPILE_LOG	diagnostic	`=1` logs the begin and end of every shader compile with key, stage, form, fence value and elapsed time (vk_draw.c); compiles of 1 s or more are logged without it
 DM_VSYNC_HZ	switch	`=<Hz>`: rate at which a host thread fires the vi vsync event when the display link does not drive it (default 60)
 DM_WATCH	diagnostic	`=<s>` dumps all threads after that many seconds (SIGALRM) and turns on the stall watchdog; off unless set
 DM_WATCH_SAMPLE	diagnostic	`=<path>` (Mac): when the stall watchdog fires, samples the process for 1 s with `/usr/bin/sample` and writes the thread stacks to that path

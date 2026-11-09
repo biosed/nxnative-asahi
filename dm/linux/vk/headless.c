@@ -29,7 +29,7 @@ void mtl_set_frame(uint64_t f) { atomic_store(&g_frame_no, f); }
 uint64_t vkh_frame(void) { return atomic_load(&g_frame_no); }   // the frame the game is recording (vk_replay.c's GPU timing)
 void mtl_set_tex_pool_n(int n) { (void)n; }
 void mtl_xv_window_tex(uint64_t serial) { (void)serial; }
-void mtl_tex_cpu_written(const tex_t *t) { (void)t; }
+// mtl_tex_cpu_written: vk_replay.c (textures re-uploaded after a CPU write)
 void mtl_prog_release(prog_t *p) { (void)p; }
 void mtl_read_texels(const tex_t *t, unsigned level, unsigned layer0, const NVNcopyRegion *r, uint8_t *dst, size_t row, size_t img) {
     (void)t; (void)level; (void)layer0; (void)r; (void)dst; (void)row; (void)img;
@@ -48,7 +48,7 @@ void mtl_pool_add(const void *mem, uint64_t size) {
                                      (unsigned long long)atomic_load(&g_pool_a16), (unsigned long long)(atomic_load(&g_pool_a16_bytes) >> 20));
 }
 void mtl_pool_del(const void *mem) { (void)mem; }
-void mtl_alias_drop_pool(const void *pool) { (void)pool; }
+// mtl_alias_drop_pool: vk_replay.c (the images built on a finalized pool)
 // Whether [addr, addr+len) is in GPU-visible guest memory (vk_mem.c): hle_nvn.c computes a program's shader keys at SetShaders only then, while the control
 // section it hashes is still valid. Answering no for everything left them to the first draw, when Pokémon Shining Pearl had already reused the control
 // sections' memory: every vertex shader key was wrong and nothing was drawn
