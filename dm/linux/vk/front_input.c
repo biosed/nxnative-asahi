@@ -1,6 +1,7 @@
 // Linux build: keyboard and SDL gamepads → the players' controllers, with the bindings remappable (front_sdl.c feeds it the window's events).
 // Each player has a keyboard (on or off) and a controller (none, the next free one, or one model by its SDL GUID), each with its own bindings, and a stick deadzone.
 // DM_INPUT_MAP names a map file (the library front end writes it: frontend/controllers.py); without one the built-in map below is the one the Mac front end uses.
+// DM_INPUT_LOG=1 logs each non-repeat keyboard event and the player-1 keyboard state it evaluates to, to distinguish window/event delivery from mapping or HID faults.
 // Map file, one line each, '#' starts a comment:
 //   player <1-8> keyboard on|off
 //   player <1-8> controller none|any|<GUID, 32 hex digits>
@@ -35,6 +36,12 @@ typedef struct {
 } player_t;
 static player_t g_pl[DM_PLAYERS];
 static bool g_keys[SDL_SCANCODE_COUNT];
+
+static int input_log(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("DM_INPUT_LOG"); on = e && atoi(e) != 0; }
+    return on;
+}
 
 // The Mac front end's map (front_mac.m): W A S D the left stick, J K U I → A B X Y, F G press the sticks, Q E Z C → L R ZL ZR, Return Tab → + −, the arrows the
 // d-pad, Space shakes; controllers one player each in the order they connect, buttons by position (right A, bottom B, top X, left Y), triggers as ZL / ZR
@@ -160,6 +167,12 @@ static void players_changed(void) {
 void input_key(const SDL_KeyboardEvent *k) {
     if (k->repeat || (unsigned)k->scancode >= SDL_SCANCODE_COUNT) return;
     g_keys[k->scancode] = k->down;
+    if (input_log()) {
+        pad_state s = eval(&g_pl[0], src_key);
+        LOG("input: key %s (scancode %u) %s; player 1 keyboard buttons=%#llx left=(%d,%d) right=(%d,%d)",
+            SDL_GetScancodeName(k->scancode), (unsigned)k->scancode, k->down ? "down" : "up",
+            (unsigned long long)s.b, s.lx, s.ly, s.rx, s.ry);
+    }
     for (int p = 0; p < DM_PLAYERS; p++) if (g_pl[p].keyboard) push(p);
 }
 void input_pad_added(SDL_JoystickID id) {

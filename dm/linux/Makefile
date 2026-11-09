@@ -38,7 +38,7 @@ OBJ := $(NVN_OBJ) \
        $(patsubst %,$(OUT)/obj/linux/%.o,$(NULL_SRC))
 
 .DEFAULT_GOAL := null-renderer
-.PHONY: profile null-renderer vulkan-replay-objects nxasahi-renderer-objects nxasahi-renderer nxasahi-front vulkan-selftest vk-mem-selftest t_push t_skipcs t_gpstamp t_focus t_gmem_trace t_missing_log t_counter_report t_vk_stage t_vk_compile_watch t_vk_format t_vk_cs_gpu_lifecycle t_vk_image_refs t_vk_gmem_map t_vk_bindless_lru t_vk_mesh t_vk_mesh_compile t_vk_descriptor_pool t_vk_mesh_coverage t_vk_shader_resolve t_vk_movie dmhost dmhost-vulkan t_fs_linux clean
+.PHONY: profile null-renderer vulkan-replay-objects nxasahi-renderer-objects nxasahi-renderer nxasahi-front vulkan-selftest vk-mem-selftest t_push t_skipcs t_gpstamp t_focus t_front_input t_gmem_trace t_missing_log t_counter_report t_vk_stage t_vk_compile_watch t_vk_format t_vk_cs_gpu_lifecycle t_vk_image_refs t_vk_gmem_map t_vk_bindless_lru t_vk_mesh t_vk_mesh_compile t_vk_descriptor_pool t_vk_mesh_coverage t_vk_shader_resolve t_vk_movie dmhost dmhost-vulkan t_fs_linux clean
 
 # The consolidated asahi branch also carries the Linux host. Keep its object
 # namespace and rules separate so renderer-only checks remain bounded and a
@@ -126,6 +126,11 @@ $(OUT)/t_focus: vk/tests/t_focus.c vk/front_focus.h | profile
 	$(CC) $(CPPFLAGS) -std=gnu11 -O1 -g -Wall -Wextra -Werror -Ivk -o $@ $<
 t_focus: $(OUT)/t_focus
 	$<
+$(OUT)/t_front_input: vk/tests/t_front_input.c vk/front_input.c | profile
+	@mkdir -p $(dir $@)
+	$(CC) $(CPPFLAGS) -std=gnu11 -O1 -g -Wall -Wextra -Werror -Ivk $$($(PKG_CONFIG) --cflags sdl3) -o $@ $< $$($(PKG_CONFIG) --libs sdl3) -lm
+t_front_input: $(OUT)/t_front_input
+	$< ../../../config/oot-keyboard.map
 $(OUT)/t_gmem_trace: vk/tests/t_gmem_trace.c vk/vk_gmem_trace.h vk/spv_reflect.c vk/spv_reflect.h | profile
 	@mkdir -p $(dir $@)
 	$(CC) $(CPPFLAGS) -std=gnu11 -O1 -g -Wall -Wextra -Werror -Ivk $$($(PKG_CONFIG) --cflags vulkan) -o $@ vk/tests/t_gmem_trace.c vk/spv_reflect.c
