@@ -441,14 +441,22 @@ def hmma_lds(module):
                 raise ValueError('%s call has %d arguments, expected %d' %
                                  (HMMA_NAME, len(args), HMMA_PARAMETERS))
             keys = [values.key_of_var(ptr) for ptr in args[:10]]
-            vals = [emit(OP_LOAD, i32, ptr) for ptr in args[:10]]
-            lane, base = vals[0], vals[1]
-            group = integer(OP_SHR_LOGICAL, lane, ci[2])
-            thread = integer(OP_BITWISE_AND, lane, ci[3])
             key_a = ('A', *keys[:6])
             key_b = ('B', *keys[:2], *keys[6:8])
             needed = [key for key in (key_a, key_b) if key not in cache]
             if needed:
+                load_indices = {0, 1}
+                if key_a in needed:
+                    load_indices.update((2, 3, 4, 5))
+                if key_b in needed:
+                    load_indices.update((6, 7))
+                vals = {
+                    i: emit(OP_LOAD, i32, args[i])
+                    for i in sorted(load_indices)
+                }
+                lane, base = vals[0], vals[1]
+                group = integer(OP_SHR_LOGICAL, lane, ci[2])
+                thread = integer(OP_BITWISE_AND, lane, ci[3])
                 base4 = integer(OP_SHR_LOGICAL, base, ci[2])
                 vi = integer(OP_SHR_LOGICAL, thread, ci[1])
                 comp0 = emit(
@@ -504,11 +512,16 @@ def hmma_lds(module):
                         vec = emit(OP_LOAD, uvec4, pointer)
                         packed += [emit(OP_COMPOSITE_EXTRACT, u32, vec, c)
                                    for c in range(4)]
-                    return [
+                    unpacked = [
                         emit(
                             OP_EXT_INST, v2f, glsl, GLSL_UNPACK_HALF_2X16,
                             packed[2 * (kw % 4) + kw // 4],
                         ) for kw in range(8)
+                    ]
+                    return [
+                        [emit(OP_COMPOSITE_EXTRACT, f32, pair, half)
+                         for half in range(2)]
+                        for pair in unpacked
                     ]
 
                 if key_a in needed:
@@ -523,11 +536,12 @@ def hmma_lds(module):
                     ]
                 out.extend(list(barrier) for barrier in helper['barrier'])
             a_fragments, b_fragments = cache[key_a], cache[key_b]
+            cvals = [emit(OP_LOAD, i32, args[i]) for i in (8, 9)]
             result_words = []
             for row in range(2):
                 cvec = emit(
                     OP_EXT_INST, v2f, glsl, GLSL_UNPACK_HALF_2X16,
-                    emit(OP_BITCAST, u32, vals[8 + row]),
+                    emit(OP_BITCAST, u32, cvals[row]),
                 )
                 accum = [
                     emit(OP_COMPOSITE_EXTRACT, f32, cvec, 0),
@@ -538,14 +552,8 @@ def hmma_lds(module):
                         for half in range(2):
                             accum[col] = emit(
                                 OP_EXT_INST, f32, glsl, GLSL_FMA,
-                                emit(
-                                    OP_COMPOSITE_EXTRACT, f32,
-                                    a_fragments[row][kw], half,
-                                ),
-                                emit(
-                                    OP_COMPOSITE_EXTRACT, f32,
-                                    b_fragments[col][kw], half,
-                                ),
+                                a_fragments[row][kw][half],
+                                b_fragments[col][kw][half],
                                 accum[col],
                             )
                 pair = emit(OP_COMPOSITE_CONSTRUCT, v2f, *accum)

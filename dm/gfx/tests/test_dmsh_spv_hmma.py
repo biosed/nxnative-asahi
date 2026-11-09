@@ -15,10 +15,10 @@ TOOLS = Path(__file__).resolve().parents[1] / 'tools'
 sys.path.insert(0, str(TOOLS))
 import dmsh_chain
 from dmsh_spv_hmma import (DERIVED_SUFFIXES, HMMA_NAME, Module, OP_ACCESS_CHAIN, OP_BITCAST,
-                           OP_CAPABILITY, OP_COPY_OBJECT, OP_FUNCTION_PARAMETER, OP_LOAD,
-                           _current_scratch_array, _pointer_uses, _scratch_used_outside,
-                           functions_named, hmma_helper, hmma_lds, lower_file,
-                           remove_outputs)
+                           OP_CAPABILITY, OP_COMPOSITE_EXTRACT, OP_COPY_OBJECT,
+                           OP_FUNCTION_PARAMETER, OP_LOAD, _current_scratch_array,
+                           _pointer_uses, _scratch_used_outside, functions_named,
+                           hmma_helper, hmma_lds, lower_file, remove_outputs)
 
 
 def half_word(a, b):
@@ -94,13 +94,18 @@ def gathered_lowering(a_words, b_words, c_words):
     return out
 
 
-def fixture_assembly():
+def fixture_assembly(call_count=1):
     params = '\n'.join('%%%s = OpFunctionParameter %%fn_int' % ('p%d' % i)
                        for i in range(18))
     variables = '\n'.join('%%%s = OpVariable %%fn_int Function' % ('v%d' % i)
                           for i in range(18))
     stores = '\n'.join('OpStore %%v%d %%zero_i' % i for i in range(18))
     arguments = ' '.join('%%v%d' % i for i in range(18))
+    calls = '\n'.join(
+        '%s = OpFunctionCall %%int %%hmma %s' %
+        ('%call' if i == 0 else '%%call%d' % i, arguments)
+        for i in range(call_count)
+    )
     writes = '\n'.join(
         '%%store_ptr%d = OpAccessChain %%wg_uint %%scratch %%zero_u\n'
         'OpStore %%store_ptr%d %%zero_u' % (i, i) for i in range(8)
@@ -135,7 +140,7 @@ OpName %hmma "dmsh_hmma16816_f16"
 %main_label = OpLabel
 {variables}
 {stores}
-%call = OpFunctionCall %int %hmma {arguments}
+{calls}
 OpReturn
 OpFunctionEnd
 %hmma = OpFunction %int None %hmma_type
@@ -295,6 +300,35 @@ class HmmaSpirv(unittest.TestCase):
                                               params[10][1], result,
                                               params[10][2]])
                 self.assertIsNone(hmma_helper(module), opcode)
+
+    def test_cached_fragments_reuse_loads_and_scalar_extracts(self):
+        if not self.spirv_as or not self.spirv_val:
+            self.skipTest('spirv-as and spirv-val are needed for the SPIR-V fixture')
+        with tempfile.TemporaryDirectory(prefix='dmsh_hmma_reuse_') as td:
+            assembly = Path(td) / 'hmma.spvasm'
+            original = Path(td) / 'hmma.spv'
+            lowered = Path(td) / 'hmma.lowered.spv'
+            assembly.write_text(fixture_assembly(call_count=2))
+            r = subprocess.run(
+                [self.spirv_as, '--target-env', 'vulkan1.3',
+                 str(assembly), '-o', str(original)],
+                capture_output=True, text=True,
+            )
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            module = Module(original.read_bytes())
+            self.assertEqual(hmma_lds(module), 2)
+            opcodes = [x[0] & 0xffff for x in module.ins]
+            # First use gathers four rows (eight vector loads); the second
+            # call reloads only its two accumulators.  Every unpacked half is
+            # extracted once when gathered and then reused by both calls.
+            self.assertEqual(opcodes.count(OP_LOAD), 20)
+            self.assertEqual(opcodes.count(OP_COMPOSITE_EXTRACT), 104)
+            lowered.write_bytes(module.data())
+            r = subprocess.run(
+                [self.spirv_val, '--target-env', 'vulkan1.3', str(lowered)],
+                capture_output=True, text=True,
+            )
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
 
 
 if __name__ == '__main__':
