@@ -9,6 +9,8 @@ typedef struct {
     VkPhysicalDeviceProperties props; VkPhysicalDeviceMemoryProperties mem;
     int window;                   // made with the window's instance extensions and VK_KHR_swapchain
     int placed;                   // VK_EXT_map_memory_placed (guest memory backed in place, vk_mem.c)
+    int zero_init;                // VK_EXT_zero_initialize_device_memory (a guest chunk's closed pages stay uncommitted, vk_mem.c)
+    int maintenance8;             // VK_KHR_maintenance8 (dynamic texel offsets in translated shaders)
     int shader_object;            // VK_EXT_shader_object (the backend's shaders, vk_draw.c)
     int index_u8;                 // VK_KHR_index_type_uint8 (NVN's byte indices drawn as they are)
     vkx_mesh_caps mesh;           // driver capability; runtime_ready stays 0 until renderer physical proof

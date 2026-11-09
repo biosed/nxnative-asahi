@@ -91,19 +91,20 @@ uint64_t vkm_granule(void) {
     return v;
 }
 
-// Fresh Honeykrisp host-visible allocations are demand-zero shmem.  Leaving a
-// closed guest page untouched keeps it uncommitted until either the CPU opens
-// it or the GPU actually reads it.  The original bring-up explicitly wrote
-// zero to every closed page in every 32-MiB chunk, which charged the complete
-// 6.2-GiB heap and every mapped alias chunk even when the title never used
-// those pages.  This is opt-in until the physical selftest and title have both
-// exercised it; open pages are still copied byte-for-byte.
+// A guest chunk's closed pages must read zero when the guest opens them later (SetHeapSize opens the whole heap and the title's allocator trusts it).
+// The first bring-up wrote zero into every closed page of every 32-MiB chunk, which committed the complete 6.2-GiB heap and every mapped alias chunk
+// whether or not the title ever touched them: Ocarina of Time jumped from 7.9 to 12.3 GiB in five seconds at its first area load and stalled in reclaim
+// under a 12-GiB guard. Device memory is not zero by contract (a driver may hand back a recycled allocation: with the writes simply left out the title
+// aborted at startup on a stale allocator word, Result 0xd401), so the pages are left untouched only when the memory was allocated with
+// VK_MEMORY_ALLOCATE_ZERO_INITIALIZE_BIT_EXT (VK_EXT_zero_initialize_device_memory), which guarantees zero and lets the driver keep it uncommitted.
+// DM_VK_GMEM_DEMAND_ZERO=0 writes the zeroes as before; open pages are copied byte for byte either way.
 static int demand_zero_mode(void) {
     static int v = -1;
     if (v < 0) {
         const char *e = getenv("DM_VK_GMEM_DEMAND_ZERO");
-        v = e && strcmp(e, "0");
-        if (v) LOG("vulkan: closed guest pages stay demand-zero instead of being prefaulted (DM_VK_GMEM_DEMAND_ZERO=1)");
+        v = g_vkd.zero_init && !(e && !strcmp(e, "0"));
+        LOG("vulkan: closed guest pages %s (VK_EXT_zero_initialize_device_memory %s; DM_VK_GMEM_DEMAND_ZERO=0 writes them)",
+            v ? "stay demand-zero: the chunk memory is allocated zero-initialized" : "are written with zero", g_vkd.zero_init ? "present" : "absent");
     }
     return v;
 }
@@ -263,7 +264,8 @@ static int back_chunk(vkm_region *r, uint64_t ci) {
         save = malloc(nopen * pg); size_t k = 0;
         for (size_t p = 0; p < npg; p++) if (open[p]) memcpy(save + pg * k++, at + p * pg, pg);
     }
-    VkMemoryAllocateInfo ma = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = len, .memoryTypeIndex = r->type};
+    VkMemoryAllocateFlagsInfo zf = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, .flags = VK_MEMORY_ALLOCATE_ZERO_INITIALIZE_BIT_EXT};
+    VkMemoryAllocateInfo ma = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = demand_zero_mode() ? &zf : NULL, .allocationSize = len, .memoryTypeIndex = r->type};
     VkDeviceMemory m; VkResult vr = vkAllocateMemory(g_vkd.dev, &ma, NULL, &m);
     if (vr) {
         if (swapping) { protect_runs(at, open, npg, pg, 1, PROT_READ | PROT_WRITE); swap_end(); nvn_dirty_unhold(); }
@@ -295,6 +297,10 @@ static int back_chunk(vkm_region *r, uint64_t ci) {
             else if (!demand_zero_mode()) memset(at + p * pg, 0, pg);
         }
     }
+    { static int zc = -1; if (zc < 0) { const char *e = getenv("DM_VK_GMEM_ZERO_CHECK"); zc = e && atoi(e) != 0; }   // diagnostic: do the untouched closed pages read zero? (reading commits them)
+      if (zc && demand_zero_mode()) { size_t bad = 0; for (size_t p = 0; p < npg; p++) if (!open[p]) { const uint64_t *w = (const uint64_t *)(at + p * pg); for (size_t i = 0; i < pg / 8; i++) if (w[i]) { bad++; break; } }
+          static _Atomic uint64_t tot, chunks; uint64_t t = atomic_fetch_add(&tot, bad) + bad, c = atomic_fetch_add(&chunks, 1) + 1;
+          if (bad || !(c & (c - 1))) LOG("%svulkan: zero check: chunk %p has %zu non-zero closed pages of %zu (%llu in %llu chunks so far)", bad ? "[RED] " : "", (void *)at, bad, npg - nopen, (unsigned long long)t, (unsigned long long)c); } }
     protect_runs(at, open, npg, pg, 0, PROT_NONE);
     if (swapping) { swap_end(); nvn_dirty_unhold(); }
     free(open); free(save);
