@@ -18,6 +18,7 @@
 #include "vk_mem.h"
 #include "vk_gmem_trace.h"
 #include "vk_counter_report.h"
+#include "vk_cs_gpu_lifecycle.h"
 int nvn_dpool_base(const void *pool, int tex);   // hle_nvn.c: a descriptor pool's ID base
 #include "../gfx/nvn/nvn_obj.h"
 #include "../gfx/nvn/nvn_dirty.h"
@@ -38,7 +39,7 @@ typedef struct sref { uint64_t serial; vtex *t; struct sref *next; } sref;
 static sref *g_tab[4096]; static vtex *g_stab[4096]; static vtex *g_dead;
 static uint32_t stor_hash(const uint8_t *mem, const nvn_texdesc *d) { uint64_t h = (uint64_t)(uintptr_t)mem >> 6; h ^= (uint64_t)d->width * 31 + d->height * 131 + (uint64_t)d->format * 7919 + (uint64_t)d->target * 104729; return (uint32_t)(h ^ h >> 13) % 4096; }
 static VkSemaphore g_tl; static _Atomic uint64_t g_fence;
-static VkCommandPool g_pool; static VkCommandBuffer g_cb[CB_RING]; static uint64_t g_cb_val[CB_RING]; static int g_cb_i = -1, g_cb_n = CB_RING, g_open;
+static VkCommandPool g_pool; static VkCommandBuffer g_cb[CB_RING]; static _Atomic uint64_t g_cb_val[CB_RING]; static int g_cb_i = -1, g_cb_n = CB_RING, g_open;
 // DM_VK_MESH_LOG submission breadcrumbs. A mesh command is tagged while it
 // is recorded, then associated with the exact replay timeline value when its
 // command buffer is submitted. Diagnostics only: no ordering change.
@@ -71,6 +72,88 @@ typedef struct { uint64_t f, ns, t0, t1; } gpu_frame;
 static gpu_frame g_gf[64]; static pthread_mutex_t g_gfmu = PTHREAD_MUTEX_INITIALIZER;
 uint64_t vkh_frame(void); static uint64_t done_value(void);
 static uint64_t mono_ns(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec; }
+
+// Per-dispatch GPU timing is deliberately separate from the always-on frame
+// queries.  It is a diagnostic, enabled by DM_VK_CS_GPU=1, and must not split
+// command buffers or introduce a wait: timestamps are written around the
+// existing dispatch and read only after the ring slot's timeline value has
+// completed.  Both GPU queries and their host metadata have fixed bounds.
+#define CS_GPU_PER_SLOT 512
+#define CS_GPU_DEFAULT_LIMIT 4096
+#define CS_GPU_MAX_LIMIT 65536
+typedef struct {
+    char key[17];
+    uint32_t x, y, z;
+    uint64_t indirect, frame;
+} cs_gpu_meta;
+static VkQueryPool g_cs_qp;
+static cs_gpu_meta g_cs_meta[CB_RING][CS_GPU_PER_SLOT];
+static vkr_cs_gpu_batch g_cs_batch[CB_RING];
+static uint64_t g_cs_recorded, g_cs_logged, g_cs_limit;
+static _Atomic uint64_t g_cs_overflow;
+static int g_cs_cap_logged;
+static uint32_t cs_query(int slot, int sample) {
+    return 2u * ((uint32_t)slot * CS_GPU_PER_SLOT + (uint32_t)sample);
+}
+static void cs_gpu_harvest(int slot, uint64_t done) {   // under g_tmu: only published batches are visible
+    vkr_cs_gpu_batch *b = &g_cs_batch[slot];
+    if (!g_cs_qp || !vkr_cs_gpu_harvestable(b, done)) return;
+    uint32_t n = b->submitted;
+    uint64_t q[2 * CS_GPU_PER_SLOT];
+    VkResult r = vkGetQueryPoolResults(g_vkd.dev, g_cs_qp, cs_query(slot, 0),
+        2 * n, sizeof q, q, sizeof *q, VK_QUERY_RESULT_64_BIT);
+    if (r != VK_SUCCESS) {
+        LOG("[RED] vulkan compute GPU profile: %u timestamp pairs from completed slot %d could not be read (%d)", n, slot, (int)r);
+        vkr_cs_gpu_retire(b);
+        return;
+    }
+    double per = g_vkd.props.limits.timestampPeriod;
+    for (uint32_t i = 0; i < n; i++) {
+        cs_gpu_meta *m = &g_cs_meta[slot][i];
+        uint64_t ticks = q[2 * i + 1] > q[2 * i] ? q[2 * i + 1] - q[2 * i] : 0;
+        double ms = ticks * per / 1e6;
+        if (m->indirect)
+            LOG("[vk-cs-gpu] frame %llu shader %s groups indirect@%#llx record %ux%ux%u gpu %.3f ms",
+                (unsigned long long)m->frame, m->key, (unsigned long long)m->indirect,
+                m->x, m->y, m->z, ms);
+        else
+            LOG("[vk-cs-gpu] frame %llu shader %s groups %ux%ux%u gpu %.3f ms",
+                (unsigned long long)m->frame, m->key, m->x, m->y, m->z, ms);
+        g_cs_logged++;
+    }
+    vkr_cs_gpu_retire(b);
+    if (g_cs_logged == g_cs_limit)
+        LOG("vulkan compute GPU profile: completed bounded sample of %llu dispatches%s",
+            (unsigned long long)g_cs_logged, atomic_load(&g_cs_overflow) ? " (some command-buffer slots overflowed before the global cap)" : "");
+}
+int vkr_cs_gpu_begin(VkCommandBuffer c, const char key[17], uint32_t x,
+                     uint32_t y, uint32_t z, uint64_t indirect) {
+    if (!g_cs_qp || g_cb_i < 0 || c != g_cb[g_cb_i]) return -1;
+    if (g_cs_recorded >= g_cs_limit) {
+        if (!g_cs_cap_logged++)
+            LOG("vulkan compute GPU profile: %llu-dispatch recording cap reached; existing samples will still be harvested",
+                (unsigned long long)g_cs_limit);
+        return -1;
+    }
+    int i = vkr_cs_gpu_record(&g_cs_batch[g_cb_i], CS_GPU_PER_SLOT);
+    if (i < 0) {
+        uint64_t overflow = atomic_fetch_add(&g_cs_overflow, 1) + 1;
+        if (!(overflow & (overflow - 1)))
+            LOG("[RED] vulkan compute GPU profile: command-buffer slot %d exceeded %d dispatches (%llu untimed so far); execution is unchanged",
+                g_cb_i, CS_GPU_PER_SLOT, (unsigned long long)overflow);
+        return -1;
+    }
+    cs_gpu_meta *m = &g_cs_meta[g_cb_i][i];
+    snprintf(m->key, sizeof m->key, "%s", key);
+    m->x = x; m->y = y; m->z = z; m->indirect = indirect; m->frame = vkh_frame();
+    g_cs_recorded++;
+    vkCmdWriteTimestamp(c, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, g_cs_qp, cs_query(g_cb_i, i));
+    return i;
+}
+void vkr_cs_gpu_end(VkCommandBuffer c, int token) {
+    if (!g_cs_qp || token < 0 || token >= CS_GPU_PER_SLOT || g_cb_i < 0 || c != g_cb[g_cb_i]) return;
+    vkCmdWriteTimestamp(c, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, g_cs_qp, cs_query(g_cb_i, token) + 1);
+}
 static void gpu_harvest(int i) {   // slot i's timestamps into its frame (its submission is done)
     if (!g_cb_timed[i]) return;
     uint64_t q[2]; if (vkGetQueryPoolResults(g_vkd.dev, g_qp, (uint32_t)(2 * i), 2, sizeof q, q, 8, VK_QUERY_RESULT_64_BIT)) return;
@@ -82,7 +165,14 @@ static void gpu_harvest(int i) {   // slot i's timestamps into its frame (its su
     g->ns += ns; if ((uint64_t)(q[0] * per) < g->t0) g->t0 = (uint64_t)(q[0] * per); if ((uint64_t)(q[1] * per) > g->t1) g->t1 = (uint64_t)(q[1] * per);
     pthread_mutex_unlock(&g_gfmu);
 }
-static void gpu_harvest_done(void) { uint64_t d = done_value(); for (int i = 0; i < CB_RING; i++) if (g_cb_timed[i] && g_cb_val[i] && g_cb_val[i] <= d) gpu_harvest(i); }
+static void gpu_harvest_done(void) {
+    uint64_t d = done_value();
+    for (int i = 0; i < CB_RING; i++) {
+        uint64_t submitted = atomic_load(&g_cb_val[i]);
+        if (submitted && submitted <= d && g_cb_timed[i]) gpu_harvest(i);
+        cs_gpu_harvest(i, d);
+    }
+}
 double mtl_gpu_ms(uint64_t f) {
     if (g_on <= 0 || !g_qp) return -1;
     pthread_mutex_lock(&g_tmu); gpu_harvest_done(); pthread_mutex_unlock(&g_tmu);
@@ -115,6 +205,22 @@ static int vkr_on(void) {
     if (vkAllocateCommandBuffers(g_vkd.dev, &ai, g_cb) || vkAllocateCommandBuffers(g_vkd.dev, &ai, g_up)) { LOG("[RED] vulkan replay: no command buffers"); return g_on = 0; }
     VkQueryPoolCreateInfo qci = {.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, .queryType = VK_QUERY_TYPE_TIMESTAMP, .queryCount = 2 * CB_RING};
     if (!g_vkd.props.limits.timestampComputeAndGraphics || vkCreateQueryPool(g_vkd.dev, &qci, NULL, &g_qp)) { g_qp = VK_NULL_HANDLE; LOG("vulkan replay: no GPU timestamps (GPU time is not measured)"); }
+    const char *cs_gpu = getenv("DM_VK_CS_GPU");
+    if (cs_gpu && strcmp(cs_gpu, "0")) {
+        g_cs_limit = CS_GPU_DEFAULT_LIMIT;
+        const char *lim = getenv("DM_VK_CS_GPU_LIMIT");
+        if (lim) {
+            char *end = NULL; unsigned long long n = strtoull(lim, &end, 10);
+            if (end != lim && !*end && n >= 1 && n <= CS_GPU_MAX_LIMIT) g_cs_limit = n;
+            else LOG("[RED] vulkan replay: DM_VK_CS_GPU_LIMIT=%s is not 1..%d; using %d", lim, CS_GPU_MAX_LIMIT, CS_GPU_DEFAULT_LIMIT);
+        }
+        qci.queryCount = 2 * CB_RING * CS_GPU_PER_SLOT;
+        if (!g_vkd.props.limits.timestampComputeAndGraphics || vkCreateQueryPool(g_vkd.dev, &qci, NULL, &g_cs_qp))
+            LOG("[RED] vulkan replay: DM_VK_CS_GPU requested, but compute timestamps are unavailable");
+        else
+            LOG("vulkan compute GPU profile: timing at most %d dispatches per command buffer and %llu total; no submissions or waits are added",
+                CS_GPU_PER_SLOT, (unsigned long long)g_cs_limit);
+    }
     // DM_VK_TEXDUMP=<dir>[:n]: the first n textures loaded from guest memory (16 by default, at most 64) as PNG files in dir, level 0 and layer 0
     const char *td = getenv("DM_VK_TEXDUMP");
     if (td && *td) { snprintf(g_dump_dir, sizeof g_dump_dir, "%s", td); char *cn = strrchr(g_dump_dir, ':'); g_dump_left = 16; if (cn) { g_dump_left = atoi(cn + 1); *cn = 0; } if (g_dump_left > 64) g_dump_left = 64; }
@@ -294,6 +400,11 @@ static void retire_unused_speculative(void) {
     }
 }
 static _Thread_local uint64_t t_spec_budget, t_spec_max;
+static void add_view_format(VkFormat *views, uint32_t *n, VkFormat f) {
+    if (f == VK_FORMAT_UNDEFINED) return;
+    for (uint32_t i = 0; i < *n; i++) if (views[i] == f) return;
+    views[(*n)++] = f;
+}
 // The image for a texture, made the first time it is needed (under g_tmu). NULL for what is not made (logged once per kind). Layers as nvn_mtl.m counts them: an array's and a
 // cube array's depth (a cube array's counts layer-faces), 6 for a cube, a 1D array's height; 1D textures are one-row 2D images
 static vtex *tex_get(const tex_t *o) {
@@ -357,24 +468,31 @@ static vtex *tex_get(const tex_t *o) {
     if (ff & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) use |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
     if (ff & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) use |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
     if ((ff & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) && samples == 1) use |= VK_IMAGE_USAGE_STORAGE_BIT;
-    // Ocarina's scene post pass binds an R32UI view of an R11G11B10F image and
-    // writes already-packed RGB9E5 words. Extended usage lets that integer
-    // view supply storage support even when the base float format does not.
-    if (f == VK_FORMAT_B10G11R11_UFLOAT_PACK32 && samples == 1) {
-        VkFormatProperties ip; vkGetPhysicalDeviceFormatProperties(g_vkd.pd, VK_FORMAT_R32_UINT, &ip);
-        if (ip.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) use |= VK_IMAGE_USAGE_STORAGE_BIT;
+    // NVN image operations may address any compatible 32-bit colour texel as
+    // an R32 integer word. Extended usage lets such a view supply storage and
+    // atomic support even when the base colour format does not.
+    VkFormat word_views[2] = {VK_FORMAT_UNDEFINED, VK_FORMAT_UNDEFINED};
+    if (samples == 1) for (int i = 0; i < 2; i++) {
+        VkFormat wf = i ? VK_FORMAT_R32_SINT : VK_FORMAT_R32_UINT;
+        if (!vkr_word_view_compatible(f, wf)) continue;
+        VkFormatProperties ip; vkGetPhysicalDeviceFormatProperties(g_vkd.pd, wf, &ip);
+        if (ip.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) {
+            word_views[i] = wf;
+            use |= VK_IMAGE_USAGE_STORAGE_BIT;
+        }
     }
     // a 3D image that can be a render target is rendered slice by slice through 2D-array views of it (2D_ARRAY_COMPATIBLE)
     VkImageCreateFlags cf = (tg == NVN_TEXTURE_TARGET_CUBEMAP || tg == NVN_TEXTURE_TARGET_CUBEMAP_ARRAY) && layers % 6 == 0 ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0;
     if (tg == NVN_TEXTURE_TARGET_3D && (use & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)) cf |= VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT;
-    VkFormat views[3] = {f}; uint32_t nviews = 1;
-    VkFormat twin = vkr_srgb_twin(f); if (twin) views[nviews++] = twin;
+    VkFormat views[6] = {f}; uint32_t nviews = 1;
+    add_view_format(views, &nviews, vkr_srgb_twin(f));
     if (f == VK_FORMAT_B10G11R11_UFLOAT_PACK32) {
-        views[nviews++] = VK_FORMAT_E5B9G9R9_UFLOAT_PACK32;
-        views[nviews++] = VK_FORMAT_R32_UINT;
+        add_view_format(views, &nviews, VK_FORMAT_E5B9G9R9_UFLOAT_PACK32);
     }
+    add_view_format(views, &nviews, word_views[0]);
+    add_view_format(views, &nviews, word_views[1]);
     VkImageFormatListCreateInfo fl = {.sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO, .viewFormatCount = nviews, .pViewFormats = views};
-    if (nviews > 1) cf |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;   // sRGB twins and OoT's raw R32UI scene-storage view
+    if (nviews > 1) cf |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;   // compatible view formats can supply their own usage features
     VkImageCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .pNext = nviews > 1 ? &fl : NULL, .flags = cf,
         .imageType = tg == NVN_TEXTURE_TARGET_3D ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D, .format = f, .extent = {d->width ? d->width : 1, h, depth},
         .mipLevels = d->levels ? d->levels : 1, .arrayLayers = layers, .samples = (VkSampleCountFlagBits)samples, .tiling = VK_IMAGE_TILING_OPTIMAL,
@@ -521,7 +639,7 @@ static int upload_(vtex *t, const tex_t *o) {   // under g_tmu, inside a submiss
     s->after = atomic_load(&g_fence) + 1; s->next = g_stage; g_stage = s;
     if (partial) off = part_bytes;
     if (t->uploaded) g_reuploads++; else g_uploads++;
-    t->uploaded = 1; t->raw_9e5 = 0; g_up_bytes += off;
+    t->uploaded = 1; g_up_bytes += off;
     if (g_dump_left > 0 && g_ndump < 64 && !bad) { g_dump_ser[g_ndump++] = t->serial; g_dump_left--; }
     if (!((g_uploads + g_reuploads) & (g_uploads + g_reuploads - 1)))
         LOG("vulkan replay: textures loaded from guest memory: %llu, again after a write %llu, %llu MiB (latest %ux%u NVN %#x target %d, %u levels %u layers%s)", (unsigned long long)g_uploads,
@@ -717,14 +835,26 @@ static void full_barrier(VkCommandBuffer c);
 static void dump_uploads(uint64_t fence);
 static void sub_open(void) {   // the next ring slot's command buffer, begun (its last use waited for)
     g_cb_i = (g_cb_i + 1) % g_cb_n;
-    wait_value_named(g_cb_val[g_cb_i], UINT64_MAX, "sub_open", g_cb_i);   // its last use is done
+    uint64_t submitted = atomic_load(&g_cb_val[g_cb_i]);
+    wait_value_named(submitted, UINT64_MAX, "sub_open", g_cb_i);   // its last use is done
     uint64_t done = done_value();
     gp_run(done);   // its reports written while its timestamp queries still hold that use's times (they are reset below)
-    if (g_qp) { pthread_mutex_lock(&g_tmu); gpu_harvest(g_cb_i); pthread_mutex_unlock(&g_tmu); }
+    if (g_qp || g_cs_qp) {
+        pthread_mutex_lock(&g_tmu);
+        gpu_harvest(g_cb_i); cs_gpu_harvest(g_cb_i, done);
+        atomic_store(&g_cb_val[g_cb_i], 0);   // no old submission may publish this slot while it is recorded again
+        if (g_cs_batch[g_cb_i].timeline || g_cs_batch[g_cb_i].submitted)
+            LOG("[RED] vulkan compute GPU profile: slot %d was not retired after timeline %llu completed; disabling new samples in this reuse",
+                g_cb_i, (unsigned long long)submitted);
+        else
+            g_cs_batch[g_cb_i].recording = 0;
+        pthread_mutex_unlock(&g_tmu);
+    } else atomic_store(&g_cb_val[g_cb_i], 0);
     vkResetCommandBuffer(g_cb[g_cb_i], 0);
     VkCommandBufferBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
     vkBeginCommandBuffer(g_cb[g_cb_i], &bi); g_open = 1;
     if (g_qp) { vkCmdResetQueryPool(g_cb[g_cb_i], g_qp, (uint32_t)(2 * g_cb_i), 2); vkCmdWriteTimestamp(g_cb[g_cb_i], VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, g_qp, (uint32_t)(2 * g_cb_i)); g_cb_frame[g_cb_i] = vkh_frame(); }
+    if (g_cs_qp) vkCmdResetQueryPool(g_cb[g_cb_i], g_cs_qp, cs_query(g_cb_i, 0), 2 * CS_GPU_PER_SLOT);
     g_up_open = 0;
     full_barrier(g_cb[g_cb_i]);   // after everything before it on the queue: the upload command buffer, earlier submissions, presents
     vkx_sub_begin(g_cb_i, g_cb[g_cb_i], done);
@@ -776,7 +906,13 @@ static uint64_t sub_submit(void) {   // the open command buffer (after its uploa
             (unsigned long long)mesh_seq, g_cb_i, (unsigned long long)v, (int)r, (unsigned long long)done_value());
     if (r) die("vulkan replay: submit failed (%d)", (int)r);
     if (mesh_seq) atomic_store(&g_mesh_last_signal, v);
-    g_cb_val[g_cb_i] = v; atomic_store(&g_fence, v); g_flush_draws = 0; g_mesh_batch_draws = 0;
+    pthread_mutex_lock(&g_tmu);
+    if (g_cs_qp && vkr_cs_gpu_publish(&g_cs_batch[g_cb_i], v) < 0)
+        LOG("[RED] vulkan compute GPU profile: slot %d could not publish its batch at timeline %llu; samples disabled for this slot",
+            g_cb_i, (unsigned long long)v);
+    atomic_store(&g_cb_val[g_cb_i], v);
+    pthread_mutex_unlock(&g_tmu);
+    atomic_store(&g_fence, v); g_flush_draws = 0; g_mesh_batch_draws = 0;
     return v;
 }
 void mtl_sub_begin(void) {
@@ -826,7 +962,7 @@ uint64_t mtl_sub_commit(void) {
 uint64_t mtl_last_fence(void) { return atomic_load(&g_fence); }
 int mtl_wait(uint64_t fence, uint64_t timeout_ns) { if (g_on <= 0) return 1; if (!wait_value(fence, timeout_ns)) return 0; gp_run(done_value()); return 1; }
 int mtl_wait_acq(uint64_t fence, uint64_t timeout_ns) { return mtl_wait(fence, timeout_ns); }
-void mtl_finish(void) { if (g_on > 0) { wait_value(atomic_load(&g_fence), UINT64_MAX); gp_run(done_value()); } }
+void mtl_finish(void) { if (g_on > 0) { wait_value(atomic_load(&g_fence), UINT64_MAX); if (g_cs_qp) { pthread_mutex_lock(&g_tmu); gpu_harvest_done(); pthread_mutex_unlock(&g_tmu); } gp_run(done_value()); } }
 void mtl_drain(void) { mtl_finish(); }
 
 // ---- the record stream ----
@@ -1038,7 +1174,6 @@ static int rp_begin(VkCommandBuffer c) {
         dg->view = ca[i].imageView != VK_NULL_HANDLE;
         if (!ca[i].imageView) continue;
         vkr_tex_gpu_write(t);
-        t->raw_9e5 = t->fmt == VK_FORMAT_B10G11R11_UFLOAT_PACK32 && rtf == VK_FORMAT_R32_UINT;
         have = have_c = 1; samples = (int)t->samples;
         uint32_t lw = t->w >> r.baseMipLevel ? t->w >> r.baseMipLevel : 1, lh = t->h >> r.baseMipLevel ? t->h >> r.baseMipLevel : 1;
         if (lw < w) w = lw; if (lh < h) h = lh;
@@ -1115,7 +1250,7 @@ static void op_clear_color(VkCommandBuffer c, const p_clear_color *p) {
     // multisampled targets too (vkCmdClearColorImage / vkCmdClearDepthStencilImage take any sample count): Pokémon Shining Pearl draws its scene into a 4x target whose depth,
     // never cleared, failed its reversed-Z GEQUAL test everywhere, and its background and characters were not drawn
     if (t && (t->aspect & VK_IMAGE_ASPECT_COLOR_BIT)) {
-        vkr_tex_gpu_write(t); t->raw_9e5 = 0;
+        vkr_tex_gpu_write(t);
         tex_ready(c, t);
         if (g_passlog) { int sc[4], hs = vkx_scissor_get(sc); LOG("[pass] clear colour %d serial %llu to %g %g %g %g mask %#x scissor %s %d %d %d %d (image %ux%u)", p->index, (unsigned long long)t->serial,
                                 p->rgba[0], p->rgba[1], p->rgba[2], p->rgba[3], p->mask, hs ? "on" : "off", sc[0], sc[1], sc[2], sc[3], t->w, t->h); }
@@ -1180,7 +1315,7 @@ static void op_copy_t2t(VkCommandBuffer c, const p_copy_t2t *p) {
     if (g_passlog) LOG("[pass] copy texture serial %llu %ux%u -> serial %llu %ux%u%s (objects: serial %llu storage %p -> serial %llu storage %p)", (unsigned long long)s->serial, s->w, s->h, (unsigned long long)d->serial, d->w, d->h,
                        p->flags & DM_COPY_RESOLVE ? " (resolve)" : "", (unsigned long long)p->src->serial, (const void *)p->src->mem, (unsigned long long)p->dst->serial, (const void *)p->dst->mem);
     if (!d->gpu_owned && !d->uploaded) upload(d, p->dst);
-    vkr_tex_gpu_write(d); d->raw_9e5 = 0;
+    vkr_tex_gpu_write(d);
     VkImageSubresourceLayers ss, ds; VkOffset3D so, dof; VkExtent3D se, de;
     region_of(s, &p->sv, p->has_sv, &p->sr, &ss, &so, &se); region_of(d, &p->dv, p->has_dv, &p->dr, &ds, &dof, &de);
     if (!ss.layerCount || !ds.layerCount) { pthread_mutex_unlock(&g_tmu); copy_fail("texture to texture: layers out of range"); return; }
@@ -1204,7 +1339,7 @@ static void op_copy_bt(VkCommandBuffer c, const p_copy_b2t *p, int to_tex) {
     pthread_mutex_lock(&g_tmu);
     vtex *t = to_tex ? tex_get(p->tex) : tex_sampled(p->tex);
     if (!t) { pthread_mutex_unlock(&g_tmu); copy_fail("buffer and texture: no image"); return; }
-    if (to_tex) { if (!t->gpu_owned && !t->uploaded) upload(t, p->tex); vkr_tex_gpu_write(t); t->raw_9e5 = 0; }
+    if (to_tex) { if (!t->gpu_owned && !t->uploaded) upload(t, p->tex); vkr_tex_gpu_write(t); }
     VkImageSubresourceLayers sl; VkOffset3D o; VkExtent3D e; region_of(t, &p->view, p->has_view, &p->r, &sl, &o, &e);
     int bw, bh, bpb = nvn_fmt_bpb(p->tex->d.format, &bw, &bh);
     if (!bpb || !sl.layerCount) { pthread_mutex_unlock(&g_tmu); copy_fail("buffer and texture: no block size"); return; }
@@ -1248,7 +1383,7 @@ static void op_clear_tex(VkCommandBuffer c, const p_clear_tex *p) {
     if (!t || !(t->aspect & VK_IMAGE_ASPECT_COLOR_BIT)) { pthread_mutex_unlock(&g_tmu); copy_fail("texture clear: no colour image"); return; }
     if (g_passlog) LOG("[pass] clear texture serial %llu %ux%u region %d %d %d %d", (unsigned long long)t->serial, t->w, t->h, p->r.xoffset, p->r.yoffset, p->r.width, p->r.height);
     if (!t->gpu_owned && !t->uploaded) upload(t, p->tex);
-    vkr_tex_gpu_write(t); t->raw_9e5 = 0;
+    vkr_tex_gpu_write(t);
     VkImageSubresourceLayers sl; VkOffset3D o; VkExtent3D e; region_of(t, &p->view, p->has_view, &p->r, &sl, &o, &e);
     VkClearColorValue v; memcpy(&v, &p->c, sizeof v);
     uint32_t lw = t->w >> sl.mipLevel ? t->w >> sl.mipLevel : 1, lh = t->h >> sl.mipLevel ? t->h >> sl.mipLevel : 1;
@@ -1388,7 +1523,7 @@ void mtl_exec(const uint8_t *handle) {
                 g_cb_mesh_seq[g_cb_i] = mesh_seq;
                 if (mesh_log_on())
                     LOG("vulkan mesh command: issue=%llu recorded slot=%d prior-signal=%llu",
-                        (unsigned long long)mesh_seq, g_cb_i, (unsigned long long)g_cb_val[g_cb_i]);
+                        (unsigned long long)mesh_seq, g_cb_i, (unsigned long long)atomic_load(&g_cb_val[g_cb_i]));
                 g_flush_draws++;
                 // Diagnostic isolation for the software task/mesh path.  N=1
                 // is the original strict proof; a small N keeps scratch

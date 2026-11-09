@@ -38,7 +38,7 @@ OBJ := $(NVN_OBJ) \
        $(patsubst %,$(OUT)/obj/linux/%.o,$(NULL_SRC))
 
 .DEFAULT_GOAL := null-renderer
-.PHONY: profile null-renderer vulkan-replay-objects nxasahi-renderer-objects nxasahi-renderer nxasahi-front vulkan-selftest vk-mem-selftest t_push t_skipcs t_gpstamp t_focus t_gmem_trace t_missing_log t_counter_report t_vk_stage t_vk_mesh t_vk_mesh_compile t_vk_descriptor_pool t_vk_mesh_coverage t_vk_shader_resolve dmhost dmhost-vulkan t_fs_linux clean
+.PHONY: profile null-renderer vulkan-replay-objects nxasahi-renderer-objects nxasahi-renderer nxasahi-front vulkan-selftest vk-mem-selftest t_push t_skipcs t_gpstamp t_focus t_gmem_trace t_missing_log t_counter_report t_vk_stage t_vk_format t_vk_cs_gpu_lifecycle t_vk_mesh t_vk_mesh_compile t_vk_descriptor_pool t_vk_mesh_coverage t_vk_shader_resolve dmhost dmhost-vulkan t_fs_linux clean
 
 # The consolidated asahi branch also carries the Linux host. Keep its object
 # namespace and rules separate so renderer-only checks remain bounded and a
@@ -145,6 +145,17 @@ $(OUT)/t_vk_stage: vk/tests/t_vk_stage.c vk/vk_stage.h | profile
 	@mkdir -p $(dir $@)
 	$(CC) $(CPPFLAGS) -std=gnu11 -O1 -g -Wall -Wextra -Werror -Ivk $$($(PKG_CONFIG) --cflags vulkan) -o $@ $<
 t_vk_stage: $(OUT)/t_vk_stage
+	$<
+
+$(OUT)/t_vk_format: vk/tests/t_vk_format.c vk/vk_replay.h vk/vk_fmt.c vk/vk_fmt.h ../gfx/tex/nvn_fmt_mtl.c ../gfx/tex/nvn_fmt_mtl.h | profile
+	@mkdir -p $(dir $@)
+	$(CC) $(CPPFLAGS) -std=gnu11 -O1 -g -Wall -Wextra -Werror -Ivk $$($(PKG_CONFIG) --cflags vulkan) -o $@ vk/tests/t_vk_format.c vk/vk_fmt.c ../gfx/tex/nvn_fmt_mtl.c
+t_vk_format: $(OUT)/t_vk_format
+	$<
+$(OUT)/t_vk_cs_gpu_lifecycle: vk/tests/t_vk_cs_gpu_lifecycle.c vk/vk_cs_gpu_lifecycle.h | profile
+	@mkdir -p $(dir $@)
+	$(CC) $(CPPFLAGS) -std=gnu11 -O1 -g -Wall -Wextra -Werror -Ivk -o $@ $<
+t_vk_cs_gpu_lifecycle: $(OUT)/t_vk_cs_gpu_lifecycle
 	$<
 $(OUT)/t_vk_mesh: vk/tests/t_vk_mesh.c vk/vk_mesh.h vk/vk_mesh_trace.h vk/vk_stage.h vk/spv_reflect.c vk/spv_reflect.h | profile
 	@mkdir -p $(dir $@)

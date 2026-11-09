@@ -20,7 +20,6 @@
 #include "vk_shader_resolve.h"
 #include "vk_mesh_trace.h"
 #include "vk_omap.h"
-#include "vk_tonemap_spv.h"
 #include <stdatomic.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -41,17 +40,6 @@ typedef struct {
     uint64_t tex[NST][256], samp[NST][128], img[NST][32];
     int tex_base, samp_base;
     const prog_t *prog[NST];
-    // Ocarina's movie producer and final stage are separate dispatches. Keep
-    // an identity, not a vtex pointer: texture objects may be retired between
-    // them, and the ID may later be registered to another serial.
-    int movie_rgb_id;
-    uint64_t movie_rgb_serial;
-    // Ocarina's gameplay NDSR chain also crosses several deliberately skipped
-    // compute dispatches.  Retain the live scene image seen by the first
-    // stage, then consume it at the last stage instead of the unwritten
-    // intermediate that stage normally samples.
-    int gameplay_scene_id;
-    uint64_t gameplay_scene_serial;
     // SPH fragment output map for the program prepared by the current draw:
     // four RGBA bits per colour target.  Maxwell preserves target components
     // outside this map even when the NVN channel mask enables them.
@@ -1010,28 +998,25 @@ static int gmem_log_fill(const vks *s, VkDescriptorBufferInfo *out) {
     } else { static _Atomic int warned; if (!atomic_exchange(&warned, 1)) LOG("[RED] vulkan draws: raw-global store logs are bound but not consumed yet; separately uploaded textures may miss those GPU writes"); }
     return 1;
 }
-// A storage image view of the texture an image handle names, as the shader declares it (under g_tmu). Ocarina's
-// final scene post pass deliberately binds an R32UI view of an R11G11B10F target and writes raw RGB9E5 words; using
-// the base float view converts those words and produces the neon/black scene seen before the NDSR dispatch.
+// A storage image view of the texture an image handle names, as the shader declares it (under g_tmu). NVN permits
+// compatible 32-bit colour images to be addressed as R32 integer words; Ocarina uses that for both packed scene data
+// and NDSR image atomics. Using the base colour view would numerically convert those words instead of preserving bits.
 static VkImageView image_view(vtex *t, const vkbind *b, const view_t *v, int has_v) {
     if (!(t->usage & VK_IMAGE_USAGE_STORAGE_BIT)) return VK_NULL_HANDLE;
     VkImageViewType vt = b->dim == 3 ? VK_IMAGE_VIEW_TYPE_3D : (b->arr || b->dim == 4) ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;   // a cube is written as its 6 layers
     if ((vt == VK_IMAGE_VIEW_TYPE_3D) != (t->d > 1)) return VK_NULL_HANDLE;
-    int raw = t->fmt == VK_FORMAT_B10G11R11_UFLOAT_PACK32 && has_v && v->set_format && v->format == NVN_FORMAT_R32UI;
-    VkFormat vf = raw ? VK_FORMAT_R32_UINT : t->fmt;
+    VkFormat vf = vkr_view_format(t->fmt, v, has_v);
+    int word = vkr_word_view_compatible(t->fmt, vf) && vf != t->fmt;
     uint64_t key = 0x40000000u | (uint32_t)vt | (uint64_t)(uint32_t)vf << 32;
-    // A later binding does not write by itself. Keep the raw-word state until
-    // a real float attachment/clear/upload/copy write replaces the contents.
-    if (raw) t->raw_9e5 = 1;
     for (vkview *v = t->views; v; v = v->next) if (v->key == key) return v->view;
     VkImageViewUsageCreateInfo vu = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO, .usage = VK_IMAGE_USAGE_STORAGE_BIT};
-    VkImageViewCreateInfo vi = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .pNext = raw ? &vu : NULL,
+    VkImageViewCreateInfo vi = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .pNext = vf != t->fmt ? &vu : NULL,
         .image = t->img, .viewType = vt, .format = vf,
         .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, vt == VK_IMAGE_VIEW_TYPE_2D || vt == VK_IMAGE_VIEW_TYPE_3D ? 1 : t->layers}};
     vkview *iv = calloc(1, sizeof *iv); iv->key = key;
     if (vkCreateImageView(g_vkd.dev, &vi, NULL, &iv->view)) { free(iv); return VK_NULL_HANDLE; }
     iv->next = t->views; t->views = iv;
-    if (raw) { static int logged; if (!logged++) LOG("vulkan draws: Ocarina R11G11B10 storage uses its guest R32UI view; tracking raw RGB9E5 words"); }
+    if (word) { static int logged; if (!logged++) LOG("vulkan draws: compatible 32-bit colour storage uses its guest R32 integer word view"); }
     return iv->view;
 }
 // The 32-bit word at byte off of stage st's uniform slot reg (a bindless handle the game wrote there): 0 when unbound or out of range
@@ -1877,327 +1862,6 @@ int vkx_draw(VkCommandBuffer c, uint32_t op, const void *a, uint32_t size, int n
 // ---- compute dispatches ----
 static uint64_t g_st_dispatched, g_st_dskip;
 
-// Ocarina's tensor/NDSR scene upscaler is among the deliberately skipped
-// compute shaders. Its input is an R11G11B10 image containing raw RGB9E5 words
-// (written through an R32UI view) with sqrt(linear) channels. NX2navi's proven
-// stand-in bit-copies those words into E5B9G9R9, scales them, then squares the
-// sampled colour. Movie-network inputs are ordinary RGBA8 and take a blit.
-typedef struct {
-    uint32_t w, h;
-    VkFormat fmt;
-    VkImageUsageFlags usage;
-    VkImage img;
-    VkDeviceMemory mem;
-    VkImageView view;
-} vkx_tm_image;
-
-static struct {
-    int tried, ok, linear;
-    VkDescriptorSetLayout dsl;
-    VkPipelineLayout layout;
-    VkPipeline pipe;
-    VkSampler sampler;
-    VkDescriptorPool pool[CB_RING];
-    uint64_t pool_gen[CB_RING];
-    vkx_tm_image image[16];
-    int nimage;
-} g_tm;
-
-static void tm_mem_barrier(VkCommandBuffer c, VkPipelineStageFlags src_stage, VkAccessFlags src_access,
-                           VkPipelineStageFlags dst_stage, VkAccessFlags dst_access) {
-    VkMemoryBarrier b = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = src_access, .dstAccessMask = dst_access};
-    vkCmdPipelineBarrier(c, src_stage, dst_stage, 0, 1, &b, 0, NULL, 0, NULL);
-}
-
-static vkx_tm_image *tm_image(VkCommandBuffer c, uint32_t w, uint32_t h, VkFormat fmt, VkImageUsageFlags usage) {
-    for (int i = 0; i < g_tm.nimage; i++) {
-        vkx_tm_image *x = &g_tm.image[i];
-        if (x->w == w && x->h == h && x->fmt == fmt && x->usage == usage) return x;
-    }
-    if (!w || !h || g_tm.nimage == (int)(sizeof g_tm.image / sizeof g_tm.image[0])) return NULL;
-    vkx_tm_image *x = &g_tm.image[g_tm.nimage];
-    VkImageCreateInfo ii = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D, .format = fmt,
-        .extent = {w, h, 1}, .mipLevels = 1, .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT,
-        .tiling = VK_IMAGE_TILING_OPTIMAL, .usage = usage, .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
-    if (vkCreateImage(g_vkd.dev, &ii, NULL, &x->img) != VK_SUCCESS) return NULL;
-    VkMemoryRequirements mr; vkGetImageMemoryRequirements(g_vkd.dev, x->img, &mr);
-    VkMemoryAllocateInfo ma = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = mr.size,
-        .memoryTypeIndex = vkr_pick_mem(mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)};
-    if (ma.memoryTypeIndex == UINT32_MAX || vkAllocateMemory(g_vkd.dev, &ma, NULL, &x->mem) != VK_SUCCESS ||
-        vkBindImageMemory(g_vkd.dev, x->img, x->mem, 0) != VK_SUCCESS) {
-        if (x->mem) vkFreeMemory(g_vkd.dev, x->mem, NULL);
-        vkDestroyImage(g_vkd.dev, x->img, NULL); memset(x, 0, sizeof *x); return NULL;
-    }
-    VkImageViewCreateInfo vi = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = x->img,
-        .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = fmt,
-        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
-    if (vkCreateImageView(g_vkd.dev, &vi, NULL, &x->view) != VK_SUCCESS) {
-        vkFreeMemory(g_vkd.dev, x->mem, NULL); vkDestroyImage(g_vkd.dev, x->img, NULL); memset(x, 0, sizeof *x); return NULL;
-    }
-    VkImageMemoryBarrier b = {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-        .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
-        .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, .newLayout = VK_IMAGE_LAYOUT_GENERAL,
-        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .image = x->img, .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
-    vkCmdPipelineBarrier(c, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL, 0, NULL, 1, &b);
-    x->w = w; x->h = h; x->fmt = fmt; x->usage = usage; g_tm.nimage++;
-    return x;
-}
-
-// A plain sampled view of a scene image for the scale-and-square pass.  Some
-// translated post passes have already produced sqrt(linear) values in the
-// base R11G11B10 format rather than raw RGB9E5 words; those must be sampled as
-// floats directly, not bit-copied into an RGB9E5 image first.
-static VkImageView tm_sample_view(vtex *t) {   // under g_tmu
-    if (!t || !(t->usage & VK_IMAGE_USAGE_SAMPLED_BIT) || t->d != 1 || t->layers != 1) return VK_NULL_HANDLE;
-    uint64_t key = 0x20000000u | (uint64_t)(uint32_t)t->fmt << 32;
-    for (vkview *v = t->views; v; v = v->next) if (v->key == key) return v->view;
-    VkImageViewCreateInfo vi = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
-        .image = t->img, .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = t->fmt,
-        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
-    vkview *v = calloc(1, sizeof *v); v->key = key;
-    if (vkCreateImageView(g_vkd.dev, &vi, NULL, &v->view) != VK_SUCCESS) { free(v); return VK_NULL_HANDLE; }
-    v->next = t->views; t->views = v;
-    return v->view;
-}
-
-static int tm_init(void) {
-    if (g_tm.tried) return g_tm.ok;
-    g_tm.tried = 1;
-    VkFormatProperties fp; vkGetPhysicalDeviceFormatProperties(g_vkd.pd, VK_FORMAT_E5B9G9R9_UFLOAT_PACK32, &fp);
-    VkFormatFeatureFlags need = VK_FORMAT_FEATURE_TRANSFER_DST_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
-    if ((fp.optimalTilingFeatures & need) != need) {
-        LOG("[RED] vulkan draws: RGB9E5 NDSR stand-in unavailable: E5B9G9R9 cannot be copied and sampled");
-        return 0;
-    }
-    g_tm.linear = !!(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT);
-    VkDescriptorSetLayoutBinding lb[2] = {
-        {.binding = 0, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT},
-        {.binding = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT}};
-    VkDescriptorSetLayoutCreateInfo li = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-        .bindingCount = 2, .pBindings = lb};
-    VkPushConstantRange pr = {.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT, .offset = 0, .size = 24};
-    VkSamplerCreateInfo si = {.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
-        .magFilter = g_tm.linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST,
-        .minFilter = g_tm.linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST,
-        .mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST,
-        .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
-        .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
-        .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, .maxLod = 0};
-    VkShaderModuleCreateInfo mi = {.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
-        .codeSize = sizeof vkx_tonemap_spv, .pCode = vkx_tonemap_spv};
-    VkShaderModule mod = VK_NULL_HANDLE;
-    int ok = vkCreateDescriptorSetLayout(g_vkd.dev, &li, NULL, &g_tm.dsl) == VK_SUCCESS;
-    VkPipelineLayoutCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
-        .setLayoutCount = 1, .pSetLayouts = &g_tm.dsl, .pushConstantRangeCount = 1, .pPushConstantRanges = &pr};
-    ok = ok && vkCreatePipelineLayout(g_vkd.dev, &pi, NULL, &g_tm.layout) == VK_SUCCESS &&
-         vkCreateSampler(g_vkd.dev, &si, NULL, &g_tm.sampler) == VK_SUCCESS &&
-         vkCreateShaderModule(g_vkd.dev, &mi, NULL, &mod) == VK_SUCCESS;
-    if (ok) {
-        VkComputePipelineCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
-            .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-                      .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = mod, .pName = "main"},
-            .layout = g_tm.layout};
-        ok = vkCreateComputePipelines(g_vkd.dev, VK_NULL_HANDLE, 1, &ci, NULL, &g_tm.pipe) == VK_SUCCESS;
-    }
-    if (mod) vkDestroyShaderModule(g_vkd.dev, mod, NULL);
-    LOG("vulkan draws: Ocarina NDSR stand-in %s (RGB9E5 %s filtering)", ok ? "ready" : "could not be created",
-        g_tm.linear ? "linear" : "nearest");
-    return g_tm.ok = ok;
-}
-
-static VkDescriptorSet tm_set(int slot, VkImageView src, VkImageView dst) {
-    if (slot < 0 || slot >= CB_RING) return VK_NULL_HANDLE;
-    uint64_t gen = vkr_fence_next();
-    if (!g_tm.pool[slot]) {
-        VkDescriptorPoolSize ps[2] = {{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 512}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 512}};
-        VkDescriptorPoolCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-            .maxSets = 512, .poolSizeCount = 2, .pPoolSizes = ps};
-        if (vkCreateDescriptorPool(g_vkd.dev, &pi, NULL, &g_tm.pool[slot]) != VK_SUCCESS) return VK_NULL_HANDLE;
-    }
-    if (g_tm.pool_gen[slot] != gen) {
-        if (vkResetDescriptorPool(g_vkd.dev, g_tm.pool[slot], 0) != VK_SUCCESS) return VK_NULL_HANDLE;
-        g_tm.pool_gen[slot] = gen;
-    }
-    VkDescriptorSet set = VK_NULL_HANDLE;
-    VkDescriptorSetAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
-        .descriptorPool = g_tm.pool[slot], .descriptorSetCount = 1, .pSetLayouts = &g_tm.dsl};
-    if (vkAllocateDescriptorSets(g_vkd.dev, &ai, &set) != VK_SUCCESS) return VK_NULL_HANDLE;
-    VkDescriptorImageInfo ii[2] = {{g_tm.sampler, src, VK_IMAGE_LAYOUT_GENERAL}, {VK_NULL_HANDLE, dst, VK_IMAGE_LAYOUT_GENERAL}};
-    VkWriteDescriptorSet wr[2] = {
-        {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set, .dstBinding = 0, .descriptorCount = 1,
-         .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &ii[0]},
-        {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set, .dstBinding = 1, .descriptorCount = 1,
-         .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .pImageInfo = &ii[1]}};
-    vkUpdateDescriptorSets(g_vkd.dev, 2, wr, 0, NULL);
-    return set;
-}
-
-// Ocarina NDVE 49dff010b9832251 writes the converted movie picture to compute
-// image slot 0. The skipped final NDSR stage consumes that exact result later;
-// remember it per NVN queue and re-resolve it at the consumer.
-static void movie_rgb_remember(const char key[17]) {
-    if (strcmp(key, "49dff010b9832251")) return;
-    int id = (int)(S.img[5][0] & 0xfffff); tex_t o; view_t v; int hv;
-    S.movie_rgb_id = 0; S.movie_rgb_serial = 0;
-    pthread_mutex_lock(&g_tmu);
-    int ok = id && vkr_treg(id, &o, &v, &hv) && vkr_tex_sampled(&o, VK_NULL_HANDLE);
-    if (ok) { S.movie_rgb_id = id; S.movie_rgb_serial = o.serial; }
-    pthread_mutex_unlock(&g_tmu);
-}
-
-static int skipped_compute_fallback(VkCommandBuffer c, const uint8_t key8[8]) {
-    char key[17]; for (int i = 0; i < 8; i++) snprintf(key + 2 * i, 3, "%02x", key8[i]);
-    // The movie and gameplay use different NDSR programs.  Only accept the
-    // movie's final stage, or one of the five agl gameplay stages; the raw
-    // RGB9E5 tag and size/aspect checks below select the one gameplay stage
-    // that actually binds the scene colour and its larger output.  Applying
-    // this to arbitrary skipped compute can paste a G-buffer intermediate
-    // over the real picture.
-    int movie = !strcmp(key, "4f41ccf24f163e0d");
-    int gameplay = !strcmp(key, "f8965bffbdf51d78") || !strcmp(key, "d17eefaff4f0bc23") ||
-                   !strcmp(key, "a335c1db6270c355") || !strcmp(key, "fa3033d05c0a41d6") ||
-                   !strcmp(key, "d99fbeeb53d38847");
-    int gameplay_source = !strcmp(key, "f8965bffbdf51d78") || !strcmp(key, "a335c1db6270c355");
-    int gameplay_final = !strcmp(key, "d99fbeeb53d38847");
-    if (!movie && !gameplay) return 0;
-    vtex *src = NULL, *dst = NULL;
-    uint64_t ss = 0, ds = 0;
-    int src_raw_view = 0, gameplay_direct = 0, src_id = 0;
-    VkImageView gameplay_view = VK_NULL_HANDLE;
-    pthread_mutex_lock(&g_tmu);
-    tex_t so, dso; view_t sv, dsv; int shv, dshv;
-    if (movie && S.movie_rgb_id && vkr_treg(S.movie_rgb_id, &so, &sv, &shv) && so.serial == S.movie_rgb_serial)
-        src = vkr_tex_sampled(&so, VK_NULL_HANDLE);
-    if (movie) {
-        int did = (int)(S.img[5][1] & 0xfffff);
-        if (did && vkr_treg(did, &dso, &dsv, &dshv)) dst = vkr_tex_sampled(&dso, VK_NULL_HANDLE);
-    } else {
-        // Bindings persist across programs, so scanning every slot can pick a
-        // stale movie output.  Resolve only the slots declared by each known
-        // gameplay shader's .vkb.  For the two-input stages, keep the largest
-        // compatible colour input (the other is a small auxiliary texture).
-        int dslot = !strcmp(key, "f8965bffbdf51d78") ? 0 :
-                    !strcmp(key, "a335c1db6270c355") ? 2 : 1;
-        int sslot[2] = {-1, -1}, ns = 1;
-        if (!strcmp(key, "f8965bffbdf51d78")) sslot[0] = 3;
-        else if (!strcmp(key, "d17eefaff4f0bc23")) sslot[0] = 4, sslot[1] = 6, ns = 2;
-        else if (!strcmp(key, "a335c1db6270c355")) sslot[0] = 5, sslot[1] = 3, ns = 2;
-        else sslot[0] = 0;
-        int did = (int)(S.img[5][dslot] & 0xfffff);
-        if (did && vkr_treg(did, &dso, &dsv, &dshv)) dst = vkr_tex_sampled(&dso, VK_NULL_HANDLE);
-        for (int i = 0; dst && i < ns; i++) {
-            int id = (int)(S.tex[5][sslot[i]] & 0xfffff);
-            tex_t o; view_t v; int hv;
-            vtex *t = id && vkr_treg(id, &o, &v, &hv) ? vkr_tex_sampled(&o, VK_NULL_HANDLE) : NULL;
-            if (t && t != dst && t->fmt == VK_FORMAT_B10G11R11_UFLOAT_PACK32 &&
-                (t->aspect & VK_IMAGE_ASPECT_COLOR_BIT) && t->d == 1 && t->samples == 1 &&
-                (!src || (uint64_t)t->w * t->h > (uint64_t)src->w * src->h)) {
-                src = t;
-                src_id = id;
-                src_raw_view = hv && vkr_view_format(t->fmt, &v, hv) == VK_FORMAT_E5B9G9R9_UFLOAT_PACK32;
-            }
-        }
-        if (gameplay_source && src && src_id) {
-            S.gameplay_scene_id = src_id;
-            S.gameplay_scene_serial = src->serial;
-        }
-        if (gameplay_final && S.gameplay_scene_id &&
-            vkr_treg(S.gameplay_scene_id, &so, &sv, &shv) && so.serial == S.gameplay_scene_serial) {
-            vtex *remembered = vkr_tex_sampled(&so, VK_NULL_HANDLE);
-            if (remembered && remembered != dst &&
-                remembered->fmt == VK_FORMAT_B10G11R11_UFLOAT_PACK32 &&
-                (remembered->aspect & VK_IMAGE_ASPECT_COLOR_BIT) &&
-                remembered->d == 1 && remembered->samples == 1) {
-                src = remembered;
-                src_id = S.gameplay_scene_id;
-                src_raw_view = 0;
-                gameplay_view = tm_sample_view(remembered);
-                gameplay_direct = gameplay_view != VK_NULL_HANDLE;
-            }
-        }
-    }
-    if (src) ss = src->serial;
-    if (dst) ds = dst->serial;
-    VkImage si = src ? src->img : VK_NULL_HANDLE, di = dst ? dst->img : VK_NULL_HANDLE;
-    uint32_t sw = src ? src->w : 0, sh = src ? src->h : 0, dw = dst ? dst->w : 0, dh = dst ? dst->h : 0;
-    VkFormat sf = src ? src->fmt : VK_FORMAT_UNDEFINED, df = dst ? dst->fmt : VK_FORMAT_UNDEFINED;
-    int raw = src && (src->raw_9e5 || src_raw_view) &&
-              sf == VK_FORMAT_B10G11R11_UFLOAT_PACK32;
-    uint64_t lhs = (uint64_t)sw * dh, rhs = (uint64_t)sh * dw;
-    uint64_t aspect_max = lhs > rhs ? lhs : rhs, aspect_diff = lhs > rhs ? lhs - rhs : rhs - lhs;
-    int eligible = src && dst && dw > sw && dh > sh && aspect_max && aspect_diff * 100 <= aspect_max &&
-                   (movie || raw || gameplay_direct);
-    if (eligible) {
-        vkr_tex_gpu_write(dst); dst->raw_9e5 = 0;
-        // Only one member of the five-stage gameplay chain may consume this
-        // scene.  The producer tags it again on the next frame.
-        if (raw) src->raw_9e5 = 0;
-    }
-    pthread_mutex_unlock(&g_tmu);
-    if (!si || !di || !eligible) {
-        static char missed[8][17]; static int nmissed;
-        int known = 0; for (int i = 0; i < nmissed; i++) known |= !strcmp(missed[i], key);
-        if (!known && nmissed < (int)(sizeof missed / sizeof missed[0])) {
-            snprintf(missed[nmissed++], 17, "%s", key);
-            LOG("vulkan draws: skipped compute %s has no stand-in pair: src %llu %ux%u fmt %d raw %d -> dst %llu %ux%u fmt %d",
-                key, (unsigned long long)ss, sw, sh, (int)sf, raw,
-                (unsigned long long)ds, dw, dh, (int)df);
-        }
-        return 0;
-    }
-
-    static struct { char key[17]; uint64_t s, d; } seen[32]; static int nseen;
-    int known = 0; for (int i = 0; i < nseen; i++) known |= !strcmp(seen[i].key, key) && seen[i].s == ss && seen[i].d == ds;
-    if (!known && nseen < (int)(sizeof seen / sizeof seen[0])) {
-        snprintf(seen[nseen].key, 17, "%s", key); seen[nseen].s = ss; seen[nseen].d = ds; nseen++;
-        LOG("vulkan draws: skipped compute %s stand-in: serial %llu %ux%u fmt %d%s -> %llu %ux%u fmt %d", key,
-            (unsigned long long)ss, sw, sh, (int)sf, raw ? " raw RGB9E5" : gameplay_direct ? " sqrt-linear" : "",
-            (unsigned long long)ds, dw, dh, (int)df);
-    }
-
-    VkImageBlit bl = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
-        .srcOffsets = {{0, 0, 0}, {(int32_t)sw, (int32_t)sh, 1}},
-        .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
-        .dstOffsets = {{0, 0, 0}, {(int32_t)dw, (int32_t)dh, 1}}};
-    tm_mem_barrier(c, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_WRITE_BIT,
-                   VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
-    if (!raw && !gameplay_direct) {
-        vkCmdBlitImage(c, si, VK_IMAGE_LAYOUT_GENERAL, di, VK_IMAGE_LAYOUT_GENERAL, 1, &bl, VK_FILTER_LINEAR);
-        return 1;
-    }
-    if (!tm_init()) return 0;
-    vkx_tm_image *out = tm_image(c, dw, dh, VK_FORMAT_R16G16B16A16_SFLOAT,
-                                 VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
-    if (!out) return 0;
-    VkImageView sample_view = gameplay_view;
-    if (raw) {
-        vkx_tm_image *e5 = tm_image(c, sw, sh, VK_FORMAT_E5B9G9R9_UFLOAT_PACK32,
-                                    VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
-        if (!e5) return 0;
-        VkImageCopy cp = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
-            .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .extent = {sw, sh, 1}};
-        vkCmdCopyImage(c, si, VK_IMAGE_LAYOUT_GENERAL, e5->img, VK_IMAGE_LAYOUT_GENERAL, 1, &cp);
-        tm_mem_barrier(c, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
-                       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
-        sample_view = e5->view;
-    } else {
-        tm_mem_barrier(c, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_WRITE_BIT,
-                       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
-    }
-    VkDescriptorSet set = tm_set(g_pool_slot, sample_view, out->view); if (!set) return 0;
-    vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, g_tm.pipe);
-    vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_COMPUTE, g_tm.layout, 0, 1, &set, 0, NULL);
-    struct { float inv[2], unused, pad; int32_t size[2]; } pc = {{1.0f / (float)dw, 1.0f / (float)dh}, 0, 0, {(int32_t)dw, (int32_t)dh}};
-    vkCmdPushConstants(c, g_tm.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, &pc);
-    vkCmdDispatch(c, (dw + 7) / 8, (dh + 7) / 8, 1);
-    tm_mem_barrier(c, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
-                   VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
-    bl.srcOffsets[1] = (VkOffset3D){(int32_t)dw, (int32_t)dh, 1};
-    vkCmdBlitImage(c, out->img, VK_IMAGE_LAYOUT_GENERAL, di, VK_IMAGE_LAYOUT_GENERAL, 1, &bl, VK_FILTER_NEAREST);
-    return 1;
-}
-
 // Compute shaders left out on purpose (vk_skipcs.h: DM_VK_SKIP_CS exact keys): read once, each selected key logged once. The key is checked before shader_get,
 // so this dispatch neither requests a shader object nor reaches the command buffer (background prewarming may still compile it). Unset follows the original path.
 static vkx_skipcs g_skipcs; static int g_skipcs_read;
@@ -2241,7 +1905,7 @@ void vkx_dispatch(VkCommandBuffer c, const p_dispatch *p) {
     if (!draw_init() || g_pool_slot < 0 || !S.prog[5]) DSKIP(0);
     vks *s = NULL; uint8_t k8[8];
     for (int i = 0; i < NST && !s && prog_key(S.prog[5], (unsigned)i, k8); i++) {
-        if (skipcs(k8)) { if (!skipped_compute_fallback(c, k8)) g_st_dskip++; return; }
+        if (skipcs(k8)) { g_st_dskip++; return; }
         vks *t = shader_get(S.prog[5], i); if (t && t->stage == 5) s = t;
     }
     if (!s) DSKIP(1);
@@ -2254,8 +1918,10 @@ void vkx_dispatch(VkCommandBuffer c, const p_dispatch *p) {
     VkDescriptorSet set = stage_set(5, s); if (!set) DSKIP(3);
     vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_COMPUTE, g_pl_cs, 0, 1, &set, 0, NULL);
     VkShaderStageFlagBits st = VK_SHADER_STAGE_COMPUTE_BIT; g_vkd.bind_shaders(c, 1, &st, &s->sh);
+    int gpu_sample = vkr_cs_gpu_begin(c, s->key, (uint32_t)p->x, (uint32_t)p->y,
+                                      (uint32_t)p->z, p->ind);
     if (p->ind) vkCmdDispatchIndirect(c, ib, io); else vkCmdDispatch(c, (uint32_t)p->x, (uint32_t)p->y, (uint32_t)p->z);
-    movie_rgb_remember(s->key);
+    vkr_cs_gpu_end(c, gpu_sample);
     g_st_dispatched++; dkeys_note(s->key);
     if (drawlog() && !(g_st_dispatched & (g_st_dispatched - 1))) LOG("vulkan draws: %llu dispatches, %llu skipped", (unsigned long long)g_st_dispatched, (unsigned long long)g_st_dskip);
 }

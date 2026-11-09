@@ -145,27 +145,89 @@ outside this MIT runtime tree.
 
 ## Bounded NDVE diagnostic
 
-`DM_VK_SKIP_CS` is an opt-in exact-key diagnostic for compute kernels that are
-known to be unsafe on the current GPU. With the variable unset, every compute
+`DM_VK_SKIP_CS` is an opt-in exact-key diagnostic for isolating expensive or
+suspect compute kernels. With the variable unset or empty, every compute
 dispatch follows the normal path. Values are comma- or whitespace-separated
 16-hex-digit shader keys; invalid entries are rejected, and there is no size or
-prefix matching.
+prefix matching. A selected dispatch is dropped: the replay does not replace
+it with a blit, scaler, tone map or another title-specific operation.
 
-On the M1 Pro/Honeykrisp OoT title path, only the four measured NDVE
-movie-enhancement kernels should be selected:
+The first M1 Pro/Honeykrisp investigation isolated four measured NDVE
+movie-enhancement kernels with:
 
 ```sh
 DM_VK_SKIP_CS=d15370a382630d4e,e6be82d835fbe4d3,9442573ee4ace011,0a56002cdc7e1fce
 ```
 
-The title movie is then unenhanced. Each selected key is logged once, and
-`DM_VK_OPS=1` reports the cumulative number of deliberately skipped dispatches.
-This is containment for a bounded title/input test, not a general performance
-switch or a claim of rendering correctness. The parser and disabled default
-have a device-free check:
+The movie chain is incomplete under that diagnostic. Each selected key is
+logged once, and `DM_VK_OPS=1` reports the cumulative number of deliberately
+skipped dispatches. This is containment for a bounded investigation, not a
+general performance switch or a rendering fallback. The root launcher leaves
+the variable empty so the real NDVE movie and NDSR gameplay chains run. The
+parser and disabled default have a device-free check:
 
 ```sh
 make -C dm/linux GAME=0400486024DEC000 t_skipcs
+```
+
+## Vulkan compute lowering and timing
+
+The Linux SPIR-V build lowers the translator's named
+`dmsh_hmma16816_f16` helper only when its current 18-pointer ABI, private
+workgroup scratch layout, barriers and unused TensorPass facts all match. The
+lowering gathers A/B fragments through vector workgroup loads, reuses equal
+fragments within a basic block, preserves the helper's ordered FP32 FMA and
+FP16 packing, and removes the scalar helper. A named helper with a changed ABI
+fails the key instead of silently retaining the slow path. Every changed
+module requires `spirv-val --target-env vulkan1.3` before it is published.
+
+A second conservative pass coalesces aligned pairs or quads of scalar loads
+from a reflected read-only storage buffer. It admits only a 32-bit,
+stride-four descriptor with a complete no-write/no-alias proof, keeps original
+SSA result IDs at their original program points, and closes its candidate run
+at every unclassified operation. Existing SPIR-V vector and pointer types are
+reused. The canonical module and its `.vkb` table are published as one
+fail-closed unit, and both passes participate in `DMSH_CHAIN`.
+
+The portable fixtures cover ABI drift, helper semantics, SPIR-V validation,
+pointer aliasing, write detection, alignment and type reuse:
+
+```sh
+SPIRV_AS="$(command -v spirv-as)" \
+SPIRV_VAL="$(command -v spirv-val)" \
+python3 dm/gfx/tests/test_dmsh_spv_hmma.py
+
+DMSH_FIXTURE_TOOLS="$(dirname "$(command -v spirv-val)")" \
+python3 dm/gfx/tests/test_dmsh_spv_vector.py
+```
+
+`DM_VK_CS_GPU=1` adds timestamp pairs around existing Vulkan compute
+dispatches without splitting command buffers or adding barriers or waits.
+Completed submissions log shader key, frame, group dimensions and GPU time as
+`[vk-cs-gpu]`; `DM_VK_CS_GPU_LIMIT` bounds the total (4,096 by default,
+65,536 maximum), and each command-buffer slot holds at most 512 samples. The
+publication/reuse lifecycle has a device-free check:
+
+```sh
+make -C dm/linux GAME=0400486024DEC000 t_vk_cs_gpu_lifecycle
+```
+
+## Compatible 32-bit image views
+
+NVN shaders may address a compatible 32-bit colour image through an R32UI or
+R32I view. Ocarina's NDSR chain depends on this: `d17eefaff4f0bc23` performs
+integer image atomics on an RGBA8 target. The Vulkan replay therefore declares
+the supported R32 integer views in the image's `VkImageFormatListCreateInfo`,
+uses mutable/extended usage at image creation, and binds the guest-requested
+integer view to the same image allocation. It does not substitute a buffer or
+copy the pixels into a title-specific side image.
+
+Only uncompressed, non-depth members of Vulkan's 32-bit format compatibility
+class are admitted, and only when the device reports storage-image support for
+the integer view. The format selection boundary has a device-free check:
+
+```sh
+make -C dm/linux GAME=0400486024DEC000 t_vk_format
 ```
 
 ## Focused Vulkan diagnostics

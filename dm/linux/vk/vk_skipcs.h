@@ -2,7 +2,8 @@
 // movie-enhancement network has four compute shaders whose HMMA chains become scalar code on Honeykrisp and take 237-251 ms of GPU a frame.
 //   DM_VK_SKIP_CS=<key>[,<key>...]   skip only these exact compute shader keys (16 hex digits each, as shader_map.tsv names them)
 // There is deliberately no size/prefix rule: enabling the diagnostic cannot silently catch a newly generated or unrelated shader. Unset means no change to dispatches.
-// Pure (no Vulkan), so vk/tests/t_skipcs.c checks the parser, exact matching and disabled default; each selected key is logged once by the caller.
+// A match drops the dispatch and never substitutes a blit or another operation. Pure (no Vulkan), so vk/tests/t_skipcs.c checks the parser, exact matching and disabled
+// default; each selected key is logged once by the caller.
 #pragma once
 #include <stdint.h>
 #include <stdlib.h>

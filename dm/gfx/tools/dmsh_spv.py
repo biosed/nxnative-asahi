@@ -12,6 +12,8 @@ import json, os, runpy, shutil, subprocess, sys, threading
 HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, HERE)
 import dmsh_chain   # before XLATE is set: XLATE_DIR stays the pinned build in dmsh_xlate_bin
 from dmsh_spv_stage import STAGE_SET, StageError, import_native_translation
+from dmsh_spv_hmma import lower_file as lower_hmma_file, remove_outputs
+from dmsh_spv_vector import optimize_vector_loads
 
 if len(sys.argv) < 3: sys.exit('usage: DM_GAME=<id> dmsh_spv.py <Switch package dir> <output dir> [key...]')
 DLL = os.path.join(dmsh_chain.XLATE_DIR, 'dmsh_xlate.dll')
@@ -65,7 +67,13 @@ def fix_caps(path):
     return len(add)
 
 class Translated(Exception): pass
-_run, _lock, _state = subprocess.run, threading.Lock(), {'jobs': 0, 'spv': 0, 'native_mesh': 0, 'failed': {}, 'caps': 0, 'skipped_stage': {}, 'cross': 0}
+_run, _lock, _state = subprocess.run, threading.Lock(), {'jobs': 0, 'spv': 0, 'native_mesh': 0, 'failed': {}, 'caps': 0, 'hmma': 0, 'hmma_shaders': 0, 'vec2': 0, 'vec4': 0, 'vec_loads': 0, 'vec_shaders': 0, 'skipped_stage': {}, 'cross': 0}
+
+def lower_hmma(path):
+    """Lower the current TensorPass HMMA helper and validate the final module."""
+    validator = os.environ.get('SPIRV_VAL') or shutil.which('spirv-val')
+    return lower_hmma_file(path, validator, _run)
+
 def run(args, *a, **k):
     if isinstance(args, (list, tuple)) and args and args[0] == wrapper and len(args) == 3 and not args[1].startswith('-'):
         r = _run(args, *a, **k)
@@ -95,7 +103,17 @@ def run(args, *a, **k):
                 if not os.path.exists(os.path.join(w, key + '.spv')): continue
                 for ext in ('.spv', '.res.json', '.reader.spv'):
                     if os.path.exists(os.path.join(w, key + ext)): shutil.copyfile(os.path.join(w, key + ext), os.path.join(OUT, key + ext))
-                _state['caps'] += bool(fix_caps(os.path.join(OUT, key + '.spv')))
+                spv = os.path.join(OUT, key + '.spv')
+                caps = bool(fix_caps(spv))
+                try:
+                    hmma = lower_hmma(spv) if stage == 'cs' else 0
+                except (OSError, ValueError, KeyError, StopIteration) as e:
+                    _state['failed'][key] = 'HMMA lowering: ' + str(e)[:180]
+                    remove_outputs(OUT, key)
+                    continue
+                _state['caps'] += caps
+                _state['hmma'] += hmma
+                _state['hmma_shaders'] += bool(hmma)
                 json.dump(job, open(os.path.join(OUT, key + '.job.json'), 'w'))
                 _state['spv'] += 1
         return r
@@ -279,8 +297,49 @@ def vk_canon(key):
             json.dump(job, jf, indent=2, sort_keys=True); jf.write('\n')
         if first['binding'] is not None:
             rows.append('\t'.join(str(x) for x in (MESH_FIRST_BINDING, 'u', 'mesh_first', '', '', '', '', '', 0, 0, 0, 0, 1)))
-    open(os.path.join(OUT, key + '.vk.spv'), 'wb').write(data)
-    open(os.path.join(OUT, key + '.vkb'), 'w').write(f'# {key} {vk["stage"]} set {st}\n' + ''.join(r + '\n' for r in rows))
+    canonical = data
+    try:
+        data, vector = optimize_vector_loads(data, vk)
+        changed = data != canonical
+        if changed:
+            validator = os.environ.get('SPIRV_VAL') or shutil.which('spirv-val')
+            if not validator:
+                raise ValueError('vector-load lowering needs SPIRV_VAL or spirv-val on PATH')
+            temp = os.path.join(OUT, key + '.vk.spv.vector.tmp')
+            try:
+                with open(temp, 'wb') as f: f.write(data)
+                result = _run([validator, '--target-env', 'vulkan1.3', temp], capture_output=True, text=True)
+                if result.returncode:
+                    raise ValueError((result.stderr or result.stdout or 'spirv-val failed').strip()[:300])
+            finally:
+                try: os.unlink(temp)
+                except FileNotFoundError: pass
+    except Exception:
+        # An earlier run may have left a loadable canonical shader. ABI drift
+        # or failed validation must remove it and its binding table together.
+        remove_outputs(OUT, key)
+        raise
+    spv_path = os.path.join(OUT, key + '.vk.spv'); spv_tmp = spv_path + '.tmp'
+    vkb_path = os.path.join(OUT, key + '.vkb'); vkb_tmp = vkb_path + '.tmp'
+    try:
+        with open(spv_tmp, 'wb') as f: f.write(data)
+        with open(vkb_tmp, 'w') as f: f.write(f'# {key} {vk["stage"]} set {st}\n' + ''.join(r + '\n' for r in rows))
+        # Remove both old halves first, then publish the shader last. A crash
+        # can leave the pair absent, never a new shader with stale bindings.
+        for old in (spv_path, vkb_path):
+            try: os.unlink(old)
+            except FileNotFoundError: pass
+        os.replace(vkb_tmp, vkb_path)
+        os.replace(spv_tmp, spv_path)
+    except Exception:
+        # The runtime consumes the shader and binding table as one ABI unit.
+        # Never leave one new half paired with an old or missing other half.
+        remove_outputs(OUT, key)
+        for temp in (spv_tmp, vkb_tmp):
+            try: os.unlink(temp)
+            except FileNotFoundError: pass
+        raise
+    return vector
 
 sys.argv = [os.path.join(HERE, 'dmsh_build.py')] + sys.argv[1:]
 try: runpy.run_path(sys.argv[0], run_name='__main__')
@@ -291,11 +350,17 @@ for f in sorted(os.listdir(OUT)):
     if not f.endswith('.spv') or '.reader.' in f or f.endswith('.vk.spv'): continue   # <key>.vk.spv is vk_canon's output from an earlier run, not a shader
     try:
         bs = vk_reflect(f[:-4])
-        vk_canon(f[:-4])
+        vector = vk_canon(f[:-4])
+        _state['vec2'] += vector['groups2']; _state['vec4'] += vector['groups4']; _state['vec_loads'] += vector['scalar_loads']; _state['vec_shaders'] += bool(vector['scalar_loads'])
         for b in bs: _kinds[b['kind']] += 1; _noreg += b['kind'] in ('cbuf', 'tex', 'img', 'sbuf', 'samp', 'samp_tex', 'tbuf') and b.get('reg') is None
-    except Exception as e: print(f'  [RED] {f}: reflection failed: {e}'); _state['failed'][f[:-4]] = 'reflection: ' + str(e)
+    except Exception as e:
+        remove_outputs(OUT, f[:-4])
+        print(f'  [RED] {f}: reflection failed: {e}')
+        _state['failed'][f[:-4]] = 'reflection: ' + str(e)
 print('Vulkan reflection (.vk.json): bindings by kind ' + ', '.join(f'{k} {v}' for k, v in _kinds.most_common()) + f'; without a slot {_noreg}')
 print(f'SPIR-V: {_state["spv"]} shaders written from {_state["jobs"]} jobs to {OUT} (native task/mesh imports {_state["native_mesh"]}); translation/reflection failed {len(_state["failed"])}; storage image capabilities added to {_state["caps"]}')
+print(f'SPIR-V HMMA: {_state["hmma"]} current-ABI helper calls lowered in {_state["hmma_shaders"]} compute shaders')
+print(f'SPIR-V vector loads: {_state["vec_loads"]} scalar loads coalesced as {_state["vec2"]} x 64-bit and {_state["vec4"]} x 128-bit groups in {_state["vec_shaders"]} shaders')
 print('SPIR-V stages omitted (no validated DMSH_VK_MESH_EXT_DIR input): ' + (', '.join(f'{k} {v}' for k, v in sorted(_state['skipped_stage'].items())) or 'none') + f'; Metal conversions bypassed {_state["cross"]}')
 for key, msg in list(_state['failed'].items())[:10]: print(f'  [RED] {key}: {msg}')
 sys.exit(0 if _state['jobs'] else 1)
