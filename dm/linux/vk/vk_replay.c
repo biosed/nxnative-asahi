@@ -408,6 +408,7 @@ static void rc_eval(const p_render_cond *rc) {
 static void tex_ready(VkCommandBuffer c, vtex *t);
 static VkCommandBuffer up_cb(void);
 static void rp_end(VkCommandBuffer c);
+static void pc_flush(VkCommandBuffer c);
 static vtex *tex_find(uint64_t serial) { for (sref *r = g_tab[serial % 4096]; r; r = r->next) if (r->serial == serial) return r->t; return NULL; }
 static void sref_add(uint64_t serial, vtex *t) {
     if (!vkx_image_serial_ref_add(&t->refs, &t->serial_refs,
@@ -424,7 +425,8 @@ static void sref_drop_all(vtex *t) {
     vkx_image_serial_refs_drop_all(&t->refs, &t->serial_refs);
 }
 static void stor_unlink(vtex *t) { for (vtex **p = &g_stab[t->khash]; *p; p = &(*p)->next) if (*p == t) { *p = t->next; return; } }
-static void tex_retire(vtex *t) { t->release_after = atomic_load(&g_fence) + 1; t->next = g_dead; g_dead = t; g_dead_bytes += t->bytes; }   // the submission in progress may use it too
+static void pc_drop(const vtex *t);
+static void tex_retire(vtex *t) { pc_drop(t); t->release_after = atomic_load(&g_fence) + 1; t->next = g_dead; g_dead = t; g_dead_bytes += t->bytes; }   // the submission in progress may use it too
 void vkr_tex_gpu_write(vtex *t) { if (t) t->gpu_owned = 1; }
 static uint64_t g_shared_hits, g_taken;
 static void image_stats(uint64_t *cpu, uint64_t *gpu, uint64_t *empty, uint64_t *stale) {
@@ -1019,6 +1021,7 @@ static unsigned mesh_flush_every(void) {
 }
 static uint64_t sub_submit(void) {   // the open command buffer (after its uploads) to the queue, signalling the next timeline value
     VkCommandBuffer c = g_cb[g_cb_i];
+    pc_flush(c);   // a pending clear does not outlive its command buffer (every caller has ended the pass)
     uint64_t mesh_seq = g_cb_mesh_seq[g_cb_i];
     if (g_qp) { vkCmdWriteTimestamp(c, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g_qp, (uint32_t)(2 * g_cb_i + 1)); g_cb_timed[g_cb_i] = 1; }
     if (mesh_seq && mesh_log_on())
@@ -1220,7 +1223,49 @@ static void ubd_land(VkCommandBuffer c) {   // the deferred updates, in order, o
     }
     g_nubd = 0;
 }
-static void rp_end(VkCommandBuffer c) { if (!g_rp_on) return; vkCmdEndRendering(c); final_remember(); g_rp_on = 0; g_rp_drew = 0; ubd_land(c); full_barrier(c); }
+static void rp_end_keep(VkCommandBuffer c) { if (!g_rp_on) return; vkCmdEndRendering(c); final_remember(); g_rp_on = 0; g_rp_drew = 0; ubd_land(c); full_barrier(c); }   // the pass ends; pending clears stay pending
+// ---- whole-attachment clears held for the next pass's load operation ----
+// NVN's ClearColor / ClearDepthStencil outside a scissor clear the whole target, and the game draws into it next. Recorded as vkCmdClear*Image the clear is
+// a pass of its own on a tiled GPU (a compute fill on Honeykrisp G13, behind a barrier), and the draw pass that follows then loads the image it just wrote
+// back into the tile buffer. Ocarina of Time clears 49 attachments this way in a Kokiri Forest frame (biosed-agent's audit). The clear is kept pending
+// instead: a pass that attaches exactly that image level and layer over its whole size takes it as VK_ATTACHMENT_LOAD_OP_CLEAR; anything else that could
+// read the image first (another pass, a copy, a dispatch, a barrier, the submission's end: every rp_end) records the clear as before. DM_VK_PEND_CLEAR=0
+// records every clear at once.
+typedef struct { vtex *t; VkImageSubresourceRange r; VkClearValue v; VkImageAspectFlags asp; } pclear;
+enum { PC_MAX = 12 };
+static pclear g_pc[PC_MAX]; static int g_pcn; static uint64_t g_pc_taken, g_pc_recorded;
+static int pc_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_PEND_CLEAR"); v = !(e && !strcmp(e, "0")); } return v; }
+static void pc_emit(VkCommandBuffer c, const pclear *q) {
+    if (q->asp & VK_IMAGE_ASPECT_COLOR_BIT) vkCmdClearColorImage(c, q->t->img, VK_IMAGE_LAYOUT_GENERAL, &q->v.color, 1, &q->r);
+    else { VkImageSubresourceRange r = q->r; r.aspectMask = q->asp; vkCmdClearDepthStencilImage(c, q->t->img, VK_IMAGE_LAYOUT_GENERAL, &q->v.depthStencil, 1, &r); }
+    full_barrier(c); g_clears++; g_pc_recorded++;
+}
+static void pc_flush(VkCommandBuffer c) { for (int i = 0; i < g_pcn; i++) pc_emit(c, &g_pc[i]); g_pcn = 0; }
+static void pc_drop(const vtex *t) { for (int i = 0; i < g_pcn;) if (g_pc[i].t == t) g_pc[i] = g_pc[--g_pcn]; else i++; }   // an image that is retired: nothing may name it again
+static void pc_add(VkCommandBuffer c, vtex *t, VkImageSubresourceRange r, VkClearValue v, VkImageAspectFlags asp) {
+    for (int i = 0; i < g_pcn; i++) { pclear *q = &g_pc[i];
+        if (q->t != t || q->r.baseMipLevel != r.baseMipLevel || q->r.levelCount != r.levelCount || q->r.baseArrayLayer != r.baseArrayLayer || q->r.layerCount != r.layerCount) continue;
+        if (asp & VK_IMAGE_ASPECT_COLOR_BIT) { q->v = v; return; }   // a later clear of the same range replaces the earlier one
+        if (asp & VK_IMAGE_ASPECT_DEPTH_BIT) q->v.depthStencil.depth = v.depthStencil.depth;
+        if (asp & VK_IMAGE_ASPECT_STENCIL_BIT) q->v.depthStencil.stencil = v.depthStencil.stencil;
+        q->asp |= asp; return; }
+    if (g_pcn == PC_MAX) { pc_emit(c, &g_pc[0]); memmove(g_pc, g_pc + 1, (size_t)(--g_pcn) * sizeof *g_pc); }
+    g_pc[g_pcn++] = (pclear){t, r, v, asp};
+}
+// The pending clear of exactly this attachment (level, first layer, layer count, whole level = the render area), removed: its aspects, 0 when there is none
+static VkImageAspectFlags pc_take(const vtex *t, uint32_t mip, uint32_t layer0, uint32_t nlayers, uint32_t w, uint32_t h, VkClearValue *v) {
+    for (int i = 0; i < g_pcn; i++) { const pclear *q = &g_pc[i];
+        uint32_t levels = q->r.levelCount == VK_REMAINING_MIP_LEVELS ? t->levels - q->r.baseMipLevel : q->r.levelCount;
+        uint32_t tl = t->d > 1 ? (t->d >> mip ? t->d >> mip : 1) : t->layers;
+        uint32_t layers = q->r.layerCount == VK_REMAINING_ARRAY_LAYERS ? tl - q->r.baseArrayLayer : q->r.layerCount;
+        uint32_t lw = t->w >> mip ? t->w >> mip : 1, lh = t->h >> mip ? t->h >> mip : 1;
+        if (q->t != t || q->r.baseMipLevel != mip || levels != 1 || q->r.baseArrayLayer != layer0 || layers != nlayers || lw != w || lh != h || t->d > 1) continue;
+        VkImageAspectFlags asp = q->asp; *v = q->v; g_pc[i] = g_pc[--g_pcn]; g_pc_taken++;
+        if (!(g_pc_taken & (g_pc_taken - 1))) LOG("vulkan replay: %llu whole-attachment clears taken as a pass's load operation, %llu recorded as clears", (unsigned long long)g_pc_taken, (unsigned long long)g_pc_recorded);
+        return asp; }
+    return 0;
+}
+static void rp_end(VkCommandBuffer c) { rp_end_keep(c); pc_flush(c); }
 // A uniform binding [addr, addr + size) for the draw being prepared (vk_draw.c stage_set): 1 and a shadow in *b / *off when a deferred update overlaps it, else 0 (memory as bound)
 int vkr_ub_shadow(uint64_t addr, uint64_t size, VkBuffer *b, VkDeviceSize *off) {
     int hit = 0;
@@ -1287,6 +1332,7 @@ static int rp_begin(VkCommandBuffer c) {
     if (g_rp_on) return 1;
     g_rp_drop = rp_drop_set();
     VkRenderingAttachmentInfo ca[8], da, sa; int nc = 0, have = 0, have_c = 0, samples = 1; uint32_t w = UINT32_MAX, h = UINT32_MAX, layers = 1;
+    const vtex *at[8] = {0}, *adt = NULL; uint32_t amip[8] = {0}, alay[8] = {0}, dmip = 0, dlay = 0;   // what each slot attaches, for a pending clear (pc_take)
     memset(ca, 0, sizeof ca); memset(&da, 0, sizeof da); memset(&sa, 0, sizeof sa);
     memset(&g_rp_diag, 0, sizeof g_rp_diag); g_rp_diag.ncolor = g_rt_n;
     pthread_mutex_lock(&g_tmu);
@@ -1306,9 +1352,9 @@ static int rp_begin(VkCommandBuffer c) {
             uint32_t dl = t->d >> r.baseMipLevel ? t->d >> r.baseMipLevel : 1, z0 = 0, nz = dl;
             if (g_rt_has_view[i] && g_rt_view[i].set_layers) { z0 = g_rt_view[i].min_layer < dl ? g_rt_view[i].min_layer : dl - 1; nz = g_rt_view[i].nlayers ? g_rt_view[i].nlayers : 1; if (z0 + nz > dl) nz = dl - z0; }
             ca[i].imageView = att_view_n(t, r.baseMipLevel, z0, nz, VK_IMAGE_ASPECT_COLOR_BIT, rtf); if (nz > layers) layers = nz;
-        } else ca[i].imageView = att_view_n(t, r.baseMipLevel, r.baseArrayLayer, 1, VK_IMAGE_ASPECT_COLOR_BIT, rtf);
+        } else { ca[i].imageView = att_view_n(t, r.baseMipLevel, r.baseArrayLayer, 1, VK_IMAGE_ASPECT_COLOR_BIT, rtf); at[i] = t; amip[i] = r.baseMipLevel; alay[i] = r.baseArrayLayer; }
         dg->view = ca[i].imageView != VK_NULL_HANDLE;
-        if (!ca[i].imageView) continue;
+        if (!ca[i].imageView) { at[i] = NULL; continue; }
         vkr_tex_gpu_write(t);
         have = have_c = 1; samples = (int)t->samples;
         uint32_t lw = t->w >> r.baseMipLevel ? t->w >> r.baseMipLevel : 1, lh = t->h >> r.baseMipLevel ? t->h >> r.baseMipLevel : 1;
@@ -1331,12 +1377,20 @@ static int rp_begin(VkCommandBuffer c) {
             // empty slots over its 4x depth, and rasterized at 1 sample into it the pre-pass depth came out wrong in tile-shaped areas, where the material pass then failed its
             // less-or-equal test and the target's clear colour showed (flat grey walls and armour)
             sa = da; vkr_tex_gpu_write(dt); have = 1; if (!have_c) samples = (int)dt->samples;
+            adt = dt; dmip = r.baseMipLevel; dlay = r.baseArrayLayer;
             uint32_t lw = dt->w >> r.baseMipLevel ? dt->w >> r.baseMipLevel : 1, lh = dt->h >> r.baseMipLevel ? dt->h >> r.baseMipLevel : 1;
             if (lw < w) w = lw; if (lh < h) h = lh;
         }
     }
+    if (have && g_pcn) {   // pending clears of exactly these attachments become their load operation; the others are recorded before the pass begins
+        for (int i = 0; i < nc; i++) { VkClearValue v; if (at[i] && pc_take(at[i], amip[i], alay[i], 1, w, h, &v)) { ca[i].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR; ca[i].clearValue = v; } }
+        if (adt) { VkClearValue v; VkImageAspectFlags a = pc_take(adt, dmip, dlay, 1, w, h, &v);
+            if (a & VK_IMAGE_ASPECT_DEPTH_BIT) { da.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR; da.clearValue = v; }
+            if (a & VK_IMAGE_ASPECT_STENCIL_BIT) { sa.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR; sa.clearValue = v; } }
+    }
     pthread_mutex_unlock(&g_tmu);
     if (!have) return 0;
+    pc_flush(c);
     VkRenderingInfo ri = {.sType = VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea = {{0, 0}, {w, h}}, .layerCount = layers, .colorAttachmentCount = (uint32_t)nc, .pColorAttachments = ca,
         .pDepthAttachment = has_d ? &da : NULL, .pStencilAttachment = has_s ? &sa : NULL};
     vkCmdBeginRendering(c, &ri);
@@ -1379,7 +1433,7 @@ static void op_clear_color(VkCommandBuffer c, const p_clear_color *p) {
             && scissored(t->w >> r.baseMipLevel ? t->w >> r.baseMipLevel : 1, t->h >> r.baseMipLevel ? t->h >> r.baseMipLevel : 1, &rc)
             && clear_in_pass(c, VK_IMAGE_ASPECT_COLOR_BIT, (uint32_t)p->index, &v, rc)) return;
     }
-    rp_end(c);
+    if (pc_on()) rp_end_keep(c); else rp_end(c);
     if (p->index < 0 || p->index >= g_rt_n || !g_rt[p->index]) return;
     pthread_mutex_lock(&g_tmu);
     vtex *t = tex_get(g_rt[p->index]);
@@ -1392,7 +1446,8 @@ static void op_clear_color(VkCommandBuffer c, const p_clear_color *p) {
                                 p->rgba[0], p->rgba[1], p->rgba[2], p->rgba[3], p->mask, hs ? "on" : "off", sc[0], sc[1], sc[2], sc[3], t->w, t->h); }
         VkClearColorValue v; memcpy(v.float32, p->rgba, sizeof v.float32);   // a float clear; integer targets take the same bits (open: NVN's integer clears)
         VkImageSubresourceRange r = view_range(t, &g_rt_view[p->index], g_rt_has_view[p->index], VK_IMAGE_ASPECT_COLOR_BIT);
-        vkCmdClearColorImage(c, t->img, VK_IMAGE_LAYOUT_GENERAL, &v, 1, &r); full_barrier(c); g_clears++;
+        if (pc_on()) { VkClearValue cv; cv.color = v; pc_add(c, t, r, cv, VK_IMAGE_ASPECT_COLOR_BIT); }
+        else { vkCmdClearColorImage(c, t->img, VK_IMAGE_LAYOUT_GENERAL, &v, 1, &r); full_barrier(c); g_clears++; }
     }
     pthread_mutex_unlock(&g_tmu);
 }
@@ -1410,7 +1465,7 @@ static void op_clear_ds(VkCommandBuffer c, const p_clear_ds *p) {
             && scissored(t->w >> r.baseMipLevel ? t->w >> r.baseMipLevel : 1, t->h >> r.baseMipLevel ? t->h >> r.baseMipLevel : 1, &rc)
             && clear_in_pass(c, asp, 0, &v, rc)) return;
     }
-    rp_end(c);
+    if (pc_on()) rp_end_keep(c); else rp_end(c);
     pthread_mutex_lock(&g_tmu);
     vtex *t = tex_get(g_rt_depth);
     if (g_passlog) LOG("[pass] clear depth %g (mask %d) stencil %d (mask %#x) serial %llu%s", p->depth, p->depth_mask, p->stencil, p->stencil_mask, t ? (unsigned long long)t->serial : 0ull, t ? "" : ": no image");
@@ -1423,7 +1478,8 @@ static void op_clear_ds(VkCommandBuffer c, const p_clear_ds *p) {
             tex_ready(c, t);
             VkClearDepthStencilValue v = {p->depth < 0 ? 0 : p->depth > 1 ? 1 : p->depth, (uint32_t)p->stencil};
             VkImageSubresourceRange r = view_range(t, &g_rt_dview, g_rt_has_dview, asp);
-            vkCmdClearDepthStencilImage(c, t->img, VK_IMAGE_LAYOUT_GENERAL, &v, 1, &r); full_barrier(c); g_clears++;
+            if (pc_on()) { VkClearValue cv = {.depthStencil = v}; pc_add(c, t, r, cv, asp); }
+            else { vkCmdClearDepthStencilImage(c, t->img, VK_IMAGE_LAYOUT_GENERAL, &v, 1, &r); full_barrier(c); g_clears++; }
         }
     }
     pthread_mutex_unlock(&g_tmu);
