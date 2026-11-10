@@ -13,6 +13,7 @@
 #include "vk_dev.h"
 #include "vk_push.h"
 #include "vk_fmt.h"
+#include "vk_linear_set.h"
 #include "vk_window.h"
 #include "vk_draw.h"
 #include "vk_mem.h"
@@ -789,6 +790,7 @@ static void stage_reap(void) {   // under g_tmu
 
 // ---- descriptor pools: texture and sampler IDs (mtl_reg_tex / mtl_reg_samp) ----
 typedef struct { int ok, has_v; uint64_t registered_at; tex_t t; view_t v; } treg_t;
+static vkr_lin_set g_lin;   // under g_rmu: the LINEAR textures registered (vk_linear_set.h), for vkr_cpu_written_refresh
 static treg_t *g_treg; static int g_ntreg; static samp_par *g_sreg; static uint8_t *g_sreg_ok; static int g_nsreg;
 static int *g_tdirty, g_ntdirty, g_ctdirty, *g_sdirty, g_nsdirty, g_csdirty;
 static uint8_t g_tdflag[VKR_BINDLESS_TEXTURES], g_sdflag[VKR_BINDLESS_SAMPLERS];
@@ -813,6 +815,7 @@ void mtl_reg_tex(int id, const tex_t *t, const view_t *v) {
     pthread_mutex_lock(&g_rmu);
     if (id >= g_ntreg) { int n = id + 1024; g_treg = realloc(g_treg, n * sizeof *g_treg); memset(g_treg + g_ntreg, 0, (n - g_ntreg) * sizeof *g_treg); g_ntreg = n; }
     treg_t *r = &g_treg[id]; r->ok = t != NULL; r->registered_at = atomic_load(&g_subs); if (t) r->t = *t; r->has_v = v != NULL; if (v) r->v = *v;
+    if (t && t->mem && (t->d.flags & NVN_TEXTURE_FLAGS_LINEAR) && !vkr_lin_note(&g_lin, id, t->serial)) LOG("[RED] vulkan replay: no memory to track LINEAR texture %llu", (unsigned long long)t->serial);
     reg_dirty(id, VKR_BINDLESS_TEXTURES, &g_tdirty, &g_ntdirty, &g_ctdirty, g_tdflag, "texture");
     pthread_mutex_unlock(&g_rmu);
 }
@@ -883,20 +886,25 @@ void mtl_tex_cpu_written(const tex_t *t) {   // on a guest thread
     if (i < g_cwn) g_cw[i] = *t;
     pthread_mutex_unlock(&g_cwmu);
 }
+static int lin_live(void *ctx, int id, uint64_t serial) {   // under g_rmu
+    (void)ctx; return id > 0 && id < g_ntreg && g_treg[id].ok && g_treg[id].t.serial == serial && g_treg[id].t.mem && (g_treg[id].t.d.flags & NVN_TEXTURE_FLAGS_LINEAR);
+}
 void vkr_cpu_written_refresh(void) {   // on the replay thread, the submission's command buffer open
-    enum { LIN = 64 };
-    tex_t *w = NULL; size_t nw = 0; tex_t lin[LIN]; int nl = 0;
+    static tex_t *lin; static size_t lcap; size_t nl = 0;
+    tex_t *w = NULL; size_t nw = 0;
     pthread_mutex_lock(&g_cwmu); if (g_cwn) { w = malloc(g_cwn * sizeof *w); if (w) { memcpy(w, g_cw, g_cwn * sizeof *w); nw = g_cwn; g_cwn = 0; } } pthread_mutex_unlock(&g_cwmu);
     static uint64_t clock_seen; uint64_t now = nvn_dirty_now();
     if (now != clock_seen) { clock_seen = now;
         pthread_mutex_lock(&g_rmu);
-        for (int id = 1; id < g_ntreg && nl < LIN; id++) if (g_treg[id].ok && g_treg[id].t.mem && (g_treg[id].t.d.flags & NVN_TEXTURE_FLAGS_LINEAR)) lin[nl++] = g_treg[id].t;
+        vkr_lin_prune(&g_lin, lin_live, NULL);
+        if (g_lin.n > lcap) { tex_t *q = realloc(lin, g_lin.n * sizeof *q); if (q) { lin = q; lcap = g_lin.n; } }
+        for (size_t i = 0; i < g_lin.n && nl < lcap; i++) lin[nl++] = g_treg[g_lin.e[i].id].t;
         pthread_mutex_unlock(&g_rmu); }
     if (!nw && !nl) return;
     uint64_t before = g_cw_refreshed + g_cw_linear;
     pthread_mutex_lock(&g_tmu);
     for (size_t i = 0; i < nw; i++) { vtex *t = tex_find(w[i].serial); if (t && !t->gpu_owned && t->uploaded) { t->clean_at = 0; upload(t, &w[i]); g_cw_refreshed++; } }
-    for (int i = 0; i < nl; i++) { vtex *t = tex_find(lin[i].serial);
+    for (size_t i = 0; i < nl; i++) { vtex *t = tex_find(lin[i].serial);
         if (t && !t->gpu_owned && t->uploaded) { uint64_t st = t->stamp; tex_sampled(&lin[i]); if (t->stamp != st) g_cw_linear++; } }
     pthread_mutex_unlock(&g_tmu);
     free(w);
