@@ -1276,7 +1276,7 @@ static void rp_end_keep_at(VkCommandBuffer c, int line) {   // the pass ends and
         cs_gpu_meta *m = &g_cs_meta[g_cb_i][g_rp_tok]; m->draws = g_rp_draws; m->mesh = g_rp_mesh; m->indirect = (uint64_t)line;
         vkCmdWriteTimestamp(c, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, g_cs_qp, cs_query(g_cb_i, g_rp_tok) + 1);
     }
-    g_rp_tok = -1;
+    g_rp_tok = -1; vkx_mesh_prebridge_reset();
     final_remember(); g_rp_on = 0; g_rp_drew = 0; ubd_land(c); full_barrier(c);
 }
 // ---- whole-attachment clears held for the next pass's load operation ----
@@ -1382,6 +1382,43 @@ static uint32_t rp_drop_set(void) {
         }
     }
     return drop;
+}
+// Look ahead from the op that is about to begin a pass: the indirect mesh draws met before the first operation that could end the pass or write GPU memory
+// get their records copied now, outside it (vkx_mesh_prebridge), so they draw inside it instead of each ending it (vk_draw.c). Follows jumps and calls like
+// the replay; stops at anything that is not a draw or a state change. DM_VK_MESH_PREBRIDGE=0 turns it off
+static void mesh_prebridge_ahead(VkCommandBuffer c, const uint8_t *p, const uint8_t *const *ret, int nret) {
+    static int on = -1; if (on < 0) { const char *e = getenv("DM_VK_MESH_PREBRIDGE"); on = !(e && !strcmp(e, "0")); }
+    if (!on || !vkd_mesh_active()) return;
+    const uint8_t *st[16]; int ns = nret; memcpy(st, ret, sizeof *st * (size_t)nret);
+    int n = 0;
+    for (int guard = 0; p && guard < 4096; guard++) {
+        op_hdr h; memcpy(&h, p, sizeof h); const void *a = p + 8;
+        switch (h.op) {
+        case OP_END: if (ns) { p = st[--ns]; continue; } goto done;
+        case OP_JUMP: memcpy(&p, a, 8); continue;
+        case OP_CALL: { const uint8_t *t; memcpy(&t, a, 8); if (ns == 16) goto done; st[ns++] = p + h.size; p = t; continue; }
+        case OP_DRAW: case OP_DRAW_IDX: {
+            int32_t prim; memcpy(&prim, a, 4);
+            if (prim != DM_PRIM_MESH_TASKS) break;
+            if (h.op != OP_DRAW) goto done;
+            uint64_t ind = 0; if (h.size >= 8 + offsetof(p_draw, ind) + 8) memcpy(&ind, (const uint8_t *)a + offsetof(p_draw, ind), 8);
+            if (!ind) break;
+            if (!vkx_mesh_prebridge(c, ind)) goto done;
+            n++;
+            break;
+        }
+        case OP_UPDATE_UB: if (!ub_defer_on()) goto done; break;   // held until the pass ends, as the draws see it
+        case OP_VIEWPORTS: case OP_SCISSOR: case OP_DEPTH_RANGE: case OP_BIND_PROGRAM: case OP_BIND_STATE: case OP_BIND_VATTR: case OP_BIND_VSTREAM:
+        case OP_BIND_VBUF: case OP_BIND_UBO: case OP_BIND_SSBO: case OP_BIND_TEX: case OP_BIND_SAMP: case OP_STENCIL: case OP_POLY_OFFSET:
+        case OP_SET_TEX_POOL: case OP_SET_SAMP_POOL: case OP_BLEND_COLOR: case OP_BIND_IMG: case OP_DEPTH_CLAMP: case OP_RAST_DISCARD:
+        case OP_VP_SWIZZLE: case OP_BIND_TEX1: case OP_PRIM_RESTART: case OP_BIND_UBO_SMALL: case OP_BIND_VBUF1: case OP_ALPHA_REF: case OP_PUSH_CONST:
+            break;
+        default: goto done;
+        }
+        p += h.size;
+    }
+done:
+    if (n) vkx_mesh_prebridge_barrier(c);
 }
 static int rp_begin(VkCommandBuffer c) {
     if (g_rp_on) return 1;
@@ -1729,7 +1766,7 @@ void mtl_exec(const uint8_t *handle) {
                 // two G-buffer passes into 29 (51 tile stores and reloads a frame; biosed-agent's audit of a Kokiri frame). DM_VK_MESH_KEEP_PASS=0
                 // ends it for every mesh draw as before
                 static int keep_pass = -1; if (keep_pass < 0) { const char *e = getenv("DM_VK_MESH_KEEP_PASS"); keep_pass = !(e && !strcmp(e, "0")); }
-                if (ind || !keep_pass) rp_end_keep(c);   // the bridge copies 12 bytes between buffers: pending clears stay for the pass that follows
+                if ((ind && !vkx_mesh_prebridged(ind)) || !keep_pass) rp_end_keep(c);   // the bridge copies 12 bytes between buffers unless done before the pass: pending clears stay
                 // A long render pass can consume most of this command
                 // buffer's descriptor pools before its first mesh draw.  The
                 // mesh bridge has just provided a legal split point; submit
@@ -1739,6 +1776,7 @@ void mtl_exec(const uint8_t *handle) {
                     vkr_flush(); c = g_cb[g_cb_i];
                     if (g_prof > 0) g_opns[64] += mono_ns() - ft;
                 }
+                if (!g_rp_on) mesh_prebridge_ahead(c, p, ret, nret);
                 vkx_mesh_submit submit;
                 if (!vkx_mesh_bridge(c, &md, &submit)) {
                     vkx_mesh_abort();
@@ -1795,6 +1833,7 @@ void mtl_exec(const uint8_t *handle) {
             if (g_rc_skip) break;
             if (g_passlog && g_passstop && g_passes - g_pass0 > (uint64_t)g_passstop) break;   // DM_VK_PASSSTOP: the traced frame's later passes draw nothing
             if (g_rp_on && rp_drop_set() != g_rp_drop) rp_end(c);   // another set of duplicate slots to leave out (rp_drop_set)
+            if (!g_rp_on) mesh_prebridge_ahead(c, p, ret, nret);
             if (rp_begin(c) && vkx_draw(c, h.op, a, h.size, g_rp_ncolor, g_rp_w, g_rp_h, g_rp_samples)) { g_rp_drew = 1; g_rp_draws++; } g_flush_draws++; break;
         case OP_BARRIER: rp_end_keep(c); full_barrier(c); break;   // orders work, reads nothing: pending clears stay
         case OP_COPY_T2T: op_copy_t2t(c, a); break;

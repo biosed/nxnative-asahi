@@ -1443,6 +1443,44 @@ static int mesh_bridge_failure(const char *reason, const p_draw *d)
     return 0;
 }
 
+// ---- indirect mesh records prepared before their pass ----
+// An indirect mesh draw's NVN record {count, first} reaches the Vulkan record {count, 1, 1} and the first word through transfer copies, which cannot be recorded
+// inside dynamic rendering. Ending the pass for each one split Ocarina of Time's 683x384 G-buffer into about 20 extra passes a frame (10 ms of tile stores and
+// reloads on Honeykrisp G13, DM_VK_PASS_GPU). The replay looks ahead when a pass is about to begin and copies the records of its indirect mesh draws first: up to
+// such a draw only draws and state changes run, so nothing on the GPU writes those guest words in between. A draw finds its copy by guest address, in order
+#define PB_MAX 128
+static struct { uint64_t ind; VkBuffer b; VkDeviceSize base; int used; } g_pb[PB_MAX];
+static int g_npb, g_npb_fenced, g_pb_slot = -1; static uint64_t g_pb_gen;
+static int pb_valid(void) { return g_npb && g_pb_slot == g_pool_slot && g_pb_gen == g_arena_gen[g_pool_slot]; }
+void vkx_mesh_prebridge_reset(void) { g_npb = g_npb_fenced = 0; }
+int vkx_mesh_prebridge(VkCommandBuffer c, uint64_t ind) {
+    if (g_pool_slot < 0 || !ind || ind > UINT64_MAX - 8) return 0;
+    if (g_npb && !pb_valid()) vkx_mesh_prebridge_reset();
+    if (g_npb >= PB_MAX) return 0;
+    VkBuffer source, scratch; VkDeviceSize source_off, base; VkDeviceAddress gpu; uint8_t *host;
+    if (!vkm_lookup((const void *)(uintptr_t)ind, 8, &source, &source_off, &gpu) || source_off > UINT64_MAX - 8) return 0;
+    if (!arena_get(512, &scratch, &base, &host)) return 0;
+    const uint32_t yz[2] = {1, 1}; memcpy(host + 256 + 4, yz, sizeof yz);   // Y and Z by the host (visible at submission, as a direct draw's record); X is copied
+    VkBufferCopy count = {source_off + 0, base + 256, 4}, first = {source_off + 4, base, 4};   // vkx_mesh_draw_indirect: count at +0, first at +4
+    vkCmdCopyBuffer(c, source, scratch, 1, &count); vkCmdCopyBuffer(c, source, scratch, 1, &first);
+    g_pb[g_npb++] = (typeof(g_pb[0])){ind, scratch, base, 0}; g_pb_slot = g_pool_slot; g_pb_gen = g_arena_gen[g_pool_slot];
+    return 1;
+}
+void vkx_mesh_prebridge_barrier(VkCommandBuffer c) {
+    if (g_npb_fenced == g_npb) return;
+    g_npb_fenced = g_npb;
+    VkMemoryBarrier mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT};
+    vkCmdPipelineBarrier(c, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_TASK_SHADER_BIT_EXT |
+        VK_PIPELINE_STAGE_MESH_SHADER_BIT_EXT, 0, 1, &mb, 0, NULL, 0, NULL);
+}
+static int pb_find(uint64_t ind) {
+    if (!pb_valid()) return -1;
+    for (int i = 0; i < g_npb_fenced; i++) if (!g_pb[i].used && g_pb[i].ind == ind) return i;
+    return -1;
+}
+int vkx_mesh_prebridged(uint64_t ind) { return pb_find(ind) >= 0; }
+
 int vkx_mesh_bridge(VkCommandBuffer c, const p_draw *d, vkx_mesh_submit *out) {
     const vkx_mesh_caps *caps = vkd_mesh_active();
     // A prior attempt may have allocated scratch and then failed before issue.
@@ -1478,9 +1516,11 @@ int vkx_mesh_bridge(VkCommandBuffer c, const p_draw *d, vkx_mesh_submit *out) {
             return mesh_bridge_failure("direct-meta", d);
     }
 
-    VkBuffer scratch; VkDeviceSize base; uint8_t *host;
+    VkBuffer scratch; VkDeviceSize base; uint8_t *host = NULL;
     size_t bytes = d->ind ? 512 : 256;
-    if (!arena_get(bytes, &scratch, &base, &host)) return mesh_bridge_failure("arena", d);
+    int pb = d->ind ? pb_find(d->ind) : -1;   // copied before the pass began (vkx_mesh_prebridge)
+    if (pb >= 0) { scratch = g_pb[pb].b; base = g_pb[pb].base; g_pb[pb].used = 1; }
+    else if (!arena_get(bytes, &scratch, &base, &host)) return mesh_bridge_failure("arena", d);
     VkDeviceSize first_off = base, record_off = base + 256;
     vkx_mesh_indirect_layout layout = {0};
     VkBuffer source = VK_NULL_HANDLE; VkDeviceSize source_off = 0; VkDeviceAddress source_gpu;
@@ -1504,7 +1544,7 @@ int vkx_mesh_bridge(VkCommandBuffer c, const p_draw *d, vkx_mesh_submit *out) {
     g_mesh_first_desc[owner] = (VkDescriptorBufferInfo){scratch, first_off, 256};
     g_mesh_first_valid[owner] = 1;
 
-    if (d->ind) {
+    if (d->ind && pb < 0) {
         // Initialize only Y/Z in the transfer domain; X's sole writer is the
         // count copy below.  The writes are disjoint, so no dependency is
         // needed between them and the final barrier covers the whole record.
