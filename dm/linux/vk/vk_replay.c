@@ -1223,7 +1223,10 @@ static void ubd_land(VkCommandBuffer c) {   // the deferred updates, in order, o
     }
     g_nubd = 0;
 }
-static void rp_end_keep(VkCommandBuffer c) { if (!g_rp_on) return; vkCmdEndRendering(c); final_remember(); g_rp_on = 0; g_rp_drew = 0; ubd_land(c); full_barrier(c); }   // the pass ends; pending clears stay pending
+static void rp_end_keep(VkCommandBuffer c) {   // the pass ends and the deferred uniform updates land; pending clears stay pending
+    if (!g_rp_on) return;
+    vkCmdEndRendering(c); final_remember(); g_rp_on = 0; g_rp_drew = 0; ubd_land(c); full_barrier(c);
+}
 // ---- whole-attachment clears held for the next pass's load operation ----
 // NVN's ClearColor / ClearDepthStencil outside a scissor clear the whole target, and the game draws into it next. Recorded as vkCmdClear*Image the clear is
 // a pass of its own on a tiled GPU (a compute fill on Honeykrisp G13, behind a barrier), and the draw pass that follows then loads the image it just wrote
@@ -1671,7 +1674,7 @@ void mtl_exec(const uint8_t *handle) {
                 // two G-buffer passes into 29 (51 tile stores and reloads a frame; biosed-agent's audit of a Kokiri frame). DM_VK_MESH_KEEP_PASS=0
                 // ends it for every mesh draw as before
                 static int keep_pass = -1; if (keep_pass < 0) { const char *e = getenv("DM_VK_MESH_KEEP_PASS"); keep_pass = !(e && !strcmp(e, "0")); }
-                if (ind || !keep_pass) rp_end(c);
+                if (ind || !keep_pass) rp_end_keep(c);   // the bridge copies 12 bytes between buffers: pending clears stay for the pass that follows
                 // A long render pass can consume most of this command
                 // buffer's descriptor pools before its first mesh draw.  The
                 // mesh bridge has just provided a legal split point; submit
@@ -1738,7 +1741,7 @@ void mtl_exec(const uint8_t *handle) {
             if (g_passlog && g_passstop && g_passes - g_pass0 > (uint64_t)g_passstop) break;   // DM_VK_PASSSTOP: the traced frame's later passes draw nothing
             if (g_rp_on && rp_drop_set() != g_rp_drop) rp_end(c);   // another set of duplicate slots to leave out (rp_drop_set)
             if (rp_begin(c) && vkx_draw(c, h.op, a, h.size, g_rp_ncolor, g_rp_w, g_rp_h, g_rp_samples)) g_rp_drew = 1; g_flush_draws++; break;
-        case OP_BARRIER: rp_end(c); full_barrier(c); break;
+        case OP_BARRIER: rp_end_keep(c); full_barrier(c); break;   // orders work, reads nothing: pending clears stay
         case OP_COPY_T2T: op_copy_t2t(c, a); break;
         case OP_COPY_B2T: op_copy_bt(c, a, 1); break;
         case OP_COPY_T2B: op_copy_bt(c, a, 0); break;
@@ -1750,11 +1753,13 @@ void mtl_exec(const uint8_t *handle) {
             VkBuffer b; VkDeviceSize off; VkDeviceAddress g;
             if (n && n <= 65536 && !(n & 3) && !(dst & 3) && vkm_lookup((const void *)(uintptr_t)dst, n, &b, &off, &g)) {
                 ulog_add(dst, n, (const uint8_t *)a + 16);
-                if (g_rp_on && ub_defer_on()) {   // inside a pass: deferred to its end, the draws until then read shadows (vkr_ub_shadow)
+                // Inside a pass: deferred to its end, the draws until then read shadows (vkr_ub_shadow). Not before the pass has begun: deferring Ocarina of
+                // Time's 97 pre-pass updates a frame as well was measured slower on Honeykrisp G13 (frame 58.4 -> 60.3 ms, GPU 50.4 -> 52.2 ms)
+                if (g_rp_on && ub_defer_on()) {
                     if (g_nubd == g_cubd) { size_t nc = g_cubd ? 2 * g_cubd : 64; ubd_t *nd = realloc(g_ubd, nc * sizeof *nd); if (nd) { g_ubd = nd; g_cubd = nc; } }
                     if (g_nubd < g_cubd) { g_ubd[g_nubd++] = (ubd_t){dst, n, (const uint8_t *)a + 16}; g_ub_deferred++; g_ub_updates++; break; }
                 }
-                rp_end(c); vkCmdUpdateBuffer(c, b, off, n, (const uint8_t *)a + 16); full_barrier(c); g_ub_updates++;
+                rp_end_keep(c); vkCmdUpdateBuffer(c, b, off, n, (const uint8_t *)a + 16); full_barrier(c); g_ub_updates++;   // a buffer write reads no image: pending clears stay
                 if (g_passlog) { const float *f = (const float *)((const uint8_t *)a + 16); LOG("[pass] uniform update %#llx + %llu bytes; first %g %g %g %g", (unsigned long long)dst, (unsigned long long)n, n >= 16 ? f[0] : 0.f, n >= 16 ? f[1] : 0.f, n >= 16 ? f[2] : 0.f, n >= 16 ? f[3] : 0.f);
                     static unsigned seq; const char *dd = getenv("DM_VK_SBUFDUMP");   // the update's bytes too, in order: <dir>/u<sequence>_<address>.bin
                     if (dd) { char path[600]; snprintf(path, sizeof path, "%s/u%05u_%llx.bin", dd, seq++, (unsigned long long)dst); FILE *o = fopen(path, "wb"); if (o) { fwrite(f, 1, n, o); fclose(o); } } }
@@ -1765,7 +1770,7 @@ void mtl_exec(const uint8_t *handle) {
             uint64_t src, dst, n; memcpy(&src, a, 8); memcpy(&dst, (const uint8_t *)a + 8, 8); memcpy(&n, (const uint8_t *)a + 16, 8);
             VkBuffer sb, db; VkDeviceSize so, dof; VkDeviceAddress g;
             if (n && vkm_lookup((const void *)(uintptr_t)src, n, &sb, &so, &g) && vkm_lookup((const void *)(uintptr_t)dst, n, &db, &dof, &g)) {
-                rp_end(c); VkBufferCopy bc = {so, dof, n}; vkCmdCopyBuffer(c, sb, db, 1, &bc); full_barrier(c);
+                rp_end_keep(c); VkBufferCopy bc = {so, dof, n}; vkCmdCopyBuffer(c, sb, db, 1, &bc); full_barrier(c);
             } else { static int w; if (!w++) LOG("[RED] vulkan replay: buffer copy of %llu bytes %#llx -> %#llx not made (not in GPU-visible memory)", (unsigned long long)n, (unsigned long long)src, (unsigned long long)dst); }
             break;
         }
@@ -1795,7 +1800,7 @@ void mtl_exec(const uint8_t *handle) {
         case OP_CLEAR_BUF: {   // ClearBuffer: the range filled with a 32-bit value on the GPU
             const p_clear_buf *cb = a; VkBuffer db; VkDeviceSize dof; VkDeviceAddress g;
             if (cb->size && !(cb->size & 3) && vkm_lookup((const void *)(uintptr_t)cb->addr, cb->size, &db, &dof, &g)) {
-                rp_end(c); vkCmdFillBuffer(c, db, dof, cb->size, cb->value); full_barrier(c);
+                rp_end_keep(c); vkCmdFillBuffer(c, db, dof, cb->size, cb->value); full_barrier(c);
             } else { static int w; if (!w++) LOG("[RED] vulkan replay: buffer clear of %llu bytes at %#llx not made (not 4-aligned or not in GPU-visible memory)", (unsigned long long)cb->size, (unsigned long long)cb->addr); }
             break;
         }
