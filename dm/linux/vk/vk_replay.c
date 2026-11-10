@@ -1420,6 +1420,19 @@ static void mesh_prebridge_ahead(VkCommandBuffer c, const uint8_t *p, const uint
 done:
     if (n) vkx_mesh_prebridge_barrier(c);
 }
+// DM_VK_PASS_GPU: which NVN barrier bits the game records, and whether each came inside a pass that had drawn, logged per 1024 barriers. A barrier ends the pass
+// today; one that only orders work the pass has not done could leave it open
+static void barrier_census(int32_t bits) {
+    static uint64_t n; static struct { int32_t bits; uint32_t open_drawn, open_empty, closed; } h[16]; static int nh;
+    int i = 0; while (i < nh && h[i].bits != bits) i++;
+    if (i == nh && nh < 16) h[nh++].bits = bits;
+    if (i < nh) { if (!g_rp_on) h[i].closed++; else if (g_rp_draws) h[i].open_drawn++; else h[i].open_empty++; }
+    if (++n % 1024) return;
+    char line[1024]; int o = 0;
+    for (int k = 0; k < nh && o < (int)sizeof line - 64; k++)
+        o += snprintf(line + o, sizeof line - o, " bits %#x: in a pass after draws %u, in a pass before any %u, outside %u;", h[k].bits, h[k].open_drawn, h[k].open_empty, h[k].closed);
+    LOG("vulkan replay: barrier census after %llu:%s", (unsigned long long)n, line);
+}
 static int rp_begin(VkCommandBuffer c) {
     if (g_rp_on) return 1;
     g_rp_drop = rp_drop_set();
@@ -1835,7 +1848,7 @@ void mtl_exec(const uint8_t *handle) {
             if (g_rp_on && rp_drop_set() != g_rp_drop) rp_end(c);   // another set of duplicate slots to leave out (rp_drop_set)
             if (!g_rp_on) mesh_prebridge_ahead(c, p, ret, nret);
             if (rp_begin(c) && vkx_draw(c, h.op, a, h.size, g_rp_ncolor, g_rp_w, g_rp_h, g_rp_samples)) { g_rp_drew = 1; g_rp_draws++; } g_flush_draws++; break;
-        case OP_BARRIER: rp_end_keep(c); full_barrier(c); break;   // orders work, reads nothing: pending clears stay
+        case OP_BARRIER: if (g_pass_gpu) barrier_census(*(const int32_t *)a); rp_end_keep(c); full_barrier(c); break;   // orders work, reads nothing: pending clears stay
         case OP_COPY_T2T: op_copy_t2t(c, a); break;
         case OP_COPY_B2T: op_copy_bt(c, a, 1); break;
         case OP_COPY_T2B: op_copy_bt(c, a, 0); break;
