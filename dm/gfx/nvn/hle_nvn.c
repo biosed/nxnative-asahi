@@ -1684,7 +1684,7 @@ static void queue_summary(uint64_t frame) {
     uint64_t v[NVN_QUEUE_STAT_COUNT]; nvn_queue_stats(v);
     double nf = frame > prev_frame ? (double)(frame - prev_frame) : 1.0;
 #define QD(k) ((double)(v[k] - prev[k]) / nf)
-    LOG("[nvn] logical queues up to frame %llu (%s): per frame command nodes %.1f / physical submits %.1f, event %.1f sync %.1f fence %.1f present %.1f; wait splits cross-queue %.1f / local %.1f / self-event coalesced %.1f; releases exact-queued %.1f / completion %.1f / CPU %.1f; queue switches %.1f; parked %.3f ms",
+    LOG("[nvn] logical queues up to frame %llu (%s): per frame command nodes %.1f / scheduler commits %.1f, event %.1f sync %.1f fence %.1f present %.1f; wait splits cross-queue %.1f / local %.1f / self-event coalesced %.1f; releases exact-queued %.1f / completion %.1f / CPU %.1f; queue switches %.1f; parked %.3f ms",
         (unsigned long long)frame, nvn_queue_scheduler_enabled() ? "scheduler" : "bypass",
         QD(NVN_QUEUE_STAT_COMMAND_NODES), QD(NVN_QUEUE_STAT_PHYSICAL_SUBMITS),
         QD(NVN_QUEUE_STAT_EVENT_NODES), QD(NVN_QUEUE_STAT_SYNC_NODES),

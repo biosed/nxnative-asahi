@@ -223,87 +223,195 @@ static void nq_restore_rt(const nq_queue *q) {
     mtl_exec((const uint8_t *)&records);
 }
 
+// A ready window shares one scheduler commit and final physical fence. Replay
+// may still flush internally for a hard command-buffer limit. The window never
+// crosses a frame, fence, present, externally released wait, or a point where
+// no node is immediately ready. An exact WRITE selected earlier in the window
+// can satisfy a later event wait; a full barrier occupies that wait's exact
+// replay position. Empty job receipts stay unpublished until the common fence.
+typedef struct nq_batch_item { nq_queue *q; nq_node *n; unsigned barrier; } nq_batch_item;
+typedef struct nq_batch_signal { nq_queue *q; nq_signal signal; } nq_batch_signal;
+typedef struct nq_batch {
+    nq_batch_item *item; size_t nitem, item_capacity;
+    nq_batch_signal *signal; size_t nsignal, signal_capacity;
+    uint64_t *handle; size_t handle_capacity;
+    uint64_t frame;
+} nq_batch;
+static void nq_batch_item_add(nq_batch *b, nq_batch_item item) {
+    if (b->nitem == b->item_capacity) {
+        size_t capacity = b->item_capacity ? 2 * b->item_capacity : 32;
+        nq_batch_item *p = realloc(b->item, capacity * sizeof *p); if (!p) die("queue batch allocation failed");
+        b->item = p; b->item_capacity = capacity;
+    }
+    b->item[b->nitem++] = item;
+}
+static void nq_batch_command(nq_batch *b, nq_queue *q, nq_job *j, nq_node *n) {
+    if (!b->nitem) b->frame = j->frame;
+    nq_batch_item_add(b, (nq_batch_item){q, n, 0});
+    for (unsigned i = 0; i < n->signal_count; i++) {
+        if (b->nsignal == b->signal_capacity) {
+            size_t capacity = b->signal_capacity ? 2 * b->signal_capacity : 32;
+            nq_batch_signal *p = realloc(b->signal, capacity * sizeof *p); if (!p) die("queue batch signal allocation failed");
+            b->signal = p; b->signal_capacity = capacity;
+        }
+        b->signal[b->nsignal++] = (nq_batch_signal){q, n->signals[i]};
+    }
+}
+static nq_batch_signal *nq_batch_signal_of(nq_batch *b, volatile uint32_t *event) {
+    for (size_t i = b->nsignal; i-- > 0;) if (b->signal[i].signal.event == event) return &b->signal[i];
+    return NULL;
+}
+static void nq_batch_barrier(nq_batch *b, nq_queue *q) {
+    nq_batch_item_add(b, (nq_batch_item){q, NULL, 1});
+}
+static void nq_rotate(nq_queue *q) {
+    if (!q->next) return;
+    nq_queue **link = &nq_queues; while (*link != q) link = &(*link)->next; *link = q->next;
+    nq_queue *tail = nq_queues; while (tail->next) tail = tail->next; tail->next = q; q->next = NULL;
+}
+static void nq_node_free(nq_node *n) {
+    if (!n) return;
+    if (n->receipt) nq_put(n->receipt);
+    free(n->signals); free(n->bytes); free(n);
+}
+static const struct { op_hdr h; int32_t bits; uint32_t pad; op_hdr end; } nq_batch_barrier_records = {
+    {OP_BARRIER, 16}, NVN_BARRIER_BITS_LARGE, 0, {OP_END, 8}
+};
+
 static void *nq_worker(void *unused) {
     (void)unused; pthread_setname_np(pthread_self(), "NVN queue replay");
     pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
-    uint64_t frame = UINT64_MAX, active_commands = UINT64_MAX;
+    uint64_t frame = UINT64_MAX, active_commands = UINT64_MAX; nq_batch batch = {
+        .item = malloc(32 * sizeof(nq_batch_item)), .item_capacity = 32,
+        .signal = malloc(32 * sizeof(nq_batch_signal)), .signal_capacity = 32,
+        .handle = malloc(32 * sizeof(uint64_t)), .handle_capacity = 32,
+    };
+    if (!batch.item || !batch.signal || !batch.handle) die("queue batch allocation failed");
     for (;;) {
         pthread_mutex_lock(&nq_mu); nq_queue *q = NULL; nq_node *n = NULL; nq_job *j = NULL;
         for (;;) {
         scan_again:;
-            int mapped_event_wait = 0;
+            int mapped_event_wait = 0, batch_boundary = 0, batch_event = 0;
             for (q = nq_queues; q; q = q->next) {
                 j = q->first; if (!j) continue; n = j->first;
                 if (!n) {
+                    // Its receipt needs the common batch fence. Leave the job
+                    // linked until that fence exists, but keep gathering work
+                    // from other logical queues in the same ready window.
+                    if (batch.nitem) continue;
                     nq_publish(j->receipt, q->physical); q->first = j->next; if (!q->first) q->last = NULL; nq_put(j->receipt);
                     pthread_mutex_unlock(&nq_mu); pthread_mutex_lock(&g_sub_mu); nq_job_free(j); pthread_mutex_unlock(&g_sub_mu); pthread_mutex_lock(&nq_mu); goto scan_again;
                 }
                 if (n->kind == NQ_EVENT && n->event) {
+                    nq_batch_signal *bs = batch.nitem ? nq_batch_signal_of(&batch, n->event) : NULL;
+                    if (bs) {
+                        if (bs->signal.mode == 0 && nq_predicate(bs->signal.value, n->mode, n->value)) { batch_event = 1; break; }
+                        mapped_event_wait = 1; continue;
+                    }
                     uint64_t predecessor = nq_event_pending(n->event);
-                    if (!n->waiting) n->event_predecessor = predecessor;
+                    if (!n->waiting && !batch.nitem) n->event_predecessor = predecessor;
                     // A queued WRITE has an exact value. This continuation can be encoded
                     // behind it on the one physical queue without idling for completion.
                     nq_event_write *queued = predecessor > nq_completed ? nq_event_write_of(n->event) : NULL;
                     if (queued && queued->exact && nq_predicate(queued->value, n->mode, n->value)) {
+                        if (batch.nitem) { batch_boundary = 1; break; }
                         n->event = NULL; n->wait_fence = predecessor; nq_stat(NVN_QUEUE_STAT_EXACT_QUEUED_RELEASES); break;
                     }
                     if (predecessor > nq_completed || !nq_predicate(atomic_load_explicit((_Atomic uint32_t *)n->event, memory_order_acquire), n->mode, n->value)) {
                         n->waiting = 1; if (!n->parked_at) n->parked_at = now_ns(); mapped_event_wait = 1; continue;
                     }
+                    if (batch.nitem) { batch_boundary = 1; break; }
                     n->wait_fence = predecessor;
                 }
                 if (n->kind == NQ_SYNC && n->receipt && !n->receipt->published) {
                     if (!n->parked_at) n->parked_at = now_ns(); continue;
                 }
+                if (batch.nitem && (n->kind == NQ_SYNC || n->kind == NQ_FENCE || n->kind == NQ_PRESENT ||
+                                    (n->kind == NQ_COMMANDS && j->frame != batch.frame))) { batch_boundary = 1; break; }
                 // A sync not yet fenced when submitted is a snapshot of nothing to wait for.
                 break;
             }
-            if (q) break;
-            if (mapped_event_wait) { struct timespec tick = {0, 1000000}; pthread_cond_timedwait_relative_np(&nq_cv, &nq_mu, &tick); }
-            else pthread_cond_wait(&nq_cv, &nq_mu);
+            if (batch_boundary || (batch.nitem && !q)) break;
+            if (!q) {
+                if (mapped_event_wait) { struct timespec tick = {0, 1000000}; pthread_cond_timedwait_relative_np(&nq_cv, &nq_mu, &tick); }
+                else pthread_cond_wait(&nq_cv, &nq_mu);
+                goto scan_again;
+            }
+            j->first = n->next; if (!j->first) j->last = NULL;
+            if (n->parked_at)
+                atomic_fetch_add_explicit(&nq_stats[NVN_QUEUE_STAT_PARKED_NS], now_ns() - n->parked_at, memory_order_relaxed);
+            nq_rotate(q);
+            if (batch_event) {
+                nq_batch_signal *bs = nq_batch_signal_of(&batch, n->event);
+                nq_stat(bs && bs->q != q ? NVN_QUEUE_STAT_CROSS_QUEUE_WAITS : NVN_QUEUE_STAT_LOCAL_WAITS);
+                nq_stat(NVN_QUEUE_STAT_EXACT_QUEUED_RELEASES); nq_batch_barrier(&batch, q); nq_node_free(n);
+                goto scan_again;
+            }
+            if (n->kind == NQ_SYNC || n->kind == NQ_EVENT) {
+                uint64_t f = n->receipt ? n->receipt->fence : n->wait_fence;
+                nq_stat(f > q->physical ? NVN_QUEUE_STAT_CROSS_QUEUE_WAITS : NVN_QUEUE_STAT_LOCAL_WAITS);
+                if (f > q->physical) q->physical = f;
+                nq_node_free(n); goto scan_again;
+            }
+            if (n->kind == NQ_COMMANDS) {
+                nq_batch_command(&batch, q, j, n);
+                goto scan_again;
+            }
+            if (n->kind == NQ_FENCE) nq_publish(n->receipt, q->physical);
+            break;
         }
-        j->first = n->next; if (!j->first) j->last = NULL;
-        if (n->parked_at)
-            atomic_fetch_add_explicit(&nq_stats[NVN_QUEUE_STAT_PARKED_NS], now_ns() - n->parked_at, memory_order_relaxed);
-        // Round-robin ready queues prevent a continually fed producer starving another queue.
-        if (q->next) { nq_queue **link = &nq_queues; while (*link != q) link = &(*link)->next; *link = q->next; nq_queue *tail = nq_queues; while (tail->next) tail = tail->next; tail->next = q; q->next = NULL; }
-        if (n->kind == NQ_SYNC || n->kind == NQ_EVENT) {
-            uint64_t f = n->receipt ? n->receipt->fence : n->wait_fence;
-            nq_stat(f > q->physical ? NVN_QUEUE_STAT_CROSS_QUEUE_WAITS : NVN_QUEUE_STAT_LOCAL_WAITS);
-            if (f > q->physical) q->physical = f;
-        }
-        if (n->kind == NQ_FENCE) nq_publish(n->receipt, q->physical);
         pthread_mutex_unlock(&nq_mu);
 
         uint64_t fence = 0, present = 0;
-        if (n->kind == NQ_COMMANDS || n->kind == NQ_PRESENT) {
+        if (batch.nitem) {
+            dm_host_mutex_lock(&g_sub_mu);
+            dm_host_work++; mtl_prepare(); dm_host_work--;
+            gfx_enter(); nq_cost cost = nq_cost_begin();
+            if (frame != batch.frame) { frame = batch.frame; mtl_set_frame(frame); }
+            if (batch.nitem > batch.handle_capacity) {
+                uint64_t *p = realloc(batch.handle, batch.nitem * sizeof *p); if (!p) die("queue batch handles allocation failed");
+                batch.handle = p; batch.handle_capacity = batch.nitem;
+            }
+            for (size_t i = 0; i < batch.nitem; i++)
+                batch.handle[i] = batch.item[i].barrier ? (uintptr_t)&nq_batch_barrier_records : (uintptr_t)batch.item[i].n->bytes;
+            mtl_sub_begin(); nvn_ft_poll(); mtl_sub_index(batch.handle, (int)batch.nitem);
+            for (size_t i = 0; i < batch.nitem; i++) {
+                nq_batch_item *it = &batch.item[i];
+                uint64_t handle = batch.handle[i];
+                mtl_exec_rest(batch.handle + i + 1, (int)(batch.nitem - i - 1));
+                if (it->barrier) { mtl_exec((const uint8_t *)(uintptr_t)handle); continue; }
+                nvn_cap_submit(1, &handle);
+                mtl_queue_activate(it->q->serial); mtl_set_queue_origin_lower_left(it->q->origin);
+                if (active_commands != it->q->serial) {
+                    if (active_commands != UINT64_MAX) nq_stat(NVN_QUEUE_STAT_QUEUE_SWITCHES);
+                    nq_restore_rt(it->q); active_commands = it->q->serial;
+                }
+                mtl_exec(it->n->bytes); nq_persist(it->q, it->n);
+            }
+            mtl_exec_rest(NULL, 0);
+            fence = mtl_sub_commit(); nq_stat(NVN_QUEUE_STAT_PHYSICAL_SUBMITS);
+            nq_cost_end(cost); gfx_leave(); pthread_mutex_unlock(&g_sub_mu);
+        } else if (n && n->kind == NQ_PRESENT) {
             dm_host_mutex_lock(&g_sub_mu);
             dm_host_work++; mtl_prepare(); dm_host_work--;
             gfx_enter(); nq_cost cost = nq_cost_begin();
             if (frame != j->frame) { frame = j->frame; mtl_set_frame(frame); }
             mtl_queue_activate(q->serial); mtl_set_queue_origin_lower_left(q->origin);
-            if (n->kind == NQ_COMMANDS) {
-                uint64_t handle = (uintptr_t)n->bytes;
-                nvn_cap_submit(1, &handle);
-                mtl_sub_begin(); nvn_ft_poll(); mtl_sub_index(&handle, 1);
-                mtl_exec_rest(NULL, 0);
-                if (active_commands != q->serial) {
-                    if (active_commands != UINT64_MAX) nq_stat(NVN_QUEUE_STAT_QUEUE_SWITCHES);
-                    nq_restore_rt(q); active_commands = q->serial;
-                }
-                mtl_exec(n->bytes); fence = mtl_sub_commit(); nq_stat(NVN_QUEUE_STAT_PHYSICAL_SUBMITS);
-                nq_persist(q, n);
-            } else {
-                const tex_t *texture = (const tex_t *)n->texture->data;
-                nvn_cap_present(texture, n->crop); present = mtl_present(texture, n->period, n->crop);
-            }
+            const tex_t *texture = (const tex_t *)n->texture->data;
+            nvn_cap_present(texture, n->crop); present = mtl_present(texture, n->period, n->crop);
             nq_cost_end(cost); gfx_leave(); pthread_mutex_unlock(&g_sub_mu);
         }
         pthread_mutex_lock(&nq_mu);
-        if (n->kind == NQ_PRESENT) { q->present = present; j->receipt->present = present; }
-        if (fence) { q->physical = fence; for (unsigned i = 0; i < n->signal_count; i++) nq_event_issued(n->signals[i].event, fence, n->signals[i].mode, n->signals[i].value); }
-        if (n->receipt) nq_put(n->receipt);
-        free(n->signals); free(n->bytes); free(n); pthread_cond_broadcast(&nq_cv); pthread_mutex_unlock(&nq_mu);
+        if (fence) {
+            for (size_t i = 0; i < batch.nitem; i++) batch.item[i].q->physical = fence;
+            for (size_t i = 0; i < batch.nsignal; i++) nq_event_issued(batch.signal[i].signal.event, fence, batch.signal[i].signal.mode, batch.signal[i].signal.value);
+            for (size_t i = 0; i < batch.nitem; i++) if (!batch.item[i].barrier) nq_node_free(batch.item[i].n);
+            batch.nitem = batch.nsignal = 0;
+        } else if (n) {
+            if (n->kind == NQ_PRESENT) { q->present = present; j->receipt->present = present; }
+            nq_node_free(n);
+        }
+        pthread_cond_broadcast(&nq_cv); pthread_mutex_unlock(&nq_mu);
     }
     return NULL;
 }

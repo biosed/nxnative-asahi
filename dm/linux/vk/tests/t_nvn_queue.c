@@ -146,6 +146,9 @@ static void record_wait(recording *r, volatile uint32_t *word, unsigned mode, ui
     struct { volatile uint32_t *word; uint32_t mode, value; } p = {word, mode, value};
     record_op(r, OP_WAIT_EVENT, &p, sizeof p);
 }
+static void record_fence(recording *r, sync_t *sync) {
+    const sync_t *p = sync; record_op(r, OP_FENCE_SYNC, &p, sizeof p);
+}
 static void record_marker(recording *r) { record_op(r, OP_BARRIER, NULL, 0); }
 static void record_rt(recording *r, const tex_t *texture) {
     p_set_rt rt = {.n = 1, .color = {texture}};
@@ -154,6 +157,17 @@ static void record_rt(recording *r, const tex_t *texture) {
 static void submit(queue_t *q, recording *r) {
     uint64_t handle = (uintptr_t)r->data;
     nvn_queue_submit(q, 1, &handle);
+}
+// Queue work before starting the replay thread, so the ready-window batching
+// fixture does not depend on whether the worker wins a scheduling race between
+// two ordinary nvn_queue_submit calls.
+static void enqueue_deferred(queue_t *q, recording *r) {
+    nq_job *j = calloc(1, sizeof *j); if (!j) abort();
+    j->receipt = nq_new(); j->objects.klen = sizeof(nq_object_key); j->frame = dm_nvn_frame_count();
+    dm_host_mutex_lock(&g_sub_mu); nq_flatten(j, r->data, 0); nq_end(j); pthread_mutex_unlock(&g_sub_mu);
+    int waits = 0; for (nq_node *node = j->first; node; node = node->next) waits |= node->kind == NQ_EVENT || node->kind == NQ_SYNC;
+    nvn_cap_queue(q->serial, waits);
+    pthread_mutex_lock(&nq_mu); nq_enqueue(nq_get(q), j); pthread_mutex_unlock(&nq_mu);
 }
 static int wait_at_least(_Atomic uint64_t *value, uint64_t target, uint64_t timeout_ns) {
     uint64_t start = now_ns();
@@ -197,7 +211,53 @@ int main(int argc, char **argv) {
     queue_t producer = {.serial = 1}, consumer = {.serial = 2};
     volatile uint32_t event = 0;
 
+    // Both logical queues are ready before the worker starts. The producer's
+    // exact WRITE satisfies the consumer in the same scheduler commit; the
+    // inserted full barrier remains ordered between their command ranges, and
+    // both logical receipts publish the common fence only after commit.
     uint64_t commits = atomic_load(&fake_commits); unsigned markers = atomic_load(&marker_count);
+    recording batch_write = {0}, batch_wait = {0};
+    record_signal(&batch_write, &event, 0, 1); record_marker(&batch_write); record_end(&batch_write);
+    record_wait(&batch_wait, &event, 0, 1); record_marker(&batch_wait); record_end(&batch_wait);
+    enqueue_deferred(&producer, &batch_write); enqueue_deferred(&consumer, &batch_wait);
+    sync_t producer_tail = {0}, consumer_tail = {0}; nvn_queue_fence(&producer, &producer_tail); nvn_queue_fence(&consumer, &consumer_tail);
+    pthread_once(&nq_once, nq_start);
+    CHECK(wait_markers(markers + 3, 1000000000ull), "cross-queue ready batch records producer, dependency barrier and consumer");
+    CHECK(atomic_load(&fake_commits) == commits + 1, "cross-queue exact producer and consumer share one scheduler commit");
+    uint64_t pf = 0, cf = 0; pthread_mutex_lock(&nq_mu);
+    int pp = nq_sync_encoded(&producer_tail, &pf), cp = nq_sync_encoded(&consumer_tail, &cf); pthread_mutex_unlock(&nq_mu);
+    CHECK(pp && cp && pf == cf && pf != 0, "emptied logical job receipts publish the common batch fence");
+    CHECK(event == 0, "batched signal remains CPU-invisible before completion");
+    complete_to(atomic_load(&fake_fence)); CHECK(event == 1, "batched signal publishes at the common fence"); event = 0;
+    nvn_sync_release(&producer_tail); nvn_sync_release(&consumer_tail);
+
+    // A CPU-released event is a hard window boundary: work before it commits,
+    // the unresolved continuation parks, and work after it starts a new batch.
+    volatile uint32_t cpu_gate = 0; commits = atomic_load(&fake_commits); markers = atomic_load(&marker_count);
+    recording cpu_split = {0}; record_marker(&cpu_split); record_wait(&cpu_split, &cpu_gate, 0, 1); record_marker(&cpu_split); record_end(&cpu_split);
+    submit(&producer, &cpu_split);
+    CHECK(wait_markers(markers + 1, 1000000000ull) && wait_at_least(&fake_commits, commits + 1, 1000000000ull),
+          "commands before an unresolved CPU event commit");
+    struct timespec cpu_pause = {0, 20000000}; nanosleep(&cpu_pause, NULL);
+    CHECK(atomic_load(&marker_count) == markers + 1 && atomic_load(&fake_commits) == commits + 1,
+          "commands after an unresolved CPU event stay parked");
+    nvn_event_publish(&cpu_gate, 0, 1);
+    CHECK(wait_markers(markers + 2, 1000000000ull) && wait_at_least(&fake_commits, commits + 2, 1000000000ull),
+          "CPU event release starts a new scheduler commit");
+    complete_to(atomic_load(&fake_fence));
+
+    // A guest-visible fence also terminates the current ready window. Its
+    // receipt names the first submission, never work encoded after the fence.
+    sync_t split_fence = {0}; commits = atomic_load(&fake_commits); markers = atomic_load(&marker_count);
+    recording fence_split = {0}; record_marker(&fence_split); record_fence(&fence_split, &split_fence); record_marker(&fence_split); record_end(&fence_split);
+    submit(&producer, &fence_split);
+    CHECK(wait_markers(markers + 2, 1000000000ull) && wait_at_least(&fake_commits, commits + 2, 1000000000ull),
+          "fence splits ready commands into two scheduler commits");
+    uint64_t split_value = 0; pthread_mutex_lock(&nq_mu); int split_published = nq_sync_encoded(&split_fence, &split_value); pthread_mutex_unlock(&nq_mu);
+    CHECK(split_published && split_value + 1 == atomic_load(&fake_fence), "fence receipt excludes the following command range");
+    complete_to(atomic_load(&fake_fence)); nvn_sync_release(&split_fence);
+
+    commits = atomic_load(&fake_commits); markers = atomic_load(&marker_count);
     volatile uint32_t self_event = 0;
     recording self = {0};
     record_signal(&self, &self_event, 0, 1); record_wait(&self, &self_event, 0, 1); record_marker(&self); record_end(&self);
@@ -283,8 +343,8 @@ int main(int argc, char **argv) {
     complete_to(atomic_load(&fake_fence));
 
     uint64_t stats[NVN_QUEUE_STAT_COUNT]; nvn_queue_stats(stats);
-    CHECK(stats[NVN_QUEUE_STAT_COMMAND_NODES] == stats[NVN_QUEUE_STAT_PHYSICAL_SUBMITS],
-          "every command continuation became one measured physical submit");
+    CHECK(stats[NVN_QUEUE_STAT_COMMAND_NODES] > stats[NVN_QUEUE_STAT_PHYSICAL_SUBMITS],
+          "ready command continuations are measured separately from their shared scheduler commit");
     CHECK(stats[NVN_QUEUE_STAT_EVENT_NODES] >= 3 && stats[NVN_QUEUE_STAT_SYNC_NODES] >= 1,
           "event and sync dependency nodes are measured");
     CHECK(stats[NVN_QUEUE_STAT_EXACT_QUEUED_RELEASES] >= 1 && stats[NVN_QUEUE_STAT_COMPLETION_RELEASES] >= 1 && stats[NVN_QUEUE_STAT_CPU_RELEASES] >= 1,
