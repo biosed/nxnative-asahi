@@ -83,6 +83,7 @@ static uint8_t g_bindless_seed[VKR_BINDLESS_TEXTURES];
 static int g_feedback_enabled;
 static VkPipelineLayout g_pl_gfx, g_pl_cs;
 static int g_trace;   // the replay's pass log is on (DM_VK_PASSLOG): each draw is logged with its shaders and textures
+static int g_trace_pre_stage, g_trace_pre_gl, g_trace_pre_fallback;
 void vkx_trace(int on) { g_trace = on; }
 static int g_depth_zero;   // NVN depth mode: 1 near = 0 (as Vulkan), 0 near = -w (GL, NVN's default): the last stage before rasterization then takes its GL-depth variant
 static int g_init = -1, g_gmem_trace = -1; static char g_spv[1024], g_mesh_spv[1024]; static uint32_t g_per_set[5];   // descriptors of a set by type: uniform, storage, combined, storage image, texel buffer
@@ -1403,6 +1404,11 @@ int vkx_prepare_draw(VkCommandBuffer c) {
     VkShaderEXT objs[7] = {0}; int last = sh[2] ? 2 : sh[4] ? 4 : 0;
     for (int st = 0; st < 5; st++) objs[st] = !sh[st] ? VK_NULL_HANDLE : st == 0 || st == 2 || st == 4 ? (st == last && !g_depth_zero ? gl_variant(sh[st]) : sh_plain(sh[st])) : sh[st]->sh;   // GL clip depth: the stage that feeds the rasterizer maps it to Vulkan's
     for (int st = 0; st < 5; st++) if (sh[st] && !objs[st]) { g_miss[M_NOSHADER]++; return 0; }
+    if (g_trace) {
+        g_trace_pre_stage = last;
+        g_trace_pre_gl = !g_depth_zero && sh[last]->sh_gl && objs[last] == sh[last]->sh_gl;
+        g_trace_pre_fallback = !g_depth_zero && !g_trace_pre_gl;
+    }
     g_vkd.bind_shaders(c, sizeof stages / sizeof *stages, stages, objs);
     if (drawlog() && !(g_st_draws & (g_st_draws - 1))) {
         char m[400]; int q = 0; for (int i = 0; i < 10; i++) if (g_miss[i]) q += snprintf(m + q, sizeof m - q, " %s %llu", MISS[i], (unsigned long long)g_miss[i]);
@@ -1934,6 +1940,8 @@ int vkx_draw(VkCommandBuffer c, uint32_t op, const void *a, uint32_t size, int n
     if (g_trace) { uint8_t k[8]; char ks[2][17] = {"-", "-"}; for (int st = 0; st < 2; st++) if (S.prog[st] && prog_key(S.prog[st], (unsigned)(S.prog[st] == S.prog[0] ? st : 0), k)) for (int i = 0; i < 8; i++) snprintf(ks[st] + 2 * i, 3, "%02x", k[i]);
         LOG("[pass]   draw%s prim %d count %d instances %d vs %s ps %s, blend %#x mask %#x, depth test %d write %d func %d, stencil %d func %d ref %d, cull %d", x ? " indexed" : "", d ? d->prim : x->prim, d ? d->count : x->count,
             d ? d->instances : x->instances, ks[0], ks[1], D.color.blend_en, D.chmask.mask, (int)D.ds.dt, (int)D.ds.dw, (int)D.ds.df, (int)D.ds.st, (int)D.ds.sf_f, D.st_ref[0], (int)D.poly.cull);
+        if (d) LOG("[pass]     draw arguments: first %d, base instance %d, indirect %#llx", d->first, d->base_instance, (unsigned long long)d->ind);
+        else LOG("[pass]     indexed arguments: index buffer %#llx, base vertex %d, base instance %d, indirect %#llx", (unsigned long long)x->ibuf, x->base_vertex, x->base_instance, (unsigned long long)x->ind);
         if (D.color.blend_en & 1) LOG("[pass]     blend 0: rgb src %d dst %d eq %d, alpha src %d dst %d eq %d; blend colour %g %g %g %g", (int)D.blend[0].src_rgb, (int)D.blend[0].dst_rgb, (int)D.blend[0].eq_rgb,
             (int)D.blend[0].src_a, (int)D.blend[0].dst_a, (int)D.blend[0].eq_a, D.bc[0], D.bc[1], D.bc[2], D.bc[3]);
         LOG("[pass]     viewports %d: %.1f %.1f %.1f %.1f depth %.2f..%.2f%s; scissor %s %d %d %d %d; front %s; origin %s; depth mode %s; attrs %#x", D.nvp, D.vp[0][0], D.vp[0][1], D.vp[0][2], D.vp[0][3],
@@ -1945,6 +1953,8 @@ int vkx_draw(VkCommandBuffer c, uint32_t op, const void *a, uint32_t size, int n
     static int prof = -1; if (prof < 0) prof = getenv("DM_VK_PROF") != NULL;   // DM_VK_PROF: the parts' totals (vkx_prof_take)
     uint64_t sd0 = slow || prof ? mk_now() : 0;
     if (!vkx_prepare_draw(c)) { g_st_skip[SK_PREP]++; return 0; }
+    if (g_trace) LOG("[pass]     prepared pre-raster stage %d with %s variant%s", g_trace_pre_stage, g_trace_pre_gl ? "GL-depth" : "plain",
+        g_trace_pre_fallback ? " (GL-depth requested but unavailable)" : "");
     uint64_t sd1 = slow || prof ? mk_now() : 0;
     set_state(c, ncolor, rt_w, rt_h, tp, samples);
     uint64_t sd1b = prof ? mk_now() : 0;
