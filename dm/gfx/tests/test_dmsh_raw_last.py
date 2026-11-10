@@ -25,6 +25,7 @@ exec(compile(ast.Module(body=[n for n in tree.body if isinstance(n, ast.Assign) 
 MAC_METAL = scope['MAC_METAL']
 
 LDG = (0x000ea200081e890f, 0x0000000405067981)   # LDG.E R6, [R5.64 + UR4]: R5 the thread index, an address the translator traces to no storage buffer
+LDG128 = (LDG[0] | (3 << 9), (LDG[1] & ~0xff0000) | (8 << 16))   # LDG.E.128 R8, [R5.64 + UR4]: four consecutive words from the same 64-bit base in one basic block
 HELPER = re.compile(r'(?m)^int (_\d+)\(thread const int& _\d+, thread const int& _\d+, const device (_\d+)& \w+, thread uint& (_\d+)\)\n\{\n')
 
 # The pool table as the host writes it (nvn_mtl.m gmem_map, dmsh_abi.h DMSH_GMEM_MAP_*): 8,192 entries of 8 words {start lo, start hi, end lo, end hi, delta lo, delta hi, hint, 0}, sorted by start,
@@ -69,10 +70,54 @@ int main(int ac, char **av) { @autoreleasepool {
 
 @unittest.skipUnless(os.environ.get('DMSH_TEST_XLATE'), 'set DMSH_TEST_XLATE to the offline translator')
 class RawLast(Translated):
+    def spv_dis(self, code):
+        import json
+        sys.path.insert(0, str(TOOLS))
+        import dmsh_geometry
+        with tempfile.TemporaryDirectory(prefix='raw_last_') as d:
+            work = Path(d)
+            (work / 'k.bin').write_bytes(b''.join(inst(*waiting(i)) for i in code) + inst(*EXIT))
+            job = [dict(key='k', stage='cs', arch='sm86', code=str(work / 'k.bin'), tex={}, img={}, attr={}, fout={}, local=[32, 1, 1], debug=True, nvn2_cs=[0, 0, 3, 0x40, 0], shared=0x1000)]
+            (work / 'jobs.json').write_text(json.dumps(job))
+            r = subprocess.run([os.environ['DMSH_TEST_XLATE'], str(work / 'jobs.json'), d], capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            dmsh_geometry.flatten_sets(work / 'k.spv')
+            if shutil.which('spirv-val'):
+                v = subprocess.run(['spirv-val', '--target-env', 'vulkan1.3', str(work / 'k.spv')], capture_output=True, text=True)
+                self.assertEqual(v.returncode, 0, v.stdout + v.stderr)
+            dis = subprocess.run(['spirv-dis', str(work / 'k.spv')], capture_output=True, text=True, check=True).stdout
+            return dis
+
     def msl(self):
         code = (s2r_tid(9), s2r_tid(5), LDG, STORE, (LDG[0], LDG[1] | 4 << 40), STORE)   # two loads, the second 4 bytes on, each kept by a store to shared memory
         return self.translate(b''.join(inst(*waiting(i)) for i in code) + inst(*EXIT), shared=0x1000)
 
+    @unittest.skipUnless(shutil.which('spirv-dis'), 'needs spirv-dis')
+    def test_two_guarded_loads_share_one_private_entry_word_in_spirv(self):
+        dis = self.spv_dis((s2r_tid(9), s2r_tid(5), LDG, STORE, (LDG[0], LDG[1] | 4 << 40), STORE))
+        self.assertEqual(len(re.findall(r'OpVariable \S+ Private %\w+', dis)), 1, dis[1500:3500])
+        main = dis[dis.index(' = OpFunction %void None'):]
+        calls = re.findall(r'OpFunctionCall %int (%\w+)', main)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0], calls[1])
+
+    @unittest.skipUnless(shutil.which('spirv-dis'), 'needs spirv-dis')
+    def test_same_base_words_reuse_resolved_entry_without_repeating_search(self):
+        stores = tuple((STORE[0], (STORE[1] & ~0xff000000) | (r << 24) | (off << 40)) for r, off in ((8, 0), (9, 4), (10, 16), (11, 20)))
+        dis = self.spv_dis((s2r_tid(9), s2r_tid(5), LDG128, *stores))
+        self.assertEqual(len(re.findall(r'OpVariable \S+ Private %\w+', dis)), 1, dis[1500:3500])
+        main = dis[dis.index(' = OpFunction %void None'):]
+        calls = re.findall(r'OpFunctionCall %int (%\w+)', main)
+        self.assertEqual(len(calls), 4)
+        self.assertNotEqual(calls[0], calls[1])
+        self.assertEqual(calls[1:], [calls[1]] * 3)
+        funcs = {m.group(1): m.group(0) for m in re.finditer(r'(%\w+) = OpFunction %int None .*?OpFunctionEnd', dis, re.S)}
+        self.assertIn('OpLoopMerge', funcs[calls[0]])
+        self.assertIn('%int_21', funcs[calls[0]])
+        self.assertNotIn('OpLoopMerge', funcs[calls[1]])
+        self.assertNotIn('%int_21', funcs[calls[1]])
+
+    @unittest.skipUnless(sys.platform == 'darwin', 'needs macOS spirv-cross')
     def test_two_loads_share_one_zeroed_word(self):
         msl = self.msl()
         m = HELPER.search(msl)
