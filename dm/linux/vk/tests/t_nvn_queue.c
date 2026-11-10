@@ -8,6 +8,7 @@
 #include "nvn_obj.h"
 #include "nvn_capture.h"
 #include "nvn_mtl.h"
+#include "nvn_queue.h"
 
 pthread_mutex_t g_sub_mu = PTHREAD_MUTEX_INITIALIZER;
 __thread _Atomic int dm_host_work;
@@ -107,6 +108,7 @@ int mtl_wait(uint64_t fence, uint64_t timeout_ns) {
 }
 uint64_t mtl_present(const tex_t *t, double period, const int crop[4]) { (void)t; (void)period; (void)crop; return 0; }
 void mtl_present_wait(uint64_t ticket) { (void)ticket; }
+void mtl_finish(void) { atomic_store_explicit(&fake_done, atomic_load_explicit(&fake_fence, memory_order_acquire), memory_order_release); }
 
 #include "nvn_queue.inc"
 
@@ -173,7 +175,25 @@ static int wait_markers(unsigned target, uint64_t timeout_ns) {
 static int failures;
 #define CHECK(c, message) do { if (!(c)) { fprintf(stderr, "FAIL: %s\n", message); failures++; } } while (0)
 
-int main(void) {
+static int bypass_test(void) {
+    queue_t queue = {.serial = 7}; volatile uint32_t event = 0;
+    recording commands = {0}; record_wait(&commands, &event, 0, 99); record_marker(&commands); record_end(&commands);
+    submit(&queue, &commands);
+    CHECK(atomic_load(&fake_commits) == 1 && atomic_load(&marker_count) == 1,
+          "scheduler bypass replays one old-path submission and ignores the logical wait");
+    sync_t sync = {0}; nvn_queue_fence(&queue, &sync);
+    CHECK(sync.fenced == 1 && sync.fence == atomic_load(&fake_fence), "scheduler bypass fences the latest physical submit");
+    uint64_t stats[NVN_QUEUE_STAT_COUNT]; nvn_queue_stats(stats);
+    CHECK(stats[NVN_QUEUE_STAT_COMMAND_NODES] == 1 && stats[NVN_QUEUE_STAT_PHYSICAL_SUBMITS] == 1,
+          "scheduler bypass counts its one command node and physical submit");
+    CHECK(stats[NVN_QUEUE_STAT_EVENT_NODES] == 0 && stats[NVN_QUEUE_STAT_CROSS_QUEUE_WAITS] == 0,
+          "scheduler bypass does not create dependency nodes");
+    printf("t_nvn_queue bypass: %s (%d failures)\n", failures ? "FAILED" : "passed", failures);
+    return failures != 0;
+}
+
+int main(int argc, char **argv) {
+    if (argc > 1 && !strcmp(argv[1], "bypass")) return bypass_test();
     queue_t producer = {.serial = 1}, consumer = {.serial = 2};
     volatile uint32_t event = 0;
 
@@ -241,6 +261,18 @@ int main(void) {
     CHECK(marker_rt[markers] == 101 && marker_rt[markers + 1] == 202 && marker_rt[markers + 2] == 101,
           "logical queue switches restore persistent render targets");
     complete_to(atomic_load(&fake_fence));
+
+    uint64_t stats[NVN_QUEUE_STAT_COUNT]; nvn_queue_stats(stats);
+    CHECK(stats[NVN_QUEUE_STAT_COMMAND_NODES] == stats[NVN_QUEUE_STAT_PHYSICAL_SUBMITS],
+          "every command continuation became one measured physical submit");
+    CHECK(stats[NVN_QUEUE_STAT_EVENT_NODES] >= 3 && stats[NVN_QUEUE_STAT_SYNC_NODES] >= 1,
+          "event and sync dependency nodes are measured");
+    CHECK(stats[NVN_QUEUE_STAT_EXACT_QUEUED_RELEASES] >= 1 && stats[NVN_QUEUE_STAT_COMPLETION_RELEASES] >= 1 && stats[NVN_QUEUE_STAT_CPU_RELEASES] >= 1,
+          "queued, GPU-completion and CPU event releases are distinguished");
+    CHECK(stats[NVN_QUEUE_STAT_CROSS_QUEUE_WAITS] >= 1 && stats[NVN_QUEUE_STAT_LOCAL_WAITS] >= 1,
+          "cross-queue and local wait splits are distinguished");
+    CHECK(stats[NVN_QUEUE_STAT_QUEUE_SWITCHES] >= 1 && stats[NVN_QUEUE_STAT_PARKED_NS] > 0,
+          "logical queue switches and parked wait time are measured");
 
     printf("t_nvn_queue: %s (%d failures)\n", failures ? "FAILED" : "passed", failures);
     return failures != 0;

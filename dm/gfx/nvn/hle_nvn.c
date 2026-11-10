@@ -1678,6 +1678,25 @@ void nvn_gpu_recent(double *avg, double *p95, unsigned *n) {
     qsort(v, c, sizeof *v, dcmp); *n = c; *avg = c ? s / c : -1; *p95 = c ? v[(c * 95) / 100 < c ? (c * 95) / 100 : c - 1] : -1;
 }
 static int dcmp(const void *a, const void *b) { double x = *(const double *)a, y = *(const double *)b; return (x > y) - (x < y); }
+#ifdef DM_LINUX
+static void queue_summary(uint64_t frame) {
+    static uint64_t prev[NVN_QUEUE_STAT_COUNT], prev_frame;
+    uint64_t v[NVN_QUEUE_STAT_COUNT]; nvn_queue_stats(v);
+    double nf = frame > prev_frame ? (double)(frame - prev_frame) : 1.0;
+#define QD(k) ((double)(v[k] - prev[k]) / nf)
+    LOG("[nvn] logical queues up to frame %llu (%s): per frame command nodes %.1f / physical submits %.1f, event %.1f sync %.1f fence %.1f present %.1f; wait splits cross-queue %.1f / local %.1f; releases exact-queued %.1f / completion %.1f / CPU %.1f; queue switches %.1f; parked %.3f ms",
+        (unsigned long long)frame, nvn_queue_scheduler_enabled() ? "scheduler" : "bypass",
+        QD(NVN_QUEUE_STAT_COMMAND_NODES), QD(NVN_QUEUE_STAT_PHYSICAL_SUBMITS),
+        QD(NVN_QUEUE_STAT_EVENT_NODES), QD(NVN_QUEUE_STAT_SYNC_NODES),
+        QD(NVN_QUEUE_STAT_FENCE_NODES), QD(NVN_QUEUE_STAT_PRESENT_NODES),
+        QD(NVN_QUEUE_STAT_CROSS_QUEUE_WAITS), QD(NVN_QUEUE_STAT_LOCAL_WAITS),
+        QD(NVN_QUEUE_STAT_EXACT_QUEUED_RELEASES), QD(NVN_QUEUE_STAT_COMPLETION_RELEASES),
+        QD(NVN_QUEUE_STAT_CPU_RELEASES), QD(NVN_QUEUE_STAT_QUEUE_SWITCHES),
+        (v[NVN_QUEUE_STAT_PARKED_NS] - prev[NVN_QUEUE_STAT_PARKED_NS]) / 1e6 / nf);
+#undef QD
+    memcpy(prev, v, sizeof prev); prev_frame = frame;
+}
+#endif
 // Power over the window since the last summary, for the whole process: CPU energy (task_energy in nJ, Apple silicon), CPU time (100% = one core) and the share of it on performance cores,
 // wakeups per second (interrupt / out of platform idle), GPU time per second (task_gpu_utilisation), thermal state, and the guest threads that yielded most (hle_thread.c);
 // then render-target traffic per frame (attachment load / store bytes, passes that load and store everything, stores saved by DM_NVN_UNWRITTEN_DC) and guest-thread CPU by Switch priority
@@ -1736,6 +1755,9 @@ static void tsummary(uint64_t frame) {
         o += snprintf(line + o, sizeof line - o, " %s p50 %.2f / p95 %.2f / max %.2f ms (%u frames);", g_tname[k], v[n / 2], v[(n * 95) / 100 < n ? (n * 95) / 100 : n - 1], v[n - 1], n);
     }
     LOG("[nvn] timing up to frame %llu:%s", frame, line);
+#ifdef DM_LINUX
+    queue_summary(frame);
+#endif
     { void mtl_pso_line(char *, size_t); char pl[1024]; mtl_pso_line(pl, sizeof pl); LOG("[nvn] pipelines up to frame %llu: %s", frame, pl); }
     double tgt = 1000.0 / mtl_fps_target();   // milliseconds one frame should take: 16.7 at 60 fps, 33.3 when the game itself asks for 30 (the over-time / dropped-frame counts below use it)
     { unsigned n = g_tn[0] < TWIN ? g_tn[0] : TWIN, over = 0; double v[TWIN];   // frame interval gets its own line (M1 baseline): number of frames longer than one frame period in this window and p99
