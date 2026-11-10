@@ -332,6 +332,26 @@ static void nq_signal_add(nq_node *n, nq_signal signal) {
     }
     n->signals[n->signal_count++] = signal;
 }
+// A signal followed by its own satisfied wait in one logical queue is an
+// execution/memory dependency, not a reason to end the physical submission.
+// Look at the last write to the word: an earlier exact write must not hide a
+// later ADD whose result is unknown until the GPU completes.
+static int nq_self_event(const nq_node *n, volatile uint32_t *event,
+                         unsigned mode, uint32_t value) {
+    if (!n || n->kind != NQ_COMMANDS || n->closed) return 0;
+    for (unsigned i = n->signal_count; i-- > 0;) if (n->signals[i].event == event)
+        return n->signals[i].mode == 0 && nq_predicate(n->signals[i].value, mode, value);
+    return 0;
+}
+static void nq_self_barrier(nq_node *n) {
+    // Separate physical submissions ordered every earlier GPU write before
+    // the continuation. Keep that dependency while retaining both ranges in
+    // one submit; nonzero bits are required by the Metal replay as well.
+    struct { op_hdr h; int32_t bits; uint32_t pad; } b = {
+        {OP_BARRIER, 16}, NVN_BARRIER_BITS_LARGE, 0
+    };
+    nq_bytes(n, &b, sizeof b);
+}
 static void nq_end(nq_job *j) {
     if (j->last && j->last->kind == NQ_COMMANDS && !j->last->closed) { op_hdr end = {OP_END, 8}; nq_bytes(j->last, &end, 8); j->last->closed = 1; }
 }
@@ -342,10 +362,18 @@ static void nq_flatten(nq_job *j, const uint8_t *p, unsigned depth) {
         if (h.op == OP_END) return;
         if (h.op == OP_JUMP) { memcpy(&p, a, 8); continue; }
         if (h.op == OP_CALL) { const uint8_t *called; memcpy(&called, a, 8); nq_flatten(j, called, depth + 1); p += h.size; continue; }
-        if (h.op == OP_WAIT_EVENT || h.op == OP_WAIT_SYNC || h.op == OP_FENCE_SYNC) {
-            nq_end(j); nq_node *n = nq_append(j, h.op == OP_WAIT_EVENT ? NQ_EVENT : h.op == OP_WAIT_SYNC ? NQ_SYNC : NQ_FENCE);
-            if (h.op == OP_WAIT_EVENT) { memcpy(&n->event, a, 8); memcpy(&n->mode, a + 8, 4); memcpy(&n->value, a + 12, 4); }
-            else { memcpy(&n->sync_source, a, 8); if (h.op == OP_FENCE_SYNC) n->receipt = nq_new(); }
+        if (h.op == OP_WAIT_EVENT) {
+            volatile uint32_t *event; unsigned mode; uint32_t value;
+            memcpy(&event, a, 8); memcpy(&mode, a + 8, 4); memcpy(&value, a + 12, 4);
+            if (nq_self_event(j->last, event, mode, value)) {
+                nq_self_barrier(j->last); nq_stat(NVN_QUEUE_STAT_SELF_EVENT_COALESCED);
+                p += h.size; continue;
+            }
+            nq_end(j); nq_node *n = nq_append(j, NQ_EVENT);
+            n->event = event; n->mode = mode; n->value = value;
+        } else if (h.op == OP_WAIT_SYNC || h.op == OP_FENCE_SYNC) {
+            nq_end(j); nq_node *n = nq_append(j, h.op == OP_WAIT_SYNC ? NQ_SYNC : NQ_FENCE);
+            memcpy(&n->sync_source, a, 8); if (h.op == OP_FENCE_SYNC) n->receipt = nq_new();
         } else {
             nq_node *n = j->last; if (!n || n->kind != NQ_COMMANDS || n->closed) n = nq_append(j, NQ_COMMANDS);
             size_t offset = n->length; nq_bytes(n, p, h.size);

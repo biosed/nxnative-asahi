@@ -198,12 +198,32 @@ int main(int argc, char **argv) {
     volatile uint32_t event = 0;
 
     uint64_t commits = atomic_load(&fake_commits); unsigned markers = atomic_load(&marker_count);
+    volatile uint32_t self_event = 0;
+    recording self = {0};
+    record_signal(&self, &self_event, 0, 1); record_wait(&self, &self_event, 0, 1); record_marker(&self); record_end(&self);
+    submit(&producer, &self);
+    CHECK(wait_markers(markers + 2, 1000000000ull), "same-queue exact signal/wait records its dependency and following marker");
+    CHECK(atomic_load(&fake_commits) == commits + 1, "same-queue exact signal/wait stays in one physical submission");
+    CHECK(self_event == 0, "coalesced GPU signal still waits for physical completion before CPU publication");
+    complete_to(atomic_load(&fake_fence));
+    CHECK(self_event == 1, "coalesced GPU signal publishes on completion");
+
+    volatile uint32_t wrap = 9; commits = atomic_load(&fake_commits); markers = atomic_load(&marker_count);
+    recording self_wrap = {0};
+    record_signal(&self_wrap, &wrap, 0, 0); record_wait(&self_wrap, &wrap, 1, UINT32_MAX); record_marker(&self_wrap); record_end(&self_wrap);
+    submit(&producer, &self_wrap);
+    CHECK(wait_markers(markers + 2, 1000000000ull) && atomic_load(&fake_commits) == commits + 1,
+          "same-queue exact signal satisfies a wrapped greater-or-equal wait in one submission");
+    complete_to(atomic_load(&fake_fence));
+
+    commits = atomic_load(&fake_commits); markers = atomic_load(&marker_count);
     recording write = {0}, wait = {0};
     record_signal(&write, &event, 0, 1); record_end(&write); submit(&producer, &write);
     CHECK(wait_at_least(&fake_commits, commits + 1, 1000000000ull), "WRITE producer encodes");
     uint64_t write_fence = atomic_load(&fake_fence);
     record_wait(&wait, &event, 0, 1); record_marker(&wait); record_end(&wait); submit(&consumer, &wait);
     CHECK(wait_markers(markers + 1, 1000000000ull), "wait encodes behind a queued exact WRITE");
+    CHECK(atomic_load(&fake_commits) == commits + 2, "cross-queue exact signal/wait retains two physical submissions");
     CHECK(event == 0, "queued WRITE need not land on the CPU before its consumer encodes");
     complete_to(atomic_load(&fake_fence));
     CHECK(event == 1 && write_fence != 0, "queued WRITE publishes on completion");
@@ -271,6 +291,8 @@ int main(int argc, char **argv) {
           "queued, GPU-completion and CPU event releases are distinguished");
     CHECK(stats[NVN_QUEUE_STAT_CROSS_QUEUE_WAITS] >= 1 && stats[NVN_QUEUE_STAT_LOCAL_WAITS] >= 1,
           "cross-queue and local wait splits are distinguished");
+    CHECK(stats[NVN_QUEUE_STAT_SELF_EVENT_COALESCED] == 2,
+          "same-queue exact event coalescing is measured without swallowing cross-queue waits");
     CHECK(stats[NVN_QUEUE_STAT_QUEUE_SWITCHES] >= 1 && stats[NVN_QUEUE_STAT_PARKED_NS] > 0,
           "logical queue switches and parked wait time are measured");
 
