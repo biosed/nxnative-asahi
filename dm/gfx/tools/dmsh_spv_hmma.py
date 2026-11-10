@@ -381,6 +381,38 @@ def hmma_helper(module):
     }
 
 
+# Gathered A / B fragments kept for reuse within a basic block, most recently
+# used first.  Every kept fragment is 32 half-float values that stay live until
+# its last reuse: an unbounded cache kept ten B matrices live across thousands
+# of instructions in the NDSR kernel d99fbeeb53d38847 (five convolution layers
+# in one block), more than the AGX register file holds, and the driver spilled
+# 852 values and filled 877 per thread (36 / 31 before this lowering existed).
+# Two of each keeps the adjacent reuse the kernels actually have.
+# DMSH_HMMA_CACHE=<a>,<b> overrides it for measurements (0 = unbounded).
+HMMA_CACHE_A, HMMA_CACHE_B = 2, 2
+
+
+def _cache_limits():
+    text = os.environ.get('DMSH_HMMA_CACHE')
+    if not text:
+        return HMMA_CACHE_A, HMMA_CACHE_B
+    a, b = (int(part) for part in text.split(','))
+    if a < 0 or b < 0:
+        raise ValueError('DMSH_HMMA_CACHE=%s: limits are not negative' % text)
+    return a, b
+
+
+def _cache_keep(cache, key, limits):
+    """Mark key most recently used and drop the oldest of its kind past the limit."""
+    cache[key] = cache.pop(key)
+    limit = limits[0] if key[0] == 'A' else limits[1]
+    if not limit:
+        return
+    same = [k for k in cache if k[0] == key[0]]
+    for old in same[:max(0, len(same) - limit)]:
+        del cache[old]
+
+
 def hmma_lds(module):
     """Lower every recognized HMMA call, returning the number replaced.
 
@@ -419,6 +451,7 @@ def hmma_lds(module):
     for function in functions:
         first, last = module.function_range(function)
         out, values, cache = [], BlockValues(module), {}
+        limits = _cache_limits()
 
         def emit(op, ty, *operands):
             result = module.new_id()
@@ -536,6 +569,8 @@ def hmma_lds(module):
                     ]
                 out.extend(list(barrier) for barrier in helper['barrier'])
             a_fragments, b_fragments = cache[key_a], cache[key_b]
+            _cache_keep(cache, key_a, limits)
+            _cache_keep(cache, key_b, limits)
             cvals = [emit(OP_LOAD, i32, args[i]) for i in (8, 9)]
             result_words = []
             for row in range(2):
