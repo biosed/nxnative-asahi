@@ -1609,15 +1609,18 @@ void mtl_exec(const uint8_t *handle) {
                 if (!vkd_mesh_active()) {
                     SKIP_ONCE(g_skip_mesh, "mesh/task draw (DrawMeshTasks%s) skipped: VK_EXT_mesh_shader runtime proof gate is closed", ind ? "Indirect" : ""); break;
                 }
-                // Copies and both visibility barriers must be outside dynamic
-                // rendering.  Only after the bridge is complete may the
-                // task/mesh/fragment program and final command be recorded.
-                rp_end(c);
+                // An indirect mesh draw copies its count and first-instance words out of guest memory with transfer commands, which must be outside dynamic
+                // rendering: the pass ends for it. A direct one writes its record from the host and records nothing, so it stays in the pass the game's
+                // other draws are in. Ending the pass before every mesh draw split Ocarina of Time's 1600x1600 shadow pass into 23 hardware passes and
+                // two G-buffer passes into 29 (51 tile stores and reloads a frame; biosed-agent's audit of a Kokiri frame). DM_VK_MESH_KEEP_PASS=0
+                // ends it for every mesh draw as before
+                static int keep_pass = -1; if (keep_pass < 0) { const char *e = getenv("DM_VK_MESH_KEEP_PASS"); keep_pass = !(e && !strcmp(e, "0")); }
+                if (ind || !keep_pass) rp_end(c);
                 // A long render pass can consume most of this command
                 // buffer's descriptor pools before its first mesh draw.  The
                 // mesh bridge has just provided a legal split point; submit
                 // the old part before allocating the task/mesh/fragment sets.
-                if (g_flush_draws >= FLUSH_DRAWS && !g_noflush) {
+                if (!g_rp_on && g_flush_draws >= FLUSH_DRAWS && !g_noflush) {   // only at a split point: with the pass still open the next pass end flushes
                     uint64_t ft = g_prof > 0 ? mono_ns() : 0;
                     vkr_flush(); c = g_cb[g_cb_i];
                     if (g_prof > 0) g_opns[64] += mono_ns() - ft;

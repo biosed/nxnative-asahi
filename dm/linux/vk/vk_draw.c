@@ -1528,14 +1528,9 @@ int vkx_mesh_bridge(VkCommandBuffer c, const p_draw *d, vkx_mesh_submit *out) {
         vkCmdPipelineBarrier(c, VK_PIPELINE_STAGE_TRANSFER_BIT,
             VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT | command.owner_dst_stage,
             0, 0, NULL, 2, barrier, 0, NULL);
-    } else {
-        VkBufferMemoryBarrier barrier = {.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
-            .srcAccessMask = VK_ACCESS_HOST_WRITE_BIT, .dstAccessMask = VK_ACCESS_UNIFORM_READ_BIT,
-            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .buffer = scratch, .offset = first_off, .size = 4};
-        vkCmdPipelineBarrier(c, VK_PIPELINE_STAGE_HOST_BIT, command.owner_dst_stage,
-                             0, 0, NULL, 1, &barrier, 0, NULL);
     }
+    // A direct draw's record is written by the host into coherent mapped memory before the command buffer is submitted, which is visible to the GPU
+    // without a barrier; recording one here would also be illegal inside the dynamic rendering the draw now stays in (vk_replay.c)
     *out = (vkx_mesh_submit){.command = command,
         .indirect_buffer = d->ind ? scratch : VK_NULL_HANDLE,
         .indirect_offset = d->ind ? record_off : 0,
