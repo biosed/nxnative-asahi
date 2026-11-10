@@ -33,12 +33,16 @@ static uint64_t g_chunks, g_bytes; static _Atomic uint64_t g_refchunks;
 static _Atomic uint64_t g_generation = 1;
 enum { VKM_PROFILE_CHUNKS = 4096 };
 static uint8_t g_profile[VKM_MAXREG][VKM_PROFILE_CHUNKS];
+static uint8_t g_profile_miss_reported[VKM_MAXREG][VKM_PROFILE_CHUNKS];
+static unsigned g_profile_miss_reports;
 static int g_profile_loaded, g_profile_on;
+static int pool_mode(void);
 
 // A learned profile is a set of 32-MiB region/chunk pairs, one per line. It is
-// consumed only by the normal pre-open dm_gpu_commit path: selected chunks are
-// placed before SetHeapSize/MapPhysicalMemory opens their first CPU page. No
-// live mapping is ever replaced in this mode.
+// consumed by the normal pre-open dm_gpu_commit path: selected chunks are
+// placed before SetHeapSize/MapPhysicalMemory opens their first CPU page. In
+// pool mode it is audit-only: NVN-addressed ranges are checked against it, but
+// only the address exposure may place memory.
 static int profile_mode(void) {
     if (g_profile_loaded) return g_profile_on;
     g_profile_loaded = 1;
@@ -60,8 +64,14 @@ static int profile_mode(void) {
     }
     fclose(f);
     g_profile_on = n != 0;
-    if (g_profile_on) LOG("vulkan: guest-memory profile %s selects %u pre-open 32-MiB chunks", path, n);
-    else LOG("[RED] vulkan: guest-memory profile %s is empty; using full backing", path);
+    if (g_profile_on && pool_mode())
+        LOG("vulkan: guest-memory profile %s lists %u 32-MiB chunks (audit only; NVN addresses drive placement)", path, n);
+    else if (g_profile_on)
+        LOG("vulkan: guest-memory profile %s selects %u pre-open 32-MiB chunks", path, n);
+    else if (pool_mode())
+        LOG("[RED] vulkan: guest-memory profile %s is empty; pool coverage audit is disabled", path);
+    else
+        LOG("[RED] vulkan: guest-memory profile %s is empty; using full backing", path);
     return g_profile_on;
 }
 
@@ -175,7 +185,7 @@ void dm_gpu_region(void *base, size_t size) {
     static int pool_reported;
     if (pool_mode()) {
         swap_hooks();
-        if (!pool_reported++) LOG("vulkan: guest heap/alias use anonymous pages until NVN memory pools expose them (DM_VK_GMEM_POOLS=1)");
+        if (!pool_reported++) LOG("[RED] vulkan: experimental live guest-memory placement enabled (DM_VK_GMEM_POOLS=1); not a gameplay baseline");
     }
     pthread_mutex_lock(&g_mu);
     if (g_nreg < VKM_MAXREG && size) {
@@ -208,11 +218,23 @@ void vkm_addressed(const void *addr, uint64_t len) {
                                  (unsigned long long)c, (unsigned long long)(c * granule),
                                  (unsigned long long)(granule >> 20));
             }
-            if (profile_mode() && !r->chunk[c]) {
-                static _Atomic int misses;
-                if (atomic_fetch_add(&misses, 1) < 32)
-                    LOG("[RED] vulkan: guest-memory profile miss: region %d chunk %llu (offset %#llx)", i,
-                        (unsigned long long)c, (unsigned long long)(c * granule));
+        }
+        // The learned profile is always indexed in 32-MiB units, independent
+        // of the experimental pool placement granule. Report each uncovered
+        // profile chunk once; observing it must never place memory.
+        if (profile_mode()) {
+            for (uint64_t c = lo / VKM_CHUNK_DEFAULT;
+                 c * VKM_CHUNK_DEFAULT < hi; c++) {
+                int missing = c >= VKM_PROFILE_CHUNKS || !g_profile[i][c];
+                int fresh = c >= VKM_PROFILE_CHUNKS || !g_profile_miss_reported[i][c];
+                if (missing && fresh) {
+                    if (c < VKM_PROFILE_CHUNKS)
+                        g_profile_miss_reported[i][c] = 1;
+                    if (g_profile_miss_reports++ < 32)
+                        LOG("[RED] vulkan: guest-memory profile miss: region %d chunk %llu (offset %#llx)", i,
+                            (unsigned long long)c,
+                            (unsigned long long)(c * VKM_CHUNK_DEFAULT));
+                }
             }
         }
         break;
