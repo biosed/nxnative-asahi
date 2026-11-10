@@ -297,23 +297,24 @@ def vk_canon(key):
             json.dump(job, jf, indent=2, sort_keys=True); jf.write('\n')
         if first['binding'] is not None:
             rows.append('\t'.join(str(x) for x in (MESH_FIRST_BINDING, 'u', 'mesh_first', '', '', '', '', '', 0, 0, 0, 0, 1)))
-    canonical = data
     try:
         data, vector = optimize_vector_loads(data, vk)
-        changed = data != canonical
-        if changed:
-            validator = os.environ.get('SPIRV_VAL') or shutil.which('spirv-val')
-            if not validator:
-                raise ValueError('vector-load lowering needs SPIRV_VAL or spirv-val on PATH')
-            temp = os.path.join(OUT, key + '.vk.spv.vector.tmp')
-            try:
-                with open(temp, 'wb') as f: f.write(data)
-                result = _run([validator, '--target-env', 'vulkan1.3', temp], capture_output=True, text=True)
-                if result.returncode:
-                    raise ValueError((result.stderr or result.stdout or 'spirv-val failed').strip()[:300])
-            finally:
-                try: os.unlink(temp)
-                except FileNotFoundError: pass
+        validator = os.environ.get('SPIRV_VAL') or shutil.which('spirv-val')
+        if not validator:
+            raise ValueError('canonical SPIR-V validation needs SPIRV_VAL or spirv-val on PATH')
+        temp = os.path.join(OUT, key + '.vk.spv.validate.tmp')
+        try:
+            with open(temp, 'wb') as f: f.write(data)
+            # Dynamic Offset on OpImageFetch is valid with VK_KHR_maintenance8;
+            # the runtime queries and enables that feature before loading one.
+            result = _run([validator, '--target-env', 'vulkan1.3',
+                           '--allow-offset-texture-operand', temp],
+                          capture_output=True, text=True)
+            if result.returncode:
+                raise ValueError((result.stderr or result.stdout or 'spirv-val failed').strip()[:300])
+        finally:
+            try: os.unlink(temp)
+            except FileNotFoundError: pass
     except Exception:
         # An earlier run may have left a loadable canonical shader. ABI drift
         # or failed validation must remove it and its binding table together.
