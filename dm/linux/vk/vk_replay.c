@@ -815,7 +815,12 @@ void mtl_reg_tex(int id, const tex_t *t, const view_t *v) {
     pthread_mutex_lock(&g_rmu);
     if (id >= g_ntreg) { int n = id + 1024; g_treg = realloc(g_treg, n * sizeof *g_treg); memset(g_treg + g_ntreg, 0, (n - g_ntreg) * sizeof *g_treg); g_ntreg = n; }
     treg_t *r = &g_treg[id]; r->ok = t != NULL; r->registered_at = atomic_load(&g_subs); if (t) r->t = *t; r->has_v = v != NULL; if (v) r->v = *v;
-    if (t && t->mem && (t->d.flags & NVN_TEXTURE_FLAGS_LINEAR) && !vkr_lin_note(&g_lin, id, t->serial)) LOG("[RED] vulkan replay: no memory to track LINEAR texture %llu", (unsigned long long)t->serial);
+    if (t && (t->d.flags & NVN_TEXTURE_FLAGS_LINEAR)) {
+        size_t had = g_lin.n;
+        if (t->mem && !vkr_lin_note(&g_lin, id, t->serial)) LOG("[RED] vulkan replay: no memory to track LINEAR texture %llu", (unsigned long long)t->serial);
+        static int logged; if ((g_lin.n != had || !t->mem) && logged < 32) { logged++;
+            LOG("vulkan replay: LINEAR texture %llu registered as ID %d, %ux%u format %#x%s; %zu tracked", (unsigned long long)t->serial, id, t->d.width, t->d.height, t->d.format, t->mem ? "" : " WITHOUT guest memory (not refreshed)", g_lin.n); }
+    }
     reg_dirty(id, VKR_BINDLESS_TEXTURES, &g_tdirty, &g_ntdirty, &g_ctdirty, g_tdflag, "texture");
     pthread_mutex_unlock(&g_rmu);
 }
