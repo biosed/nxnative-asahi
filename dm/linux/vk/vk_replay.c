@@ -89,7 +89,9 @@ static uint64_t mono_ns(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONI
 #define CS_GPU_MAX_LIMIT 65536
 typedef struct {
     char key[17];
-    uint32_t x, y, z;
+    uint8_t pass;            // a render pass (DM_VK_PASS_GPU) rather than a dispatch
+    uint32_t x, y, z;        // a pass: its width, height and colour attachment count
+    uint32_t draws, mesh;    // a pass: draws recorded in it, mesh draws among them
     uint64_t indirect, frame;
 } cs_gpu_meta;
 static VkQueryPool g_cs_qp;
@@ -118,7 +120,10 @@ static void cs_gpu_harvest(int slot, uint64_t done) {   // under g_tmu: only pub
         cs_gpu_meta *m = &g_cs_meta[slot][i];
         uint64_t ticks = q[2 * i + 1] > q[2 * i] ? q[2 * i + 1] - q[2 * i] : 0;
         double ms = ticks * per / 1e6;
-        if (m->indirect)
+        if (m->pass)
+            LOG("[vk-pass-gpu] frame %llu pass %ux%u colours %u targets %s draws %u mesh %u ended-at %llu gpu %.3f ms",
+                (unsigned long long)m->frame, m->x, m->y, m->z, m->key, m->draws, m->mesh, (unsigned long long)m->indirect, ms);
+        else if (m->indirect)
             LOG("[vk-cs-gpu] frame %llu shader %s groups indirect@%#llx record %ux%ux%u gpu %.3f ms",
                 (unsigned long long)m->frame, m->key, (unsigned long long)m->indirect,
                 m->x, m->y, m->z, ms);
@@ -132,8 +137,9 @@ static void cs_gpu_harvest(int slot, uint64_t done) {   // under g_tmu: only pub
         LOG("vulkan compute GPU profile: completed bounded sample of %llu dispatches%s",
             (unsigned long long)g_cs_logged, atomic_load(&g_cs_overflow) ? " (some command-buffer slots overflowed before the global cap)" : "");
 }
-int vkr_cs_gpu_begin(VkCommandBuffer c, const char key[17], uint32_t x,
-                     uint32_t y, uint32_t z, uint64_t indirect) {
+static int g_pass_gpu;   // DM_VK_PASS_GPU=1 (with DM_VK_CS_GPU): render passes are timed too, in the same bounded sample
+static int gpu_sample_begin(VkCommandBuffer c, const char key[17], uint32_t x, uint32_t y, uint32_t z,
+                            uint64_t indirect, int pass, VkPipelineStageFlagBits stage) {
     if (!g_cs_qp || g_cb_i < 0 || c != g_cb[g_cb_i]) return -1;
     { static long after = -1; if (after < 0) { const char *e = getenv("DM_VK_CS_GPU_AFTER"); after = e ? atol(e) : 0; }   // DM_VK_CS_GPU_AFTER=<frame>: no samples before that frame, so the bounded total reaches gameplay
       if (after > 0 && vkh_frame() < (uint64_t)after) return -1; }
@@ -154,9 +160,14 @@ int vkr_cs_gpu_begin(VkCommandBuffer c, const char key[17], uint32_t x,
     cs_gpu_meta *m = &g_cs_meta[g_cb_i][i];
     snprintf(m->key, sizeof m->key, "%s", key);
     m->x = x; m->y = y; m->z = z; m->indirect = indirect; m->frame = vkh_frame();
+    m->pass = (uint8_t)pass; m->draws = m->mesh = 0;
     g_cs_recorded++;
-    vkCmdWriteTimestamp(c, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, g_cs_qp, cs_query(g_cb_i, i));
+    vkCmdWriteTimestamp(c, stage, g_cs_qp, cs_query(g_cb_i, i));
     return i;
+}
+int vkr_cs_gpu_begin(VkCommandBuffer c, const char key[17], uint32_t x,
+                     uint32_t y, uint32_t z, uint64_t indirect) {
+    return gpu_sample_begin(c, key, x, y, z, indirect, 0, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
 }
 void vkr_cs_gpu_end(VkCommandBuffer c, int token) {
     if (!g_cs_qp || token < 0 || token >= CS_GPU_PER_SLOT || g_cb_i < 0 || c != g_cb[g_cb_i]) return;
@@ -228,8 +239,11 @@ static int vkr_on(void) {
         if (!g_vkd.props.limits.timestampComputeAndGraphics || vkCreateQueryPool(g_vkd.dev, &qci, NULL, &g_cs_qp))
             LOG("[RED] vulkan replay: DM_VK_CS_GPU requested, but compute timestamps are unavailable");
         else
-            LOG("vulkan compute GPU profile: timing at most %d dispatches per command buffer and %llu total; no submissions or waits are added",
-                CS_GPU_PER_SLOT, (unsigned long long)g_cs_limit);
+        {
+            const char *pg = getenv("DM_VK_PASS_GPU"); g_pass_gpu = pg && strcmp(pg, "0");
+            LOG("vulkan compute GPU profile: timing at most %d dispatches%s per command buffer and %llu total; no submissions or waits are added",
+                CS_GPU_PER_SLOT, g_pass_gpu ? " and render passes" : "", (unsigned long long)g_cs_limit);
+        }
     }
     // DM_VK_TEXDUMP=<dir>[:n]: the first n textures loaded from guest memory (16 by default, at most 64) as PNG files in dir, level 0 and layer 0
     const char *td = getenv("DM_VK_TEXDUMP");
@@ -407,7 +421,10 @@ static void rc_eval(const p_render_cond *rc) {
 // ---- textures ----
 static void tex_ready(VkCommandBuffer c, vtex *t);
 static VkCommandBuffer up_cb(void);
-static void rp_end(VkCommandBuffer c);
+static void rp_end_at(VkCommandBuffer c, int line);
+static void rp_end_keep_at(VkCommandBuffer c, int line);
+#define rp_end(c) rp_end_at((c), __LINE__)        // the line ends up in a timed pass's sample (DM_VK_PASS_GPU)
+#define rp_end_keep(c) rp_end_keep_at((c), __LINE__)
 static void pc_flush(VkCommandBuffer c);
 static vtex *tex_find(uint64_t serial) { for (sref *r = g_tab[serial % 4096]; r; r = r->next) if (r->serial == serial) return r->t; return NULL; }
 static void sref_add(uint64_t serial, vtex *t) {
@@ -1123,7 +1140,7 @@ static VkImageSubresourceRange view_range(const vtex *t, const view_t *v, int ha
 // ---- render passes over the bound render targets (step 3.4c) ----
 // Dynamic rendering begins at the first draw after the targets were set, and ends before anything that cannot be inside it (a clear, a target change, a barrier, the
 // submission's end), each end followed by a full barrier so the next pass or a sampling sees what was drawn
-static int g_rp_on, g_rp_ncolor, g_rp_samples, g_rp_drew; static uint32_t g_rp_w, g_rp_h, g_rp_layers; static uint64_t g_passes; static uint64_t g_ub_updates; static int g_passlog; static uint64_t g_pass0; static long g_passstop;
+static int g_rp_on, g_rp_ncolor, g_rp_samples, g_rp_drew, g_rp_tok = -1, g_rp_tok_slot = -1; static uint32_t g_rp_draws, g_rp_mesh; static uint32_t g_rp_w, g_rp_h, g_rp_layers; static uint64_t g_passes; static uint64_t g_ub_updates; static int g_passlog; static uint64_t g_pass0; static long g_passstop;
 typedef struct {
     uint8_t bound, resolved, dropped, view;
     uint64_t serial;
@@ -1223,9 +1240,15 @@ static void ubd_land(VkCommandBuffer c) {   // the deferred updates, in order, o
     }
     g_nubd = 0;
 }
-static void rp_end_keep(VkCommandBuffer c) {   // the pass ends and the deferred uniform updates land; pending clears stay pending
+static void rp_end_keep_at(VkCommandBuffer c, int line) {   // the pass ends and the deferred uniform updates land; pending clears stay pending
     if (!g_rp_on) return;
-    vkCmdEndRendering(c); final_remember(); g_rp_on = 0; g_rp_drew = 0; ubd_land(c); full_barrier(c);
+    vkCmdEndRendering(c);
+    if (g_rp_tok >= 0 && g_rp_tok_slot == g_cb_i && c == g_cb[g_cb_i]) {   // the pass's sample (DM_VK_PASS_GPU) ends after its store, and carries its draw counts
+        cs_gpu_meta *m = &g_cs_meta[g_cb_i][g_rp_tok]; m->draws = g_rp_draws; m->mesh = g_rp_mesh; m->indirect = (uint64_t)line;
+        vkCmdWriteTimestamp(c, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, g_cs_qp, cs_query(g_cb_i, g_rp_tok) + 1);
+    }
+    g_rp_tok = -1;
+    final_remember(); g_rp_on = 0; g_rp_drew = 0; ubd_land(c); full_barrier(c);
 }
 // ---- whole-attachment clears held for the next pass's load operation ----
 // NVN's ClearColor / ClearDepthStencil outside a scissor clear the whole target, and the game draws into it next. Recorded as vkCmdClear*Image the clear is
@@ -1268,7 +1291,7 @@ static VkImageAspectFlags pc_take(const vtex *t, uint32_t mip, uint32_t layer0, 
         return asp; }
     return 0;
 }
-static void rp_end(VkCommandBuffer c) { rp_end_keep(c); pc_flush(c); }
+static void rp_end_at(VkCommandBuffer c, int line) { rp_end_keep_at(c, line); pc_flush(c); }
 // A uniform binding [addr, addr + size) for the draw being prepared (vk_draw.c stage_set): 1 and a shadow in *b / *off when a deferred update overlaps it, else 0 (memory as bound)
 int vkr_ub_shadow(uint64_t addr, uint64_t size, VkBuffer *b, VkDeviceSize *off) {
     int hit = 0;
@@ -1396,6 +1419,9 @@ static int rp_begin(VkCommandBuffer c) {
     pc_flush(c);
     VkRenderingInfo ri = {.sType = VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea = {{0, 0}, {w, h}}, .layerCount = layers, .colorAttachmentCount = (uint32_t)nc, .pColorAttachments = ca,
         .pDepthAttachment = has_d ? &da : NULL, .pStencilAttachment = has_s ? &sa : NULL};
+    char pk[17]; snprintf(pk, sizeof pk, "%llx/%llx", at[0] ? (unsigned long long)at[0]->serial : 0ull, adt ? (unsigned long long)adt->serial : 0ull);   // colour 0 / depth serials
+    g_rp_tok = g_pass_gpu ? gpu_sample_begin(c, pk, w, h, (uint32_t)nc, 0, 1, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT) : -1;
+    g_rp_tok_slot = g_cb_i; g_rp_draws = g_rp_mesh = 0;
     vkCmdBeginRendering(c, &ri);
     g_rp_on = 1; g_rp_drew = 0; g_rp_ncolor = nc; g_rp_w = w; g_rp_h = h; g_rp_layers = layers; g_rp_samples = samples; g_passes++;
     if (g_passlog) {   // each colour slot: the texture's serial, '-' when the slot is empty, '!' after it when no view could be attached
@@ -1717,7 +1743,7 @@ void mtl_exec(const uint8_t *handle) {
                         LOG("[RED] vulkan replay: mesh/task draw (DrawMeshTasks%s) reached rendering but failed program preparation or command issue", ind ? "Indirect" : "");
                     break;
                 }
-                g_rp_drew = 1;
+                g_rp_drew = 1; g_rp_draws++; g_rp_mesh++;
                 g_cb_mesh_seq[g_cb_i] = mesh_seq;
                 if (mesh_log_on())
                     LOG("vulkan mesh command: issue=%llu recorded slot=%d prior-signal=%llu",
@@ -1740,7 +1766,7 @@ void mtl_exec(const uint8_t *handle) {
             if (g_rc_skip) break;
             if (g_passlog && g_passstop && g_passes - g_pass0 > (uint64_t)g_passstop) break;   // DM_VK_PASSSTOP: the traced frame's later passes draw nothing
             if (g_rp_on && rp_drop_set() != g_rp_drop) rp_end(c);   // another set of duplicate slots to leave out (rp_drop_set)
-            if (rp_begin(c) && vkx_draw(c, h.op, a, h.size, g_rp_ncolor, g_rp_w, g_rp_h, g_rp_samples)) g_rp_drew = 1; g_flush_draws++; break;
+            if (rp_begin(c) && vkx_draw(c, h.op, a, h.size, g_rp_ncolor, g_rp_w, g_rp_h, g_rp_samples)) { g_rp_drew = 1; g_rp_draws++; } g_flush_draws++; break;
         case OP_BARRIER: rp_end_keep(c); full_barrier(c); break;   // orders work, reads nothing: pending clears stay
         case OP_COPY_T2T: op_copy_t2t(c, a); break;
         case OP_COPY_B2T: op_copy_bt(c, a, 1); break;
