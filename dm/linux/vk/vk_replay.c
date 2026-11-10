@@ -23,6 +23,7 @@
 #include "vk_tex_lifetime.h"
 int nvn_dpool_base(const void *pool, int tex);   // hle_nvn.c: a descriptor pool's ID base
 #include "../gfx/nvn/nvn_obj.h"
+#include "../gfx/nvn/nvn_queue.h"
 #include "../gfx/nvn/nvn_hmap.h"
 #include "../gfx/nvn/nvn_dirty.h"
 #include "../gfx/nvn/nvn_timestamp.h"
@@ -41,6 +42,8 @@ pthread_mutex_t g_tmu = PTHREAD_MUTEX_INITIALIZER;
 typedef struct sref { uint64_t serial; vtex *t; struct sref *next; } sref;
 static sref *g_tab[4096]; static vtex *g_stab[4096]; static vtex *g_dead;
 static nvn_hmap g_tex_live = {.klen = 8};   // serial -> the NVNtexture passed to Initialize, under g_tmu
+typedef struct { unsigned refs; tex_t snapshot; } tex_pin;
+static nvn_hmap g_tex_pins = {.klen = 8};   // queued descriptor snapshots, under g_tmu
 static uint32_t stor_hash(const uint8_t *mem, const nvn_texdesc *d) { uint64_t h = (uint64_t)(uintptr_t)mem >> 6; h ^= (uint64_t)d->width * 31 + d->height * 131 + (uint64_t)d->format * 7919 + (uint64_t)d->target * 104729; return (uint32_t)(h ^ h >> 13) % 4096; }
 static VkSemaphore g_tl; static _Atomic uint64_t g_fence;
 static VkCommandPool g_pool; static VkCommandBuffer g_cb[CB_RING]; static _Atomic uint64_t g_cb_val[CB_RING]; static int g_cb_i = -1, g_cb_n = CB_RING, g_open;
@@ -294,6 +297,7 @@ static int wait_value(uint64_t v, uint64_t timeout_ns) { return wait_value_named
 // Deluxe's "Select a Mii" waited for such values to build its list: with them dropped, it stayed empty and took no input
 typedef struct { uint64_t at; int kind, slot, q; volatile uint32_t *val; uint32_t mode, v; uint64_t addr, type; } gpost;   // kind 1: event (mode 1 adds), 2: counter report; slot: the command buffer recorded in; q: the report's own timestamp query in that slot (seg_ts), -1 none
 static gpost *g_gp; static size_t g_gpn, g_gpcap; static pthread_mutex_t g_gpmu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_gpcv = PTHREAD_COND_INITIALIZER;
+static _Atomic uint64_t g_post_done;   // highest physical fence whose CPU-visible post effects have all landed
 // A counter report's time is the GPU time of the submission part it was recorded in, as nvn_mtl.m's segment clock gives it: TIMESTAMP_TOP (0x10) the part's start, any other
 // type its end, from the part's timestamp queries (g_qp), placed on the guest clock against the newest part written now. Breath of the Wild measures its GPU time with a top
 // report at the start of a frame and another at its end, and scales its resolution down when that passes 175% of a 60 Hz frame (main+0x1267070): with one time for all of
@@ -347,7 +351,7 @@ static void gp_run(uint64_t done) {   // writes everything the GPU is done with
     for (size_t i = 0; i < g_gpn && g_gp[i].at <= done; i++) { uint64_t a, b; if (g_gp[i].kind == 2 && gp_span(g_gp[i].slot, &a, &b) && b > ref) ref = b; }
     for (; k < g_gpn && g_gp[k].at <= done; k++) {
         const gpost *o = &g_gp[k];
-        if (o->kind == 1) { if (o->mode == 1) *o->val += o->v; else *o->val = o->v; continue; }
+        if (o->kind == 1) { nvn_event_publish_gpu(o->val, o->mode, o->v, o->at); continue; }
         uint64_t ns = now, a, b;
         if (ref && gp_span(o->slot, &a, &b)) { uint64_t at = o->type == 0x10 ? a : b, own;
             if (seg_tick(o->slot, o->q, &own) && own <= ref) at = own;   // its own place in the part
@@ -356,7 +360,10 @@ static void gp_run(uint64_t done) {   // writes everything the GPU is done with
         uint64_t t = nvn_timestamp_from_ns(ns), rec[2] = {vkr_counter_value(o->type, t, DM_GAME_RENDER_COND, NVN_COUNTER_TYPE_SAMPLES_PASSED), t}; memcpy((void *)(uintptr_t)o->addr, rec, sizeof rec);   // render_cond: a timestamp's counter field is 0, as on the GPU (rc_value)
     }
     if (k) { memmove(g_gp, g_gp + k, (g_gpn - k) * sizeof *g_gp); g_gpn -= k; }
+    uint64_t published = atomic_load_explicit(&g_post_done, memory_order_relaxed);
+    while (published < done && !atomic_compare_exchange_weak_explicit(&g_post_done, &published, done, memory_order_release, memory_order_relaxed)) {}
     pthread_mutex_unlock(&g_gpmu);
+    nvn_queue_gpu_progress();
 }
 static void *gp_thread(void *arg) {
     (void)arg;
@@ -426,13 +433,20 @@ static void rp_end_keep_at(VkCommandBuffer c, int line);
 #define rp_end(c) rp_end_at((c), __LINE__)        // the line ends up in a timed pass's sample (DM_VK_PASS_GPU)
 #define rp_end_keep(c) rp_end_keep_at((c), __LINE__)
 static void pc_flush(VkCommandBuffer c);
+static void stor_unlink(vtex *t);
+static void tex_retire(vtex *t);
 static vtex *tex_find(uint64_t serial) { for (sref *r = g_tab[serial % 4096]; r; r = r->next) if (r->serial == serial) return r->t; return NULL; }
 static void sref_add(uint64_t serial, vtex *t) {
     if (!vkx_image_serial_ref_add(&t->refs, &t->serial_refs,
-                                  nvn_hm_get(&g_tex_live, &serial) != NULL)) return;
+                                  nvn_hm_get(&g_tex_live, &serial) != NULL || nvn_hm_get(&g_tex_pins, &serial) != NULL)) return;
     sref *r = calloc(1, sizeof *r);
     if (!r) { vkx_image_serial_ref_drop(&t->refs, &t->serial_refs); return; }
     r->serial = serial; r->t = t; r->next = g_tab[serial % 4096]; g_tab[serial % 4096] = r;
+}
+static void sref_drop_serial(uint64_t serial) {
+    sref **p = &g_tab[serial % 4096]; while (*p && (*p)->serial != serial) p = &(*p)->next;
+    if (*p) { sref *r = *p; vtex *t = r->t; *p = r->next; free(r); vkx_image_serial_ref_drop(&t->refs, &t->serial_refs);
+        if (!t->refs && !t->kmem) { stor_unlink(t); tex_retire(t); } }
 }
 static void sref_drop_all(vtex *t) {
     for (int h = 0; h < 4096; h++) for (sref **p = &g_tab[h]; *p;) {
@@ -939,6 +953,23 @@ void mtl_tex_init(const tex_t *t) {
     nvn_hm_put(&g_tex_live, &t->serial, (void *)t);
     pthread_mutex_unlock(&g_tmu);
 }
+void mtl_tex_pin(const tex_t *t) {
+    if (!t || !t->serial) return;
+    pthread_mutex_lock(&g_tmu);
+    tex_pin *pin = nvn_hm_get(&g_tex_pins, &t->serial);
+    if (!pin) { pin = calloc(1, sizeof *pin); if (!pin) die("vulkan queued texture pin allocation failed"); pin->snapshot = *t; nvn_hm_put(&g_tex_pins, &t->serial, pin); }
+    pin->refs++;
+    pthread_mutex_unlock(&g_tmu);
+}
+void mtl_tex_unpin(uint64_t serial) {
+    if (!serial) return;
+    pthread_mutex_lock(&g_tmu); tex_pin *pin = nvn_hm_get(&g_tex_pins, &serial);
+    if (pin && !--pin->refs) {
+        nvn_hm_del(&g_tex_pins, &serial); free(pin);
+        if (!nvn_hm_get(&g_tex_live, &serial)) sref_drop_serial(serial);
+    }
+    pthread_mutex_unlock(&g_tmu);
+}
 int vkr_tex_gpu_owned(uint64_t serial) {
     pthread_mutex_lock(&g_tmu);
     vtex *t = tex_find(serial); int owned = t && t->gpu_owned;
@@ -977,10 +1008,7 @@ void mtl_tex_release(tex_t *o) {
     const tex_t *owner = nvn_hm_get(&g_tex_live, &o->serial);
     if (vkx_tex_release_is_copy(owner, o)) { pthread_mutex_unlock(&g_tmu); return; }
     nvn_hm_del(&g_tex_live, &o->serial);
-    sref **p = &g_tab[o->serial % 4096];
-    while (*p && (*p)->serial != o->serial) p = &(*p)->next;
-    if (*p) { sref *r = *p; vtex *t = r->t; *p = r->next; free(r); vkx_image_serial_ref_drop(&t->refs, &t->serial_refs);
-        if (!t->refs && !t->kmem) { stor_unlink(t); tex_retire(t); } }   // with storage it stays for the next object over it
+    if (!nvn_hm_get(&g_tex_pins, &o->serial)) sref_drop_serial(o->serial);   // with storage it stays for the next object over it
     pthread_mutex_unlock(&g_tmu);
 }
 
@@ -1115,6 +1143,7 @@ uint64_t mtl_sub_commit(void) {
     if (g_ndump) dump_uploads(v);
     return v;
 }
+uint64_t mtl_completed_fence(void) { return atomic_load_explicit(&g_post_done, memory_order_acquire); }
 uint64_t mtl_last_fence(void) { return atomic_load(&g_fence); }
 int mtl_wait(uint64_t fence, uint64_t timeout_ns) { if (g_on <= 0) return 1; if (!wait_value(fence, timeout_ns)) return 0; gp_run(done_value()); return 1; }
 int mtl_wait_acq(uint64_t fence, uint64_t timeout_ns) { return mtl_wait(fence, timeout_ns); }

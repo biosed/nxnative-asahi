@@ -267,6 +267,14 @@ Games read this count as a position in their own command memory and size their h
 
 ## Queues and syncs
 
+### GPU event and sync waits order logical queues
+
+- **Symptom:** a producer and consumer submitted on different NVN queues run in CPU-arrival order, causing stale lighting, exposure or shared-buffer data. A synchronous readback can hide the problem by accidentally serializing the work.
+- **Cause:** the Linux route treated `nvnQueueWaitSync`, `nvnCommandBufferWaitSync` and `nvnCommandBufferWaitEvent` as no-ops. One physical Vulkan queue preserves the order in which work is encoded, but it cannot infer that a consumer submitted first must wait for a producer submitted later on another logical NVN queue.
+- **Fix:** `nvn_queue.inc` snapshots submitted records and their program/texture descriptors, then replays ready continuations on the single Vulkan queue. An unresolved dependency parks only its logical queue. Exact queued event writes can release a consumer at encode time; an additive signal waits until its result lands. Logical sync receipts carry their producer's physical fence, signals do not split a command buffer, and queue switches restore persistent draw and render-target state. GPU completion publishes all CPU-visible event effects before retiring the queued-write guards.
+- **Check:** Linux's device-free `t_nvn_queue` covers a consumer submitted before its producer, exact-write versus additive signals, a never-fenced sync, multiple signals in one physical submission, same-fence event publication, and render-target restoration across queue switches. `t_nvn_capture` verifies that capture format 1 rejects dependencies or multiple logical queues instead of recording an incorrect physical order. Passing these checks does not replace a guarded hardware route.
+- **Found on:** [The Legend of Zelda: Ocarina of Time](../../dm/games/0400486024DEC000/README.md#open). Its traced lighting and exposure work has explicit cross-queue event dependencies; the scheduler contains no title or shader-key check.
+
 ### Bindings belong to each queue
 
 - **Symptom:** choosing X-2 after the collection launcher crashes in `keys_hash`, reading control address `0x8000000000`; the program object now contains command-buffer data.
@@ -287,14 +295,14 @@ Games read this count as a position in their own command memory and size their h
 
 - **Symptom:** `nvnCommandBufferFenceSync` unimplemented, every `SyncWait` timed out at once.
 - **Cause:** Pokémon Legends: Z-A fences once per frame from a command buffer and waits on it; Unreal's RHI records the call in its command buffers too.
-- **Fix:** a record (`OP_FENCE_SYNC`) fences the sync at replay with the fence value of the submission segment being encoded, so it signals once everything before it has completed (the replay fences the sync with the submission that reaches it).
+- **Fix:** on the Linux Vulkan route a record (`OP_FENCE_SYNC`) establishes a logical receipt at submit. Replay publishes its physical fence only after preceding commands on that logical queue have been encoded, so a dependency parked ahead of the fence cannot be bypassed by unrelated work on another queue. Other routes fence the submission segment that reaches the record.
 - **Found on:** [Pokémon Legends: Z-A](../../dm/games/0100F43008C44000/README.md) (19.3.11; one boot); [Octopath Traveler 0](../../dm/games/01005270232F2000/README.md) (new with Unreal).
 
 ### Submissions from two queues on two threads
 
 - **Symptom:** `FATAL submit re-entered` in the first frames.
 - **Cause:** the game initializes two NVN queues and submits on both from two threads, while the Metal replay keeps one command buffer for the submission in progress.
-- **Fix:** `nvnQueueSubmitCommands` now holds a lock across the replay (`g_sub_mu` in `hle_nvn.c`). It takes the lock before the graphics gate ([Going to the background during the prepare step](#going-to-the-background-during-the-prepare-step)).
+- **Fix:** ready continuations replay under one lock (`g_sub_mu` in `hle_nvn.c`); submission snapshots its command stream and descriptors under that lock. Queue dependencies determine which continuation can run ([GPU event and sync waits](#gpu-event-and-sync-waits-order-logical-queues)). The lock is taken before the graphics gate ([Going to the background during the prepare step](#going-to-the-background-during-the-prepare-step)).
 - **Found on:** [Fire Emblem: Three Houses](../../dm/games/010055D009F78000/README.md).
 
 ### Going to the background during the prepare step

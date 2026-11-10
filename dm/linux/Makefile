@@ -14,7 +14,7 @@ OUT := gen/$(GAME)
 GAME_GEN := $(HOST)/gen/$(GAME)
 GAME_DIR := $(if $(wildcard ../games/$(GAME)/game.tsv),../games/$(GAME),$(GAME_GEN)/profile)
 
-CPPFLAGS := -D_GNU_SOURCE -include compat/dm_compat.h -Icompat -I$(HOST) \
+CPPFLAGS := -D_GNU_SOURCE -DDM_LINUX -include compat/dm_compat.h -Icompat -I$(HOST) \
             -I../gfx/nvn -I../gfx/nvn/include -I../third_party/vulkan-headers/include \
             -I$(GAME_GEN) -I$(GAME_DIR)
 CFLAGS := -std=gnu11 -MMD -MP -O2 -g -fPIC -fvisibility=hidden -Wall -Wextra \
@@ -38,7 +38,7 @@ OBJ := $(NVN_OBJ) \
        $(patsubst %,$(OUT)/obj/linux/%.o,$(NULL_SRC))
 
 .DEFAULT_GOAL := null-renderer
-.PHONY: profile null-renderer vulkan-replay-objects nxasahi-renderer-objects nxasahi-renderer nxasahi-front vulkan-selftest vk-mem-selftest t_push t_skipcs t_gpstamp t_focus t_front_input t_gmem_trace t_missing_log t_counter_report t_vk_stage t_vk_compile_watch t_vk_format t_vk_cs_gpu_lifecycle t_vk_image_refs t_vk_gmem_map t_vk_bindless_lru t_vk_mesh t_vk_mesh_compile t_vk_descriptor_pool t_vk_mesh_coverage t_vk_shader_resolve t_vk_movie dmhost dmhost-vulkan t_fs_linux clean
+.PHONY: profile null-renderer vulkan-replay-objects nxasahi-renderer-objects nxasahi-renderer nxasahi-front vulkan-selftest vk-mem-selftest t_push t_skipcs t_gpstamp t_focus t_front_input t_gmem_trace t_missing_log t_counter_report t_nvn_capture t_nvn_queue t_vk_stage t_vk_compile_watch t_vk_format t_vk_cs_gpu_lifecycle t_vk_image_refs t_vk_gmem_map t_vk_bindless_lru t_vk_mesh t_vk_mesh_compile t_vk_descriptor_pool t_vk_mesh_coverage t_vk_shader_resolve t_vk_movie dmhost dmhost-vulkan t_fs_linux clean
 
 # The consolidated asahi branch also carries the Linux host. Keep its object
 # namespace and rules separate so renderer-only checks remain bounded and a
@@ -150,6 +150,16 @@ $(OUT)/t_counter_report: vk/tests/t_counter_report.c vk/vk_counter_report.h | pr
 	@mkdir -p $(dir $@)
 	$(CC) $(CPPFLAGS) -std=gnu11 -O1 -g -Wall -Wextra -Werror -Ivk -o $@ $<
 t_counter_report: $(OUT)/t_counter_report
+	$<
+$(OUT)/t_nvn_capture: ../gfx/tests/t_capture.c ../gfx/nvn/nvn_capture.c ../gfx/nvn/nvn_capture.h ../gfx/nvn/nvn_obj.h | profile
+	@mkdir -p $(dir $@)
+	$(CC) $(CPPFLAGS) -std=gnu11 -O1 -g -Wall -Wextra -Wno-unused-function -o $@ ../gfx/tests/t_capture.c ../gfx/nvn/nvn_capture.c
+t_nvn_capture: $(OUT)/t_nvn_capture
+	$<
+$(OUT)/t_nvn_queue: vk/tests/t_nvn_queue.c ../gfx/nvn/nvn_queue.inc ../gfx/nvn/nvn_queue.h ../gfx/nvn/nvn_capture.h ../gfx/nvn/nvn_obj.h | profile
+	@mkdir -p $(dir $@)
+	$(CC) $(CPPFLAGS) -std=gnu11 -O1 -g -Wall -Wextra -Werror -Ivk -pthread -o $@ $<
+t_nvn_queue: $(OUT)/t_nvn_queue
 	$<
 $(OUT)/t_vk_stage: vk/tests/t_vk_stage.c vk/vk_stage.h | profile
 	@mkdir -p $(dir $@)
