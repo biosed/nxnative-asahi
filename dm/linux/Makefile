@@ -17,7 +17,7 @@ GAME_DIR := $(if $(wildcard ../games/$(GAME)/game.tsv),../games/$(GAME),$(GAME_G
 CPPFLAGS := -D_GNU_SOURCE -include compat/dm_compat.h -Icompat -I$(HOST) \
             -I../gfx/nvn -I../gfx/nvn/include -I../third_party/vulkan-headers/include \
             -I$(GAME_GEN) -I$(GAME_DIR)
-CFLAGS := -std=gnu11 -MMD -MP -O1 -g -fPIC -fvisibility=hidden -Wall -Wextra \
+CFLAGS := -std=gnu11 -MMD -MP -O2 -g -fPIC -fvisibility=hidden -Wall -Wextra \
           -Wno-unused-function -Wno-format -Wno-deprecated-declarations
 
 NVN_SRC := ../gfx/hle_nv.c ../gfx/hle_vi.c \

@@ -17,7 +17,7 @@ RUNTIME_OBJ := $(OUT)/obj/runtime
 GAME_DIR := ../games/$(GAME)
 GAME_H := $(OUT)/game_profile.h
 
-CFLAGS := -MMD -MP -O1 -g -fPIE -fvisibility=hidden -D_GNU_SOURCE \
+CFLAGS := -MMD -MP -O2 -g -fPIE -fvisibility=hidden -D_GNU_SOURCE \
 	-Wall -Wno-unused-function -Wno-format -Wno-incompatible-pointer-types-discards-qualifiers \
 	-include compat/dm_compat.h -Icompat -Isrc -I$(HOST) -I../gfx/nvn \
 	-I../gfx/nvn/include -I../third_party/vulkan-headers/include -I$(OUT) \
