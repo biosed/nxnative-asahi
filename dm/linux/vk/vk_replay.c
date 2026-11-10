@@ -818,7 +818,8 @@ void mtl_reg_tex(int id, const tex_t *t, const view_t *v) {
     if (t && (t->d.flags & NVN_TEXTURE_FLAGS_LINEAR)) {
         size_t had = g_lin.n;
         if (t->mem && !vkr_lin_note(&g_lin, id, t->serial)) LOG("[RED] vulkan replay: no memory to track LINEAR texture %llu", (unsigned long long)t->serial);
-        static int logged; if ((g_lin.n != had || !t->mem) && logged < 32) { logged++;
+        static int log_linear = -1, logged; if (log_linear < 0) { const char *e = getenv("DM_VK_LINEAR_LOG"); log_linear = e && atoi(e) != 0; }
+        if (log_linear && (g_lin.n != had || !t->mem) && logged < 32) { logged++;
             LOG("vulkan replay: LINEAR texture %llu registered as ID %d, %ux%u format %#x%s; %zu tracked", (unsigned long long)t->serial, id, t->d.width, t->d.height, t->d.format, t->mem ? "" : " WITHOUT guest memory (not refreshed)", g_lin.n); }
     }
     reg_dirty(id, VKR_BINDLESS_TEXTURES, &g_tdirty, &g_ntdirty, &g_ctdirty, g_tdflag, "texture");
@@ -875,9 +876,9 @@ int vkr_bindless_evict_old_speculative(uint64_t registered_before, int *ids,
 }
 // ---- textures the CPU writes after the replay first loaded them ----
 // A texture a draw names by a bind (OP_BIND_TEX) or a per-stage binding is checked against the dirty clock each time (tex_sampled). One sampled through the
-// bindless pool (set 1) is loaded once, when its ID is registered, and was never looked at again: Ocarina of Time registers its dialogue glyph cache
-// (2048x8192 R8, LINEAR, rasterized by the font engine on the CPU) while it is still blank and samples it only through the pool, so every message window was
-// empty while the HUD's directly bound text drew. Two sources, both applied on the replay thread before a submission's first draw (vkr_cpu_written_refresh):
+// bindless pool (set 1) is loaded when its ID is registered and otherwise was never looked at again. LINEAR textures can be rasterized by a font engine on
+// the CPU after registration (Mario Wonder's 2048x8192 R8 glyph cache is one example), so stale pool images can leave their consumers blank. Two sources,
+// both applied on the replay thread before a submission's first draw (vkr_cpu_written_refresh):
 //  - mtl_tex_cpu_written (hle_nvn.c: WriteTexels, a flushed or polled range over a texture's storage), which this host answered with an empty stub;
 //  - LINEAR textures registered in the pool, which hle_nvn.c leaves out of that tracking because Metal maps them over the pool's bytes: here they are images
 //    of their own, so each is checked against the dirty clock when it has moved (upload_ re-uploads only the rows of the pages written).
@@ -899,12 +900,18 @@ void vkr_cpu_written_refresh(void) {   // on the replay thread, the submission's
     tex_t *w = NULL; size_t nw = 0;
     pthread_mutex_lock(&g_cwmu); if (g_cwn) { w = malloc(g_cwn * sizeof *w); if (w) { memcpy(w, g_cw, g_cwn * sizeof *w); nw = g_cwn; g_cwn = 0; } } pthread_mutex_unlock(&g_cwmu);
     static uint64_t clock_seen; uint64_t now = nvn_dirty_now();
-    if (now != clock_seen) { clock_seen = now;
-        pthread_mutex_lock(&g_rmu);
-        vkr_lin_prune(&g_lin, lin_live, NULL);
-        if (g_lin.n > lcap) { tex_t *q = realloc(lin, g_lin.n * sizeof *q); if (q) { lin = q; lcap = g_lin.n; } }
-        for (size_t i = 0; i < g_lin.n && nl < lcap; i++) lin[nl++] = g_treg[g_lin.e[i].id].t;
-        pthread_mutex_unlock(&g_rmu); }
+    if (now != clock_seen) for (;;) {
+        pthread_mutex_lock(&g_rmu); vkr_lin_prune(&g_lin, lin_live, NULL); size_t need = g_lin.n; pthread_mutex_unlock(&g_rmu);
+        if (need > lcap) {
+            tex_t *q = realloc(lin, need * sizeof *q);
+            if (!q) { static int logged; if (!logged++) LOG("[RED] vulkan replay: no memory to snapshot %zu LINEAR registrations; will retry", need); break; }
+            lin = q; lcap = need;
+        }
+        pthread_mutex_lock(&g_rmu); vkr_lin_prune(&g_lin, lin_live, NULL);
+        if (g_lin.n > lcap) { pthread_mutex_unlock(&g_rmu); continue; }
+        for (size_t i = 0; i < g_lin.n; i++) if (vkr_lin_first_serial(&g_lin, i)) lin[nl++] = g_treg[g_lin.e[i].id].t;
+        pthread_mutex_unlock(&g_rmu); clock_seen = now; break;
+    }
     if (!nw && !nl) return;
     uint64_t before = g_cw_refreshed + g_cw_linear;
     pthread_mutex_lock(&g_tmu);
