@@ -601,13 +601,14 @@ static vks *shader_get(const prog_t *p, int idx) {
 }
 
 // ---- resources ----
-static VkBuffer g_zero, g_support; static VkDeviceMemory g_zero_m, g_support_m;
+static VkBuffer g_zero, g_sink, g_support; static VkDeviceMemory g_zero_m, g_sink_m, g_support_m;
 static VkImage g_dimg[6]; static VkImageView g_dview[6]; static VkDeviceMemory g_dmem[6]; static VkSampler g_dsamp;
 static int g_res_ready;
 // Dummies: a zero buffer, and a 1x1 zero image of each view type (1D/2D as 2D, 2D array, 3D, cube, cube array), cleared and in GENERAL layout before the first use
 static void res_init(VkCommandBuffer c) {
     if (g_res_ready) return; g_res_ready = 1;
     buffer_with(NULL, 65536, &g_zero, &g_zero_m);
+    buffer_with(NULL, 65536, &g_sink, &g_sink_m);
     float sup[16384] = {0}; for (int i = 0; i < 73; i++) sup[(192 + 16 * i) / 4] = 1.0f;   // render_scale = 1 (Ryujinx SupportBuffer, as nvn_mtl.m support_buf)
     buffer_with(sup, sizeof sup, &g_support, &g_support_m);
     for (int k = 0; k < 6; k++) {
@@ -1169,7 +1170,7 @@ static VkDescriptorSet stage_set(int st, vks *s) {
             else g_miss[M_OTHER]++;
         } else if (b->desc == 's') {
             w->descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w->pBufferInfo = &bi[nw];
-            bi[nw] = (VkDescriptorBufferInfo){g_zero, 0, 65536};
+            bi[nw] = (VkDescriptorBufferInfo){g_sink, 0, 65536};
             const bbuf *u = (b->k == BK_SBUF) && b->reg >= 0 && b->reg < 16 ? &S.ssbo[st][b->reg] : (b->k == BK_UBO_PTR) && b->reg >= 0 && b->reg < 16 ? &S.ubo[st][b->reg] : NULL;
             int ok = b->k == BK_GMEM_MAP ? gmem_map_fill(&bi[nw]) : b->k == BK_GMEM_LOG ? gmem_log_fill(s, &bi[nw])
                    : u && buf_desc(u->addr, u->size, 16, 0x7fffffff, &bi[nw]); if (!ok) g_miss[M_SBUF]++;
