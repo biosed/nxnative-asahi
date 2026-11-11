@@ -191,7 +191,7 @@ $(OUT)/t_vk_bindless_lru: vk/tests/t_vk_bindless_lru.c vk/vk_bindless_lru.h | pr
 t_vk_bindless_lru: $(OUT)/t_vk_bindless_lru
 	$<
 
-$(OUT)/t_vk_format: vk/tests/t_vk_format.c vk/vk_replay.h vk/vk_fmt.c vk/vk_fmt.h ../gfx/tex/nvn_fmt_mtl.c ../gfx/tex/nvn_fmt_mtl.h | profile
+$(OUT)/t_vk_format: vk/tests/t_vk_format.c vk/vk_replay.h vk/vk_fmt.c vk/vk_fmt.h vk/vk_swizzle.h ../gfx/tex/nvn_fmt_mtl.c ../gfx/tex/nvn_fmt_mtl.h | profile
 	@mkdir -p $(dir $@)
 	$(CC) $(CPPFLAGS) -std=gnu11 -O1 -g -Wall -Wextra -Werror -Ivk $$($(PKG_CONFIG) --cflags vulkan) -o $@ vk/tests/t_vk_format.c vk/vk_fmt.c ../gfx/tex/nvn_fmt_mtl.c
 t_vk_format: $(OUT)/t_vk_format

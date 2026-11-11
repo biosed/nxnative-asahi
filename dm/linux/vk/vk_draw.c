@@ -9,6 +9,7 @@
 #include "dm.h"
 #include "vk_dev.h"
 #include "vk_fmt.h"
+#include "vk_swizzle.h"
 #include "vk_mem.h"
 #include "vk_replay.h"
 #include "spv_reflect.h"
@@ -665,16 +666,10 @@ static VkSampler sampler_get(const samp_par *p) {
 }
 // The components a sampled texture reads: the format's own (formats without alpha read a as 1 and so on, vk_fmt.c), then the texture's swizzle from its builder
 // (TextureBuilderSetSwizzle: 3 bits per component, 0 zero 1 one 2 R 3 G 4 B 5 A), then the view's (TextureView SetSwizzle), each picking from what the one before gives
-static VkComponentSwizzle swz_pick(int sel, const VkComponentSwizzle base[4]) {
-    switch (sel) { case 0: return VK_COMPONENT_SWIZZLE_ZERO; case 1: return VK_COMPONENT_SWIZZLE_ONE; case 2: case 3: case 4: case 5: return base[sel - 2]; default: return VK_COMPONENT_SWIZZLE_IDENTITY; }
-}
 static VkComponentMapping tex_swizzle(const tex_t *o, const view_t *v, int has_v) {
     VkComponentMapping m; vkf_from_nvn(o->d.format, NULL, &m);
-    VkComponentSwizzle c[4] = {m.r == VK_COMPONENT_SWIZZLE_IDENTITY ? VK_COMPONENT_SWIZZLE_R : m.r, m.g == VK_COMPONENT_SWIZZLE_IDENTITY ? VK_COMPONENT_SWIZZLE_G : m.g,
-                               m.b == VK_COMPONENT_SWIZZLE_IDENTITY ? VK_COMPONENT_SWIZZLE_B : m.b, m.a == VK_COMPONENT_SWIZZLE_IDENTITY ? VK_COMPONENT_SWIZZLE_A : m.a};
-    if (o->set_swz) { VkComponentSwizzle n[4]; for (int i = 0; i < 4; i++) n[i] = swz_pick((o->swz >> (3 * i)) & 7, c); memcpy(c, n, sizeof c); }
-    if (has_v && v->set_swizzle) { VkComponentSwizzle n[4]; for (int i = 0; i < 4; i++) n[i] = swz_pick(v->swz[i], c); memcpy(c, n, sizeof c); }
-    return (VkComponentMapping){c[0], c[1], c[2], c[3]};
+    return vkx_swizzle_compose(m, o->set_swz, o->swz, has_v, has_v && v->set_swizzle,
+                               has_v ? v->swz : NULL);
 }
 // A view of an image as the shader declares it (dim / arrayed from its binding), cached on the image (under g_tmu)
 static VkImageView view_get(vtex *t, const vkbind *b, const tex_t *o, const view_t *ov, int has_v) {
@@ -1192,14 +1187,25 @@ static VkDescriptorSet stage_set(int st, vks *s) {
             else if ((b->sk == BS_SAMP_ID)) sid = b->sreg;
             else if ((b->sk == BS_SAMP_UBO)) { uint32_t hw = ubo_word(st, b->sreg, b->soff); sid = (int)(hw >> 20); }
             if (sid && (b->sk != BS_SAMP_ID) && (b->k == BK_TEX_UBO)) sid += S.samp_base;
-            tex_t o; view_t v; int hv;
+            tex_t o; view_t v; int hv, have_treg = 0;
             vtex *tt = NULL;
             if (!tid) g_miss[M_TEX]++;
-            else if (!vkr_treg(tid, &o, &v, &hv)) g_miss[M_TEXREG]++;
+            else if (!(have_treg = vkr_treg(tid, &o, &v, &hv))) g_miss[M_TEXREG]++;
             else { vtex *t = tt = vkr_tex_sampled(&o, VK_NULL_HANDLE); VkImageView iv = t ? view_get(t, b, &o, &v, hv) : VK_NULL_HANDLE; if (iv) ii[nw].imageView = iv; else g_miss[M_TEX]++; }
             if (g_trace) LOG("[pass]     stage %d %s binding %u slot %d: texture ID %d serial %llu %ux%u fmt %#x target %d, sampler ID %d; image of serial %llu, %s, storage %p", st, b->kind, b->b, b->reg, tid,
-                             tid && vkr_treg(tid, &o, &v, &hv) ? (unsigned long long)o.serial : 0ull, tid ? o.d.width : 0, tid ? o.d.height : 0, tid ? o.d.format : 0, tid ? o.d.target : -1, sid,
+                             have_treg ? (unsigned long long)o.serial : 0ull, have_treg ? o.d.width : 0, have_treg ? o.d.height : 0, have_treg ? o.d.format : 0, have_treg ? o.d.target : -1, sid,
                              tt ? (unsigned long long)tt->serial : 0ull, !tt ? "none" : tt->gpu_owned ? "GPU-written" : tt->uploaded ? "loaded" : "never written", tt ? (const void *)tt->kmem : NULL);
+            if (g_trace && have_treg) {
+                VkComponentMapping fm; vkf_from_nvn(o.d.format, NULL, &fm); fm = vkx_swizzle_explicit(fm);
+                VkComponentMapping em = tex_swizzle(&o, &v, hv);
+                LOG("[pass]       swizzle format-map %s%s%s%s; builder %s %s%s%s%s; view %s %s%s%s%s; effective %s%s%s%s",
+                    vkx_swizzle_name(fm.r), vkx_swizzle_name(fm.g), vkx_swizzle_name(fm.b), vkx_swizzle_name(fm.a),
+                    o.set_swz ? "set" : "unset", vkx_nvn_swizzle_name(o.swz), vkx_nvn_swizzle_name(o.swz >> 3),
+                    vkx_nvn_swizzle_name(o.swz >> 6), vkx_nvn_swizzle_name(o.swz >> 9),
+                    !hv ? "absent" : v.set_swizzle ? "set" : "unset", hv ? vkx_nvn_swizzle_name(v.swz[0]) : "-",
+                    hv ? vkx_nvn_swizzle_name(v.swz[1]) : "-", hv ? vkx_nvn_swizzle_name(v.swz[2]) : "-", hv ? vkx_nvn_swizzle_name(v.swz[3]) : "-",
+                    vkx_swizzle_name(em.r), vkx_swizzle_name(em.g), vkx_swizzle_name(em.b), vkx_swizzle_name(em.a));
+            }
             samp_par sp; if (sid && vkr_sreg(sid, &sp)) ii[nw].sampler = sampler_get(&sp); else g_miss[M_SAMP]++;
         } else if (b->desc == 'i') {
             w->descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; w->pImageInfo = &ii[nw];
