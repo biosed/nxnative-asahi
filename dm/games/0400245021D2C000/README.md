@@ -67,7 +67,7 @@ From `save_ref`: at 72 s `A`, 8 s later `A`, 14 s later the book is open at Chap
 - [A guarded load whose destination is its address](../../../docs/reference/shaders.md#a-guarded-load-whose-destination-is-its-address): the scene's instance data read at index 0.
 - [Texture and sampler words in either order](../../../docs/reference/shaders.md#texture-and-sampler-words-in-either-order): the G-buffer bound as dummies, a black picture.
 - [Buffer textures behind handles in uniform buffers, and rows of finalized descriptors](../../../docs/reference/rendering.md#buffer-textures-behind-handles-in-uniform-buffers-and-rows-of-finalized-descriptors): flat-coloured objects, and a new Metal texture per bind.
-- [A deferred write under a false guard](../../../docs/reference/shaders.md#a-deferred-write-under-a-false-guard): the white-out from bloom.
+- [Deferred register writes under a guard (Ampere scoreboards)](../../../docs/reference/shaders.md#deferred-register-writes-under-a-guard-ampere-scoreboards): the white-out from bloom.
 - [Ampere forms with a handle in a register, and SURED's other operations](../../../docs/reference/shaders.md#ampere-forms-with-a-handle-in-a-register-and-sureds-other-operations).
 - [TXD through a uniform register kept no handle](../../../docs/reference/shaders.md#txd-through-a-uniform-register-kept-no-handle): reads deleted in 14,079 shaders the playtests have not reached.
 - [Layer entry points with the point size passed by reference](../../../docs/reference/shaders.md#layer-entry-points-with-the-point-size-passed-by-reference): 38 vertex shaders without them.

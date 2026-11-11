@@ -336,12 +336,13 @@ namespace Ryujinx.Graphics.Shader.Translation
         // Scoreboards: a variable-latency instruction (one that sets a write barrier, control bits 110..113; 7 = none) writes its registers when the result
         // arrives, and the compiler lets later instructions that do not wait on that barrier (wait mask, bits 116..122) read the registers' old values (LDG R2,
         // [R2.64] then LDG R4, [R2.64 + 4] reads the address twice). Such an instruction's writes go to locals that start as the registers' values; they are
-        // copied to the registers before the first instruction that waits on the barrier, at DEPBAR, and at the end of the block. A guarded one whose guard is false at issue writes nothing, so the copy
-        // keeps what was written meanwhile: Yoshi and the Mysterious Book's local lights take EXP2 R17 under P4 and write R17 themselves under !P4 before the wait, and the stale value's copy (a squared
-        // distance, for the light's falloff) overexposed the scene.
+        // copied to the registers before the first instruction that waits on the barrier, at DEPBAR, and at the end of the block. Under a guard, an instruction runs
+        // on some lanes only, so every copy must run on every lane: a register written again while its deferred write is pending gets that write first
+        // (LandPending), and a guarded last instruction skips to its own label when copies follow it (docs/reference/shaders.md, "Deferred register writes under a
+        // guard (Ampere scoreboards)").
         private static void EmitOpsAmpere(EmitterContext context, Block block)
         {
-            List<(Register Reg, Operand Value, Operand Guard)>[] pending = new List<(Register, Operand, Operand)>[7];
+            List<(Register Reg, Operand Value)>[] pending = new List<(Register, Operand)>[7];
             int shadows = 0;
             Stack<int> freeShadows = new();
 
@@ -349,22 +350,9 @@ namespace Ryujinx.Graphics.Shader.Translation
             {
                 if (pending[barrier] != null)
                 {
-                    foreach ((Register reg, Operand value, Operand guard) in pending[barrier])
+                    foreach ((Register reg, Operand value) in pending[barrier])
                     {
-                        if (guard != null)
-                        {
-                            Operand skip = Label();
-
-                            context.BranchIfFalse(skip, context.ICompareNotEqual(guard, Const(0)));
-                            context.Copy(Register(reg), value);
-                            context.MarkLabel(skip);
-                            freeShadows.Push(guard.GetRegister().Index);
-                        }
-                        else
-                        {
-                            context.Copy(Register(reg), value);
-                        }
-
+                        context.Copy(Register(reg), value);
                         freeShadows.Push(value.GetRegister().Index);
                     }
 
@@ -413,14 +401,18 @@ namespace Ryujinx.Graphics.Shader.Translation
                 int opStart = context.OperationsCount;
 
                 Operand predSkipLbl = null;
-                Operand guardPred = null;
 
                 if (a.Pred != RegisterConsts.PredicateTrueIndex && a.Opcode != Instructions.AmpereOpcodes.Bra)
                 {
                     Operand label;
 
-                    // The next block only when nothing waits for the end of this one's commits
-                    if (opIndex == block.OpCodes.Count - 1 && block.HasNext() && writeBarrier >= 6 && Array.TrueForAll(pending, list => list == null || list.Count == 0))
+                    // The block's last instruction may skip straight to the next block only when no deferred write is committed after it (CommitAll below):
+                    // a jump past those copies loses them on the lanes that skip it (Zelda: Ocarina of Time's glyph quads, b19e1bdd247555ec +0x750 "@P0 FFMA R85"
+                    // jumped past the commit of "@!P0 ALD R85, a[0x84]" at +0x710, so the ALD's lanes never got the corner's y; the FFMA's lanes lost theirs to
+                    // that commit, LandOverwrittenAmpereWrites)
+                    bool commitsFollow = writeBarrier < 6 || Array.Exists(pending, p => p != null && p.Count != 0);
+
+                    if (opIndex == block.OpCodes.Count - 1 && block.HasNext() && !commitsFollow)
                     {
                         label = context.GetLabel(block.Successors[0].Address);
                     }
@@ -433,8 +425,6 @@ namespace Ryujinx.Graphics.Shader.Translation
 
                     RegisterType predType = Instructions.AmpereTable.HasUniformGuard(a.Opcode) ? RegisterType.UniformPredicate : RegisterType.Predicate;
                     Operand pred = Register(a.Pred, predType);
-
-                    guardPred = pred;
 
                     if (a.PredInv)
                     {
@@ -457,25 +447,86 @@ namespace Ryujinx.Graphics.Shader.Translation
 
                 if (writeBarrier < 6 && !op.Props.HasFlag(InstProps.Bra))
                 {
-                    DeferAmpereWrites(context, opStart, pending, writeBarrier, ref shadows, freeShadows, guardPred, a.PredInv);
+                    DeferAmpereWrites(context, opStart, pending, writeBarrier, ref shadows, freeShadows);
+                }
+                else
+                {
+                    LandOverwrittenAmpereWrites(context, opStart, pending, freeShadows);
                 }
             }
 
             CommitAll();
         }
 
+        // An instruction that writes a register whose earlier deferred write has not been committed: that write lands first (copied to the register before the
+        // instruction and its guard), so the later write wins on the lanes that run it and the others keep the earlier result. The compiler leaves such a pair
+        // without a wait when their guards exclude each other ("@!P0 ALD R85" then "@P0 FFMA R85" before the wait); committing the earlier write after the
+        // later one gave every lane the shadow, and the later instruction's lanes lost their result. Landing early changes nothing on the lanes the earlier
+        // instruction skipped: its shadow started as the register's value, so they keep it, also as a source of the later instruction
+        private static void LandOverwrittenAmpereWrites(
+            EmitterContext context,
+            int opStart,
+            List<(Register Reg, Operand Value)>[] pendingAll,
+            Stack<int> freeShadows)
+        {
+            int end = context.OperationsCount;
+            List<Register> written = [];
+
+            for (int i = opStart; i < end; i++)
+            {
+                Operation operation = context.GetOperation(i);
+
+                for (int d = 0; d < operation.DestsCount; d++)
+                {
+                    Operand dest = operation.GetDest(d);
+
+                    if (dest != null && dest.Type == OperandType.Register && !written.Contains(dest.GetRegister()))
+                    {
+                        written.Add(dest.GetRegister());
+                    }
+                }
+            }
+
+            int at = opStart;
+
+            foreach (Register reg in written)   // (collected first: the copies go in before the range, which moves it)
+            {
+                at = LandPending(context, at, pendingAll, reg, freeShadows);
+            }
+        }
+
+        // Copies the pending deferred writes of reg to it at index at (the copies' position), frees their shadows; the index after the copies
+        private static int LandPending(EmitterContext context, int at, List<(Register Reg, Operand Value)>[] pendingAll, Register reg, Stack<int> freeShadows)
+        {
+            foreach (List<(Register Reg, Operand Value)> list in pendingAll)
+            {
+                if (list == null)
+                {
+                    continue;
+                }
+
+                foreach ((Register r, Operand v) in list.FindAll(p => p.Reg.Equals(reg)))
+                {
+                    context.InsertOperation(at++, new Operation(Instruction.Copy, Register(r), v));
+                    freeShadows.Push(v.GetRegister().Index);
+                }
+
+                list.RemoveAll(p => p.Reg.Equals(reg));
+            }
+
+            return at;
+        }
+
         // The registers written by the operations from opStart on become shadow registers (every use in the range too), each first set to the register's value
         private static void DeferAmpereWrites(
             EmitterContext context,
             int opStart,
-            List<(Register Reg, Operand Value, Operand Guard)>[] pendingAll,
+            List<(Register Reg, Operand Value)>[] pendingAll,
             int barrier,
             ref int shadows,
-            Stack<int> freeShadows,
-            Operand guardPred,
-            bool guardInv)
+            Stack<int> freeShadows)
         {
-            List<(Register Reg, Operand Value, Operand Guard)> pending = pendingAll[barrier] ??= [];
+            List<(Register Reg, Operand Value)> pending = pendingAll[barrier] ??= [];
 
             int end = context.OperationsCount;
             Dictionary<Register, Operand> locals = new();
@@ -534,46 +585,14 @@ namespace Ryujinx.Graphics.Shader.Translation
 
             foreach ((Register reg, Operand local) in locals)
             {
+                // A register written again before its earlier deferred write landed: the earlier write lands first (LandOverwrittenAmpereWrites), so the new
+                // shadow starts from it and the lanes the later instruction skips keep it ("@P1 TEX R6" then "@!P1 TEX R6": dropping the first pending write
+                // lost the first texture's result on its lanes)
+                at = LandPending(context, at, pendingAll, reg, freeShadows);
+
                 context.InsertOperation(at++, new Operation(Instruction.Copy, local, Register(reg)));
 
-                Operand guard = null;
-
-                if (guardPred != null)
-                {
-                    if (freeShadows.Count == 0 && shadows == RegisterConsts.ShadowsCount)
-                    {
-                        throw new InvalidOperationException("Ampere: more deferred register writes pending at once than shadow registers");
-                    }
-
-                    // The guard as it is at issue, as a nonzero word (a float's bits, which the conditional select keeps), not 1: a denormal could be flushed
-                    guard = Register(freeShadows.Count != 0 ? freeShadows.Pop() : shadows++, RegisterType.Shadow);
-                    context.InsertOperation(at++, new Operation(Instruction.ConditionalSelect, guard, guardPred, Const(guardInv ? 0 : 0x3f800000), Const(guardInv ? 0x3f800000 : 0)));
-                }
-                else
-                {
-                    // A register written again before its earlier deferred write landed: the later write wins, the earlier shadow is free. A guarded later write may not happen, so the earlier one stays
-                    foreach (List<(Register Reg, Operand Value, Operand Guard)> list in pendingAll)
-                    {
-                        if (list == null)
-                        {
-                            continue;
-                        }
-
-                        foreach ((Register r, Operand v, Operand g) in list.FindAll(p => p.Reg.Equals(reg)))
-                        {
-                            freeShadows.Push(v.GetRegister().Index);
-
-                            if (g != null)
-                            {
-                                freeShadows.Push(g.GetRegister().Index);
-                            }
-                        }
-
-                        list.RemoveAll(p => p.Reg.Equals(reg));
-                    }
-                }
-
-                pending.Add((reg, local, guard));
+                pending.Add((reg, local));
             }
         }
 
