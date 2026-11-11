@@ -23,7 +23,12 @@ typedef struct nq_job {
 typedef struct { uint64_t identity, kind; } nq_object_key;
 struct nq_owned { unsigned refs, kind; nq_object_key key; uint64_t data[]; };
 
-// Protected by g_sub_mu. A serial identifies immutable initialization metadata,
+// Protected by nq_obj_mu: the owned-object cache and every owned refcount. The game's
+// submit/present snapshots take only this lock, so they never wait for the worker's
+// replay (g_sub_mu), which made Ocarina of Time's submit/present wait ~7 ms a frame.
+// Lock order: g_sub_mu, then nq_obj_mu, then g_pk_mu/g_tmu (prog snapshot, tex pin).
+static pthread_mutex_t nq_obj_mu = PTHREAD_MUTEX_INITIALIZER;
+// A serial identifies immutable initialization metadata,
 // so jobs share one owned copy and persistent queue bindings retain that copy.
 static nvn_hmap nq_object_cache = {.klen = sizeof(nq_object_key)};
 static void nq_owned_put(nq_owned *o) {
@@ -278,11 +283,9 @@ static const struct { op_hdr h; int32_t bits; uint32_t pad; op_hdr end; } nq_bat
     {OP_BARRIER, 16}, NVN_BARRIER_BITS_LARGE, 0, {OP_END, 8}
 };
 
-// Enqueue paths that need g_sub_mu while the worker records a window announce themselves, so the worker hands the lock over between nodes
-static _Atomic unsigned nq_sub_waiters; static _Atomic uint64_t nq_sub_handoffs;
-static void nq_sub_lock(void) { atomic_fetch_add_explicit(&nq_sub_waiters, 1, memory_order_acq_rel); dm_host_mutex_lock(&g_sub_mu);
-    atomic_fetch_sub_explicit(&nq_sub_waiters, 1, memory_order_acq_rel); atomic_fetch_add_explicit(&nq_sub_handoffs, 1, memory_order_acq_rel); }
-static int nq_yield_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("DM_NVN_QUEUE_YIELD"); on = !(e && !strcmp(e, "0")); } return on; }
+static _Atomic uint64_t nq_sub_lock_ns, nq_sub_lock_n;   // time submit/present spent waiting for their snapshot lock (TSV @sublock_ms / @sublock_n)
+static void nq_obj_lock(void) { uint64_t t0 = now_ns(); pthread_mutex_lock(&nq_obj_mu);
+    atomic_fetch_add_explicit(&nq_sub_lock_ns, now_ns() - t0, memory_order_relaxed); atomic_fetch_add_explicit(&nq_sub_lock_n, 1, memory_order_relaxed); }
 static void *nq_worker(void *unused) {
     (void)unused; pthread_setname_np(pthread_self(), "NVN queue replay");
     pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
@@ -305,7 +308,7 @@ static void *nq_worker(void *unused) {
                     // from other logical queues in the same ready window.
                     if (batch.nitem) continue;
                     nq_publish(j->receipt, q->physical); q->first = j->next; if (!q->first) q->last = NULL; nq_put(j->receipt);
-                    pthread_mutex_unlock(&nq_mu); pthread_mutex_lock(&g_sub_mu); nq_job_free(j); pthread_mutex_unlock(&g_sub_mu); pthread_mutex_lock(&nq_mu); goto scan_again;
+                    pthread_mutex_unlock(&nq_mu); pthread_mutex_lock(&nq_obj_mu); nq_job_free(j); pthread_mutex_unlock(&nq_obj_mu); pthread_mutex_lock(&nq_mu); goto scan_again;
                 }
                 if (n->kind == NQ_EVENT && n->event) {
                     nq_batch_signal *bs = batch.nitem ? nq_batch_signal_of(&batch, n->event) : NULL;
@@ -391,17 +394,7 @@ static void *nq_worker(void *unused) {
                     if (active_commands != UINT64_MAX) nq_stat(NVN_QUEUE_STAT_QUEUE_SWITCHES);
                     nq_restore_rt(it->q); active_commands = it->q->serial;
                 }
-                mtl_exec(it->n->bytes); nq_persist(it->q, it->n);
-                // Between two nodes the replay state is consistent, so an enqueue waiting for g_sub_mu (nq_sub_lock: the game's present
-                // and submit snapshots) gets it here and waits for one node, not the whole window's recording, which made Ocarina of
-                // Time's present block ~31 ms a frame. Handed over explicitly: an unlock followed at once by a lock wins every time, a
-                // mutex not being fair. DM_NVN_QUEUE_YIELD=0 (diagnostic) keeps the lock for the window
-                if (i + 1 < batch.nitem && nq_yield_on() && atomic_load_explicit(&nq_sub_waiters, memory_order_acquire)) {
-                    uint64_t gen = atomic_load_explicit(&nq_sub_handoffs, memory_order_acquire);
-                    pthread_mutex_unlock(&g_sub_mu);
-                    while (atomic_load_explicit(&nq_sub_waiters, memory_order_acquire) && atomic_load_explicit(&nq_sub_handoffs, memory_order_acquire) == gen) sched_yield();
-                    dm_host_mutex_lock(&g_sub_mu);
-                }
+                mtl_exec(it->n->bytes); pthread_mutex_lock(&nq_obj_mu); nq_persist(it->q, it->n); pthread_mutex_unlock(&nq_obj_mu);
             }
             mtl_exec_rest(NULL, 0);
             fence = mtl_sub_commit(); nq_stat(NVN_QUEUE_STAT_PHYSICAL_SUBMITS);
@@ -527,9 +520,10 @@ void nvn_queue_submit(queue_t *q, int count, const uint64_t *handles) {
     pthread_once(&nq_once, nq_start); nq_job *j = calloc(1, sizeof *j); if (!j) die("queue job allocation failed");
     j->receipt = nq_new(); j->objects.klen = sizeof(nq_object_key); j->frame = dm_nvn_frame_count();
     // Snapshot guest command/object memory before Submit returns and the game may reuse it.
-    nq_sub_lock(); dm_host_work++; mtl_prepare(); dm_host_work--; nq_cost cost = nq_cost_begin();
+    // Only the owned-object cache is shared with the worker here (mtl_prepare() runs on the worker before each window).
+    nq_obj_lock(); nq_cost cost = nq_cost_begin();
     for (int i = 0; i < count; i++) nq_flatten(j, (const uint8_t *)(uintptr_t)handles[i], 0); nq_end(j);
-    nq_cost_end(cost); pthread_mutex_unlock(&g_sub_mu);
+    nq_cost_end(cost); pthread_mutex_unlock(&nq_obj_mu);
     int waits = 0; for (nq_node *node = j->first; node; node = node->next) waits |= node->kind == NQ_EVENT || node->kind == NQ_SYNC;
     nvn_cap_queue(q->serial, waits);
     pthread_mutex_lock(&nq_mu);
@@ -549,7 +543,7 @@ uint64_t nvn_queue_present(queue_t *q, const tex_t *t, double period, const int 
     pthread_once(&nq_once, nq_start);
     nq_job *j = calloc(1, sizeof *j); if (!j) die("queue present allocation failed");
     j->receipt = nq_new(); j->objects.klen = sizeof(nq_object_key); j->frame = dm_nvn_frame_count(); nq_node *n = nq_append(j, NQ_PRESENT);
-    nq_sub_lock(); n->texture = nq_owned_get(j, CAP_K_TEX, t); pthread_mutex_unlock(&g_sub_mu);
+    nq_obj_lock(); n->texture = nq_owned_get(j, CAP_K_TEX, t); pthread_mutex_unlock(&nq_obj_mu);
     n->period = period; if (crop) memcpy(n->crop, crop, sizeof n->crop);
     pthread_mutex_lock(&nq_mu); j->receipt->refs++; uint64_t ticket = (uintptr_t)j->receipt; nq_enqueue(nq_get(q), j); pthread_mutex_unlock(&nq_mu); return ticket;
 }
@@ -595,5 +589,5 @@ void nvn_queue_forget(queue_t *q) {
     if (!nvn_queue_scheduler_enabled()) { (void)q; mtl_finish(); return; }
     nvn_queue_finish(q); pthread_mutex_lock(&nq_mu); nq_queue **p = &nq_queues; while (*p && (*p)->serial != q->serial) p = &(*p)->next;
     nq_queue *old = *p; if (old) *p = old->next; pthread_mutex_unlock(&nq_mu);
-    if (old) { pthread_mutex_lock(&g_sub_mu); nq_persist_drop(old); pthread_mutex_unlock(&g_sub_mu); pthread_mutex_lock(&nq_mu); nq_put(old->tail); pthread_mutex_unlock(&nq_mu); free(old); }
+    if (old) { pthread_mutex_lock(&g_sub_mu); pthread_mutex_lock(&nq_obj_mu); nq_persist_drop(old); pthread_mutex_unlock(&nq_obj_mu); pthread_mutex_unlock(&g_sub_mu); pthread_mutex_lock(&nq_mu); nq_put(old->tail); pthread_mutex_unlock(&nq_mu); free(old); }
 }
