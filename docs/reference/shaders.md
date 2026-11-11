@@ -546,6 +546,14 @@ Finding, keying and translating shaders (`dm/gfx/tools/shader_split.py`, `dmsh_b
 - **Check:** `DMSH_TEST_XLATE=<translator> python3 dm/gfx/tests/test_dmsh_ampere_alu.py F2ip`.
 - **Found on:** [The Legend of Zelda: Ocarina of Time](../../dm/games/0400486024DEC000/README.md): `FoliageShader.sharcb` and 8 foliage mesh shaders.
 
+### NVN2 point and line mesh output layout
+
+- **Symptom:** generated native-mesh facts leave a point mesh out with `its SPH output map has outputs besides position and the generic vectors`, or translating it as the default triangle topology gives valid but semantically wrong SPIR-V. A task/mesh inventory is short by those modules.
+- **Cause:** SPH byte 0x35 bit 3 enables a point-size plane ahead of the four position planes. Control byte 0x5f is the number of indices per primitive: 1 point, 2 line or 3 triangle (0 means the triangle default). Stage memory contains every block of 32 vertex values first and then every block of 32 per-primitive values; the index area reserves the topology's index count for a full 32-primitive block, including the final partial block.
+- **Fix:** `dmsh_meshstage` exposes the point-size plane and topology and uses the guest's separate vertex/primitive block strides. `shader_split.py` writes them into generated native facts as `-4` and `-5, <indices>`. `dmsh_spv_native.py` derives the same values independently from the package and rejects a fact that disagrees before invoking the segregated GPL translator. Point outputs become `OutputPoints`, `PointSize` and `PrimitivePointIndicesEXT`; line outputs use `OutputLinesEXT` and `PrimitiveLineIndicesEXT`.
+- **Check:** `python3 dm/gfx/tests/test_dmsh_meshstage.py` and `python3 dm/gfx/tests/test_dmsh_spv_native.py`. The Ocarina inventory is 20 task and 500 mesh modules; all 520 imported modules pass `spirv-val --target-env vulkan1.3` and `t_vk_mesh --inventory 20 500 <spv-dir>/*.job.json`.
+- **Found on:** [The Legend of Zelda: Ocarina of Time](../../dm/games/0400486024DEC000/README.md): point meshes `2582bd7ea6490d33`, `28f82c129deea140`, `3a6340a04bf09797`, `58d06e7230b59741` and `a203347bb7bdbd03`; the last two need the unwritten pixel input at location 5 padded as `(0, 0, 0, 1)`.
+
 ### `nn::ndve`'s movie enhancement file
 
 - **Symptom:** when an AV1 movie starts, `[RED] shader <key> is not in the shader map` for 11 compute shaders and `[RED] the dispatched program has no compute shader (or it is not mapped)`.
