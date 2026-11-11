@@ -23,6 +23,7 @@
 #include "vk_mesh_trace.h"
 #include "vk_omap.h"
 #include "vk_compile_watch.h"
+#include "vk_shader_cache.h"
 #include <stdatomic.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -497,9 +498,9 @@ static uint32_t *sh_code(const char *key, int *st_out, size_t *nw, vks *s, unsig
 }
 // Shader binaries on disk (VK_EXT_shader_object's binary form): the driver does not cache shader objects, so each one compiled again at every run and every new one in
 // play stopped the frame for 5-15 ms (a 1.3 s stop when a level's 120 came at once). Found by key and variant under a directory named by the shader set, the descriptor
-// layout and the driver's binary UUID and version (a driver update starts a new one). DM_VK_SHCACHE=<dir> moves it, DM_VK_SHCACHE=0 turns it off
+// layout and the driver's binary UUID and version (a driver update starts a new one).  Each entry also names the exact fitted SPIR-V bytes: an override or a rebuilt
+// module under the same guest key must never load the earlier module's binary. DM_VK_SHCACHE=<dir> moves it, DM_VK_SHCACHE=0 turns it off
 static char g_shc[1400]; static int g_shc_on;
-typedef struct { uint32_t magic, version; uint8_t uuid[16]; uint64_t size; } shc_hdr;
 static VkPhysicalDeviceShaderObjectPropertiesEXT g_sop = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_OBJECT_PROPERTIES_EXT};
 static _Atomic uint64_t g_shc_hit, g_shc_saved, g_shc_hit_ns;
 static void shc_init(uint64_t layout_hash) {
@@ -517,7 +518,16 @@ static void shc_init(uint64_t layout_hash) {
     g_shc_on = 1; LOG("vulkan draws: shader binaries cached in %s", g_shc);
 }
 static void shc_path(char *out, size_t n, const char *key, int st, int gl) { snprintf(out, n, "%s/%s.%d%d.bin", g_shc, key, st, gl); }
-static int shc_has(const char *key, int st, int gl) { char p[1500]; shc_path(p, sizeof p, key, st, gl); return access(p, R_OK) == 0; }
+static int shc_has(const char *key, int st, int gl) {
+    char p[1500]; shc_path(p, sizeof p, key, st, gl);
+    FILE *f = fopen(p, "rb"); if (!f) return 0;
+    vkx_shader_cache_header h; struct stat sb;
+    int ok = fread(&h, 1, sizeof h, f) == sizeof h && !fstat(fileno(f), &sb) &&
+        sb.st_size >= (off_t)sizeof h &&
+        vkx_shader_cache_header_compatible(&h, g_sop.shaderBinaryVersion,
+            g_sop.shaderBinaryUUID, (uint64_t)sb.st_size - sizeof h);
+    fclose(f); return ok;
+}
 static VkShaderCreateInfoEXT sh_ci(int st, VkShaderCodeTypeEXT type, const void *code, size_t size, const VkDescriptorSetLayout *sets) {
     return (VkShaderCreateInfoEXT){.sType = VK_STRUCTURE_TYPE_SHADER_CREATE_INFO_EXT, .stage = vstage_of(st),
         .nextStage = vkx_stage_next(st),
@@ -529,20 +539,25 @@ static VkShaderCreateInfoEXT sh_ci(int st, VkShaderCodeTypeEXT type, const void 
 static VkShaderEXT sh_object(const char *key, int st, int gl, const uint32_t *spv, size_t nw, int *compiled) {
     VkDescriptorSetLayout sets[7] = {g_dsl, g_dsl, g_dsl, g_dsl, g_dsl, g_bindless_dsl, g_feedback_dsl}; VkShaderEXT o = VK_NULL_HANDLE; char p[1500];
     if (compiled) *compiled = 0;
+    size_t gw = 0; uint32_t *g = gl ? spvr_gl_depth(spv, nw, &gw) : NULL;
+    if (gl && !g) return VK_NULL_HANDLE;
+    const uint32_t *source = g ? g : spv; size_t source_nw = g ? gw : nw;
+    uint64_t source_hash = vkx_shader_source_hash(source, source_nw * sizeof *source);
     if (g_shc_on) {
         shc_path(p, sizeof p, key, st, gl); uint8_t *b; size_t n; uint64_t t0 = mk_now();
         if (read_file(p, &b, &n)) {
-            shc_hdr h; int ok = n >= sizeof h && (memcpy(&h, b, sizeof h), h.magic == 0x31636873u && h.version == g_sop.shaderBinaryVersion && !memcmp(h.uuid, g_sop.shaderBinaryUUID, 16) && h.size == n - sizeof h);
-            if (ok) { VkShaderCreateInfoEXT ci = sh_ci(st, VK_SHADER_CODE_TYPE_BINARY_EXT, b + sizeof h, (size_t)h.size, sets); if (g_vkd.create_shaders(g_vkd.dev, 1, &ci, NULL, &o)) o = VK_NULL_HANDLE; }
+            vkx_shader_cache_header h; int ok = n >= sizeof h &&
+                (memcpy(&h, b, sizeof h), vkx_shader_cache_header_matches(
+                    &h, g_sop.shaderBinaryVersion, g_sop.shaderBinaryUUID,
+                    source_hash, n - sizeof h));
+            if (ok) { VkShaderCreateInfoEXT ci = sh_ci(st, VK_SHADER_CODE_TYPE_BINARY_EXT, b + sizeof h, (size_t)h.binary_size, sets); if (g_vkd.create_shaders(g_vkd.dev, 1, &ci, NULL, &o)) o = VK_NULL_HANDLE; }
             free(b);
             if (o) { atomic_fetch_add(&g_shc_hit, 1); atomic_fetch_add(&g_shc_hit_ns, mk_now() - t0);
                 uint64_t hn = atomic_load(&g_shc_hit); if (!(hn & (hn - 1))) LOG("vulkan draws: %llu shaders loaded from the cache, %.2f ms each", (unsigned long long)hn, atomic_load(&g_shc_hit_ns) / 1e6 / hn);
-                return o; }
+                free(g); return o; }
         }
     }
-    size_t gw = 0; uint32_t *g = gl ? spvr_gl_depth(spv, nw, &gw) : NULL;
-    if (gl && !g) return VK_NULL_HANDLE;
-    VkShaderCreateInfoEXT ci = sh_ci(st, VK_SHADER_CODE_TYPE_SPIRV_EXT, g ? g : spv, (g ? gw : nw) * 4, sets);
+    VkShaderCreateInfoEXT ci = sh_ci(st, VK_SHADER_CODE_TYPE_SPIRV_EXT, source, source_nw * sizeof *source, sets);
     static int compile_log = -1;
     if (compile_log < 0) {
         const char *e = getenv("DM_VK_SHADER_COMPILE_LOG");
@@ -566,8 +581,13 @@ static VkShaderEXT sh_object(const char *key, int st, int gl, const uint32_t *sp
     if (g_shc_on && g_vkd.shader_binary) {   // into the cache: written to a temporary name and renamed, so a reader never sees half a file
         size_t n = 0;
         if (!g_vkd.shader_binary(g_vkd.dev, o, &n, NULL) && n) {
-            uint8_t *b = malloc(sizeof(shc_hdr) + n); shc_hdr h = {0x31636873u, g_sop.shaderBinaryVersion, {0}, n}; memcpy(h.uuid, g_sop.shaderBinaryUUID, 16); memcpy(b, &h, sizeof h);
-            if (b && !g_vkd.shader_binary(g_vkd.dev, o, &n, b + sizeof h)) {
+            uint8_t *b = malloc(sizeof(vkx_shader_cache_header) + n);
+            if (b && !g_vkd.shader_binary(g_vkd.dev, o, &n, b + sizeof(vkx_shader_cache_header))) {
+                vkx_shader_cache_header h = {.magic = VKX_SHADER_CACHE_MAGIC,
+                    .binary_version = g_sop.shaderBinaryVersion,
+                    .source_hash = source_hash, .binary_size = n};
+                memcpy(h.binary_uuid, g_sop.shaderBinaryUUID, 16);
+                memcpy(b, &h, sizeof h);
                 char t[1600]; snprintf(t, sizeof t, "%s.%ld.tmp", p, (long)syscall(SYS_gettid)); shc_path(p, sizeof p, key, st, gl);
                 FILE *f = fopen(t, "wb"); if (f) { int w = fwrite(b, 1, sizeof h + n, f) == sizeof h + n; w = !fclose(f) && w; if (w && !rename(t, p)) atomic_fetch_add(&g_shc_saved, 1); else unlink(t); }
             }
