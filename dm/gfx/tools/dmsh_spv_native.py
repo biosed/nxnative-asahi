@@ -56,6 +56,39 @@ def nvn2_key(control, code):
     return hashlib.sha256(key_control + code).hexdigest()[:16]
 
 
+def _native_sph_outputs(sph):
+    """Output planes needed by the native Vulkan mesh translator.
+
+    Keep this separate from :mod:`dmsh_meshstage`: that module describes the
+    Metal wrapper and may only change with a Mac regression run.  The native
+    path names point size explicitly so its facts can be checked before the
+    segregated translator sees any title input.
+    """
+    out = ([('psiz', 0)] if sph[0x35] & 0x08 else [])
+    out += [(None, component) for component in range(4)
+            if sph[0x35] >> (4 + component) & 1]
+    for generic in range(32):
+        out += [(generic, component) for component in range(4)
+                if sph[0x36 + generic // 2] >>
+                (4 * (generic % 2) + component) & 1]
+    return out
+
+
+def native_info(control, area):
+    """Control/SPH facts for the native Vulkan task/mesh path only."""
+    info = dmsh_meshstage.info(control, area)
+    if info.get('kind') == 'ms':
+        primitive_at = (struct.unpack_from('<I', control, 0x64)[0]
+                        if control[0x68] & 0x80 else 0)
+        primitive = (_native_sph_outputs(area[primitive_at:primitive_at + 0x80])
+                     if primitive_at else [])
+        info.update(verts=control[0x5f] or 3,
+                    vertex=_native_sph_outputs(area[:0x80]),
+                    primitive=[plane for plane in primitive
+                               if isinstance(plane[0], int)])
+    return info
+
+
 def _plane_code(plane):
     generic, component = plane
     if generic == 'psiz':
@@ -161,7 +194,7 @@ def make_native_job(key, stage, record, out_dir, fact=None):
     control, area = split_record(record)
     if nvn2_key(control, area) != key:
         raise NativeError('%s: package record key does not agree with shader_map.tsv' % key)
-    info = dmsh_meshstage.info(control, area)
+    info = native_info(control, area)
     if info.get('kind') != stage or stage not in NATIVE_MESH_STAGES:
         raise NativeError('%s: map stage %s, control stage %s' % (key, stage, info.get('kind')))
     if stage == 'ms' and info.get('verts') not in (1, 2, 3):
