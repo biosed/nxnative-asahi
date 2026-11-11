@@ -185,6 +185,12 @@ $(OUT)/t_vk_image_refs: vk/tests/t_vk_image_refs.c vk/vk_image_refs.h vk/vk_tex_
 t_vk_image_refs: $(OUT)/t_vk_image_refs
 	$<
 
+$(OUT)/t_vk_addr_set: vk/tests/t_vk_addr_set.c vk/vk_addr_set.h | profile
+	@mkdir -p $(dir $@)
+	$(CC) $(CPPFLAGS) -std=gnu11 -O1 -g -Wall -Wextra -Werror -Ivk -o $@ $<
+t_vk_addr_set: $(OUT)/t_vk_addr_set
+	$<
+
 $(OUT)/t_vk_gmem_map: vk/tests/t_vk_gmem_map.c vk/vk_gmem_map.h ../gfx/nvn/dmsh_abi.h | profile
 	@mkdir -p $(dir $@)
 	$(CC) $(CPPFLAGS) -std=gnu11 -O1 -g -Wall -Wextra -Werror -Ivk -o $@ $<

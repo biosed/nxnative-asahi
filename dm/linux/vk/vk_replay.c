@@ -34,6 +34,7 @@ int nvn_dpool_base(const void *pool, int tex);   // hle_nvn.c: a descriptor pool
 #include <stdatomic.h>
 
 #include "vk_replay.h"
+#include "vk_addr_set.h"
 // Optional runtime-side bridge for Ocarina's decoded NV12 frame.  Keeping the
 // reference weak preserves standalone renderer/test links.
 extern int dm_codec_movie_nv12_present(void *dst, uint32_t w, uint32_t h) __attribute__((weak));
@@ -410,9 +411,11 @@ static void gp_add(gpost o) {   // on the replay thread, in recording order
 // occlusion queries) is unknown too, and an unknown condition draws, as before;
 // the completion-time visible placeholder is still written for guest waits
 static int g_rc_skip;   // a render-enable block evaluated false is active (draws and clears dropped)
-static uint64_t g_rc_occ[4096];   // addresses ever given a non-timestamp report (open addressing)
-static void rc_occ_add(uint64_t a) { for (uint32_t i = (uint32_t)(a >> 4) & 4095, k = 0; k < 4096; k++, i = (i + 1) & 4095) { if (g_rc_occ[i] == a) return; if (!g_rc_occ[i]) { g_rc_occ[i] = a; return; } } }
-static int rc_occ_has(uint64_t a) { for (uint32_t i = (uint32_t)(a >> 4) & 4095, k = 0; k < 4096; k++, i = (i + 1) & 4095) { if (g_rc_occ[i] == a) return 1; if (!g_rc_occ[i]) return 0; } return 0; }
+static vkx_addr_set g_rc_occ = {.max_cap = 1u << 22};   // addresses ever given a non-timestamp report (vk_addr_set.h); saturated: every condition is unknown
+static void rc_occ_add(uint64_t a) {
+    if (!vkx_addr_set_add(&g_rc_occ, a)) { static int w; if (!w++) LOG("[RED] vulkan replay: render_cond report-address set is full (%u addresses): every condition now draws", g_rc_occ.n); }
+}
+static int rc_occ_has(uint64_t a) { return vkx_addr_set_has(&g_rc_occ, a); }
 static int rc_value(uint64_t a, uint64_t *v) {   // 0 = unknown now
     if (rc_occ_has(a)) return 0;
     int r = -1;
