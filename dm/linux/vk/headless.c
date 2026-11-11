@@ -83,7 +83,7 @@ void mtl_ub_present(double iv_ms) { (void)iv_ms; }
 void dm_gfx_passdump_next(long n) { vkr_passdump_next(n); }
 void dm_gfx_texdump_next(const char *path) { (void)path; }
 void dm_gfx_texlist(int target) { (void)target; }
-void dm_gfx_texraw(uint64_t serial, const char *path) { (void)serial; (void)path; }
+void dm_gfx_texraw(uint64_t serial, const char *path) { vkr_texraw(serial, path); }
 
 // ---- front end: front_sdl.c (the software keyboard's input box too: front_text_input) ----
 

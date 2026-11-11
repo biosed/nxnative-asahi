@@ -23,6 +23,7 @@
 #include "vk_image_refs.h"
 #include "vk_tex_lifetime.h"
 #include "vk_passlog.h"
+#include "vk_texraw.h"
 int nvn_dpool_base(const void *pool, int tex);   // hle_nvn.c: a descriptor pool's ID base
 #include "../gfx/nvn/nvn_obj.h"
 #include "../gfx/nvn/nvn_queue.h"
@@ -2116,7 +2117,9 @@ static void dump_uploads(uint64_t fence) {
 }
 static pthread_mutex_t g_shot_mu = PTHREAD_MUTEX_INITIALIZER; static long g_shot_k; static char g_shot_path[1024]; static uint64_t g_presents;
 static vkp_passlog g_passlog_next;
+static vkt_texraw g_texraw_next = VKT_TEXRAW_INIT;
 void vkr_passdump_next(long frames) { vkp_passlog_request(&g_passlog_next, frames); }
+void vkr_texraw(uint64_t serial, const char *path) { vkt_texraw_request(&g_texraw_next, serial, path); }
 void dm_gfx_shot_at(long k, const char *path) { pthread_mutex_lock(&g_shot_mu); g_shot_k = (long)g_presents + k; snprintf(g_shot_path, sizeof g_shot_path, "%s", path); pthread_mutex_unlock(&g_shot_mu); }
 static int env_shot_init;
 static void shot_check(const tex_t *t) {
@@ -2128,6 +2131,12 @@ static void shot_check(const tex_t *t) {
     int now = g_shot_k && (long)g_presents >= g_shot_k; char path[1024]; if (now) { snprintf(path, sizeof path, "%s", g_shot_path); g_shot_k = 0; }
     pthread_mutex_unlock(&g_shot_mu);
     if (now && g_on > 0) shoot(t, atomic_load(&g_fence), path);
+    char texraw_path[VKT_TEXRAW_PATH_MAX]; uint64_t texraw_serial = vkt_texraw_take(&g_texraw_next, texraw_path, sizeof texraw_path);
+    if (texraw_serial && g_on > 0) {
+        pthread_mutex_lock(&g_tmu); vtex *raw = tex_find(texraw_serial); pthread_mutex_unlock(&g_tmu);
+        if (raw) shoot_vt(raw, atomic_load(&g_fence), texraw_path);
+        else LOG("[RED] texraw %s: no live Vulkan image for serial %llu", texraw_path, (unsigned long long)texraw_serial);
+    }
     // DM_VK_RTDUMP=<present>:<dir>: at that present, every colour image the GPU rendered (render targets), as <dir>/rt_<serial>_<w>x<h>.png
     static long rtk = -1; static char rtdir[900];
     if (rtk < 0) { const char *e = getenv("DM_VK_RTDUMP"); char *c; rtk = 0; if (e && (rtk = strtol(e, &c, 10)) > 0 && *c == ':') snprintf(rtdir, sizeof rtdir, "%s", c + 1); else rtk = 0; }
