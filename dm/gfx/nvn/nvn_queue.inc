@@ -278,6 +278,11 @@ static const struct { op_hdr h; int32_t bits; uint32_t pad; op_hdr end; } nq_bat
     {OP_BARRIER, 16}, NVN_BARRIER_BITS_LARGE, 0, {OP_END, 8}
 };
 
+// Enqueue paths that need g_sub_mu while the worker records a window announce themselves, so the worker hands the lock over between nodes
+static _Atomic unsigned nq_sub_waiters; static _Atomic uint64_t nq_sub_handoffs;
+static void nq_sub_lock(void) { atomic_fetch_add_explicit(&nq_sub_waiters, 1, memory_order_acq_rel); dm_host_mutex_lock(&g_sub_mu);
+    atomic_fetch_sub_explicit(&nq_sub_waiters, 1, memory_order_acq_rel); atomic_fetch_add_explicit(&nq_sub_handoffs, 1, memory_order_acq_rel); }
+static int nq_yield_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("DM_NVN_QUEUE_YIELD"); on = !(e && !strcmp(e, "0")); } return on; }
 static void *nq_worker(void *unused) {
     (void)unused; pthread_setname_np(pthread_self(), "NVN queue replay");
     pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
@@ -387,6 +392,16 @@ static void *nq_worker(void *unused) {
                     nq_restore_rt(it->q); active_commands = it->q->serial;
                 }
                 mtl_exec(it->n->bytes); nq_persist(it->q, it->n);
+                // Between two nodes the replay state is consistent, so an enqueue waiting for g_sub_mu (nq_sub_lock: the game's present
+                // and submit snapshots) gets it here and waits for one node, not the whole window's recording, which made Ocarina of
+                // Time's present block ~31 ms a frame. Handed over explicitly: an unlock followed at once by a lock wins every time, a
+                // mutex not being fair. DM_NVN_QUEUE_YIELD=0 (diagnostic) keeps the lock for the window
+                if (i + 1 < batch.nitem && nq_yield_on() && atomic_load_explicit(&nq_sub_waiters, memory_order_acquire)) {
+                    uint64_t gen = atomic_load_explicit(&nq_sub_handoffs, memory_order_acquire);
+                    pthread_mutex_unlock(&g_sub_mu);
+                    while (atomic_load_explicit(&nq_sub_waiters, memory_order_acquire) && atomic_load_explicit(&nq_sub_handoffs, memory_order_acquire) == gen) sched_yield();
+                    dm_host_mutex_lock(&g_sub_mu);
+                }
             }
             mtl_exec_rest(NULL, 0);
             fence = mtl_sub_commit(); nq_stat(NVN_QUEUE_STAT_PHYSICAL_SUBMITS);
@@ -512,7 +527,7 @@ void nvn_queue_submit(queue_t *q, int count, const uint64_t *handles) {
     pthread_once(&nq_once, nq_start); nq_job *j = calloc(1, sizeof *j); if (!j) die("queue job allocation failed");
     j->receipt = nq_new(); j->objects.klen = sizeof(nq_object_key); j->frame = dm_nvn_frame_count();
     // Snapshot guest command/object memory before Submit returns and the game may reuse it.
-    dm_host_mutex_lock(&g_sub_mu); dm_host_work++; mtl_prepare(); dm_host_work--; nq_cost cost = nq_cost_begin();
+    nq_sub_lock(); dm_host_work++; mtl_prepare(); dm_host_work--; nq_cost cost = nq_cost_begin();
     for (int i = 0; i < count; i++) nq_flatten(j, (const uint8_t *)(uintptr_t)handles[i], 0); nq_end(j);
     nq_cost_end(cost); pthread_mutex_unlock(&g_sub_mu);
     int waits = 0; for (nq_node *node = j->first; node; node = node->next) waits |= node->kind == NQ_EVENT || node->kind == NQ_SYNC;
@@ -534,7 +549,7 @@ uint64_t nvn_queue_present(queue_t *q, const tex_t *t, double period, const int 
     pthread_once(&nq_once, nq_start);
     nq_job *j = calloc(1, sizeof *j); if (!j) die("queue present allocation failed");
     j->receipt = nq_new(); j->objects.klen = sizeof(nq_object_key); j->frame = dm_nvn_frame_count(); nq_node *n = nq_append(j, NQ_PRESENT);
-    dm_host_mutex_lock(&g_sub_mu); n->texture = nq_owned_get(j, CAP_K_TEX, t); pthread_mutex_unlock(&g_sub_mu);
+    nq_sub_lock(); n->texture = nq_owned_get(j, CAP_K_TEX, t); pthread_mutex_unlock(&g_sub_mu);
     n->period = period; if (crop) memcpy(n->crop, crop, sizeof n->crop);
     pthread_mutex_lock(&nq_mu); j->receipt->refs++; uint64_t ticket = (uintptr_t)j->receipt; nq_enqueue(nq_get(q), j); pthread_mutex_unlock(&nq_mu); return ticket;
 }
