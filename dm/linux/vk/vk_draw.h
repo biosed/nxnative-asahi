@@ -2,7 +2,57 @@
 #pragma once
 #include "../gfx/nvn/nvn_obj.h"
 #include "vk_mesh.h"
+#include "vk_stage.h"
 #include <vulkan/vulkan.h>
+
+// Descriptor bindings are canonical within a shader stage, not across every
+// stage. Keep one union for each graphics set plus a separate compute-set-0
+// domain: a large pixel array must not reserve the same capacity in every
+// vertex/task/mesh/compute set allocated by a submission.
+enum {
+    VKX_DESCRIPTOR_BINDING_LIMIT = 1024,
+    VKX_DESCRIPTOR_TYPE_COUNT = 5,
+};
+typedef struct {
+    char type[VKX_STATE_STAGE_COUNT][VKX_DESCRIPTOR_BINDING_LIMIT];
+    uint32_t count[VKX_STATE_STAGE_COUNT][VKX_DESCRIPTOR_BINDING_LIMIT];
+} vkx_descriptor_union;
+
+static inline int vkx_descriptor_layout_domain(int stage) {
+    if (stage == VKX_STAGE_CS) return VKX_STAGE_CS;
+    int set = vkx_stage_set(stage);
+    return set >= 0 && set < VKX_STATE_STAGE_COUNT ? set : -1;
+}
+
+// 1: added, 0: descriptor-type conflict in the same domain, -1: out of range.
+static inline int vkx_descriptor_union_add(vkx_descriptor_union *u, int stage,
+                                           uint32_t binding, char type,
+                                           uint32_t count) {
+    int domain = vkx_descriptor_layout_domain(stage);
+    if (!u || domain < 0 || binding >= VKX_DESCRIPTOR_BINDING_LIMIT) return -1;
+    if (u->type[domain][binding] && u->type[domain][binding] != type) return 0;
+    u->type[domain][binding] = type;
+    if (!count) count = 1;
+    if (count > u->count[domain][binding]) u->count[domain][binding] = count;
+    return 1;
+}
+
+static inline int vkx_descriptor_type_index(char type) {
+    static const char types[VKX_DESCRIPTOR_TYPE_COUNT] = {'u', 's', 't', 'i', 'b'};
+    for (int i = 0; i < VKX_DESCRIPTOR_TYPE_COUNT; i++) if (type == types[i]) return i;
+    return -1;
+}
+
+static inline void vkx_descriptor_union_totals(const vkx_descriptor_union *u,
+                                               int domain,
+                                               uint32_t out[VKX_DESCRIPTOR_TYPE_COUNT]) {
+    for (int i = 0; i < VKX_DESCRIPTOR_TYPE_COUNT; i++) out[i] = 0;
+    if (!u || domain < 0 || domain >= VKX_STATE_STAGE_COUNT) return;
+    for (uint32_t b = 0; b < VKX_DESCRIPTOR_BINDING_LIMIT; b++) {
+        int type = vkx_descriptor_type_index(u->type[domain][b]);
+        if (type >= 0) out[type] += u->count[domain][b];
+    }
+}
 
 // Keep descriptor-pool retry policy device-free and independently testable.
 // A capacity error is evidence that a pool is exhausted only after that pool

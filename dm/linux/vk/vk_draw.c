@@ -77,7 +77,7 @@ static vkx_movie_shader g_movie_shader[VKX_MOVIE_SHADERS_MAX];
 static int g_nmovie_shader;
 static vks *g_sh[1024]; static pthread_mutex_t g_shmu = PTHREAD_MUTEX_INITIALIZER;
 enum { VKX_BINDLESS_SET = 5, VKX_FEEDBACK_SET = 6, VKX_BINDLESS_2D = 0, VKX_BINDLESS_2DA = 1, VKX_BINDLESS_DEPTH = 2, VKX_BINDLESS_SAMP = 3 };
-static VkDescriptorSetLayout g_dsl, g_bindless_dsl; static VkDescriptorPool g_bindless_pool; static VkDescriptorSet g_bindless_set;
+static VkDescriptorSetLayout g_dsl[NST], g_bindless_dsl; static VkDescriptorPool g_bindless_pool; static VkDescriptorSet g_bindless_set;
 static VkDescriptorSetLayout g_feedback_dsl; static VkDescriptorPool g_feedback_pool; static VkDescriptorSet g_feedback_set[CB_RING];
 static VkBuffer g_feedback_buf[CB_RING]; static VkDeviceMemory g_feedback_mem[CB_RING]; static uint32_t *g_feedback_map[CB_RING];
 static uint8_t g_bindless_real[VKR_BINDLESS_TEXTURES];
@@ -88,7 +88,10 @@ static int g_trace;   // the replay's pass log is on (DM_VK_PASSLOG): each draw 
 static int g_trace_pre_stage, g_trace_pre_gl, g_trace_pre_fallback;
 void vkx_trace(int on) { g_trace = on; }
 static int g_depth_zero;   // NVN depth mode: 1 near = 0 (as Vulkan), 0 near = -w (GL, NVN's default): the last stage before rasterization then takes its GL-depth variant
-static int g_init = -1, g_gmem_trace = -1; static char g_spv[1024], g_mesh_spv[1024]; static uint32_t g_per_set[5];   // descriptors of a set by type: uniform, storage, combined, storage image, texel buffer
+static int g_init = -1, g_gmem_trace = -1; static char g_spv[1024], g_mesh_spv[1024];
+// Per layout domain (graphics sets 0..4, compute set 0 in slot 5), then
+// uniform, storage, combined image/sampler, storage image, texel buffer.
+static uint32_t g_per_set[NST][VKX_DESCRIPTOR_TYPE_COUNT];
 static uint64_t g_st_load, g_st_fail, g_st_nokey, g_st_draws, g_st_sets, g_miss[16];
 enum { M_UBO, M_TEX, M_TEXREG, M_SAMP, M_SBUF, M_IMG, M_TBUF, M_UNALIGNED, M_NOSHADER, M_OTHER };
 static const char *const MISS[] = {"uniform", "texture", "texture ID", "sampler", "storage", "image", "texel buffer", "unaligned", "shader", "other"};
@@ -237,10 +240,13 @@ static int draw_init(void) {
     const char *md = getenv("DMSH_VK_MESH_EXT_DIR");
     if (md && *md) snprintf(g_mesh_spv, sizeof g_mesh_spv, "%s", md);
     if (g_gmem_trace) LOG("vulkan draws: DM_VK_GMEM_TRACE=1: exact raw-global guest pages will invalidate only overlapping uploaded images");
-    // One set layout for every stage's set: the union of the bindings the game's shaders use (dmsh_spv.py's canonical bindings, listed in each <key>.vkb), each partially
-    // bound. A set takes pool space for every binding of its layout, so only the used ones are in it
-    static uint32_t cnt[1024]; static char typ[1024];
-    const char *dirs[2] = {g_spv, g_mesh_spv}; int nfiles = 0, nmesh = 0;
+    // One binding union per graphics set, plus a separate compute-set-0
+    // domain. A descriptor set consumes capacity for every binding in its
+    // layout, even when only a shader-specific subset is written; sharing one
+    // cross-stage union made an 8192-element pixel array reserve the same
+    // space in vertex/task/mesh/compute sets.
+    static vkx_descriptor_union du;
+    const char *dirs[2] = {g_spv, g_mesh_spv}; int nfiles = 0, nmesh = 0, layout_bad = 0;
     for (int di = 0; di < 2; di++) {
         if (!dirs[di][0]) continue;
         DIR *dir = opendir(dirs[di]);
@@ -259,32 +265,51 @@ static int draw_init(void) {
             if (!di) movie_reflect(key, &tmp);
             if (!(g_nkeys & 1023)) g_keys = realloc(g_keys, (g_nkeys + 1024) * sizeof *g_keys);
             memcpy(g_keys[g_nkeys], key, 17); g_nkeys++;
-            for (int i = 0; i < tmp.nb; i++) { const vkbind *b = &tmp.bd[i]; if (b->b >= 1024 || bindless_vkb(b)) continue;
-                if (typ[b->b] && typ[b->b] != b->desc) LOG("[RED] vulkan draws: binding %u is %c in one shader and %c in another", b->b, typ[b->b], b->desc);
-                typ[b->b] = b->desc; uint32_t c = b->cnt ? b->cnt : 1; if (c > cnt[b->b]) cnt[b->b] = c; }
+            for (int i = 0; i < tmp.nb; i++) {
+                const vkbind *b = &tmp.bd[i];
+                if (b->b >= VKX_DESCRIPTOR_BINDING_LIMIT || bindless_vkb(b)) continue;
+                int domain = vkx_descriptor_layout_domain(rr.stage);
+                int added = vkx_descriptor_union_add(&du, rr.stage, b->b, b->desc, b->cnt);
+                if (!added) {
+                    char was = domain >= 0 ? du.type[domain][b->b] : '?';
+                    LOG("[RED] vulkan draws: descriptor domain %d binding %u is %c in one shader and %c in another",
+                        domain, b->b, was, b->desc);
+                    layout_bad = 1;
+                }
+            }
         }
         closedir(dir);
     }
-    VkDescriptorSetLayoutBinding b[1024]; VkDescriptorBindingFlags f[1024]; uint32_t n = 0;
-    for (uint32_t i = 0; i < 1024; i++) {
-        if (!typ[i]) continue;
-        VkDescriptorType t = typ[i] == 'u' ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER : typ[i] == 's' ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER : typ[i] == 't' ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER :
-                             typ[i] == 'i' ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : typ[i] == 'b' ? VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER : VK_DESCRIPTOR_TYPE_SAMPLER;
-        b[n] = (VkDescriptorSetLayoutBinding){i, t, cnt[i], VK_SHADER_STAGE_ALL, NULL}; f[n++] = VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT;
-        for (int k = 0; k < 5; k++) if ((int)t == (int[]){VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-                                                         VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER}[k]) g_per_set[k] += cnt[i];
-    }
     if (nfiles == nmesh) { LOG("[RED] vulkan draws: no validated standard <key>.vkb in %s (run dm/gfx/tools/dmsh_spv.py)", g_spv); return g_init = 0; }
-    { uint64_t lh = 1469598103934665603ull; for (uint32_t i = 0; i < n; i++) { lh = (lh ^ b[i].binding) * 1099511628211ull; lh = (lh ^ (uint64_t)b[i].descriptorType) * 1099511628211ull; lh = (lh ^ b[i].descriptorCount) * 1099511628211ull; }
-      lh = (lh ^ VKX_BINDLESS_SET) * 1099511628211ull; lh = (lh ^ VKR_BINDLESS_TEXTURES) * 1099511628211ull; lh = (lh ^ VKR_BINDLESS_SAMPLERS) * 1099511628211ull;
-      /* Keep the pre-feedback six-set ABI and its shader-cache identity when
-       * feedback is off.  Merely appending an unused seventh set changes the
-       * shader-object binary contract on some drivers. */
-      if (g_feedback_enabled) lh = (lh ^ 1ull) * 1099511628211ull;
-      shc_init(lh); }   // shader binaries depend on the layout they were made with
-    VkDescriptorSetLayoutBindingFlagsCreateInfo fi = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO, .bindingCount = n, .pBindingFlags = f};
-    VkDescriptorSetLayoutCreateInfo li = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .pNext = &fi, .bindingCount = n, .pBindings = b};
-    if (vkCreateDescriptorSetLayout(g_vkd.dev, &li, NULL, &g_dsl)) { LOG("[RED] vulkan draws: no descriptor set layout"); return g_init = 0; }
+    if (layout_bad) return g_init = 0;
+    uint64_t lh = 1469598103934665603ull;
+    for (int domain = 0; domain < NST; domain++) {
+        VkDescriptorSetLayoutBinding b[VKX_DESCRIPTOR_BINDING_LIMIT];
+        VkDescriptorBindingFlags f[VKX_DESCRIPTOR_BINDING_LIMIT]; uint32_t n = 0;
+        vkx_descriptor_union_totals(&du, domain, g_per_set[domain]);
+        lh = (lh ^ (uint64_t)(domain + 1)) * 1099511628211ull;
+        for (uint32_t i = 0; i < VKX_DESCRIPTOR_BINDING_LIMIT; i++) {
+            char typ = du.type[domain][i]; if (!typ) continue;
+            VkDescriptorType t = typ == 'u' ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER : typ == 's' ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER : typ == 't' ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER :
+                                 typ == 'i' ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : typ == 'b' ? VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER : VK_DESCRIPTOR_TYPE_SAMPLER;
+            b[n] = (VkDescriptorSetLayoutBinding){i, t, du.count[domain][i], VK_SHADER_STAGE_ALL, NULL};
+            f[n++] = VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT;
+            lh = (lh ^ i) * 1099511628211ull;
+            lh = (lh ^ (uint64_t)t) * 1099511628211ull;
+            lh = (lh ^ du.count[domain][i]) * 1099511628211ull;
+        }
+        VkDescriptorSetLayoutBindingFlagsCreateInfo fi = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO, .bindingCount = n, .pBindingFlags = f};
+        VkDescriptorSetLayoutCreateInfo li = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .pNext = &fi, .bindingCount = n, .pBindings = b};
+        if (vkCreateDescriptorSetLayout(g_vkd.dev, &li, NULL, &g_dsl[domain])) {
+            LOG("[RED] vulkan draws: no descriptor set layout for domain %d", domain); return g_init = 0;
+        }
+    }
+    lh = (lh ^ VKX_BINDLESS_SET) * 1099511628211ull; lh = (lh ^ VKR_BINDLESS_TEXTURES) * 1099511628211ull; lh = (lh ^ VKR_BINDLESS_SAMPLERS) * 1099511628211ull;
+    /* Keep the pre-feedback six-set ABI and its shader-cache identity when
+     * feedback is off. Merely appending an unused seventh set changes the
+     * shader-object binary contract on some drivers. */
+    if (g_feedback_enabled) lh = (lh ^ 1ull) * 1099511628211ull;
+    shc_init(lh);   // shader binaries depend on every layout they were made with
     VkDescriptorSetLayoutBinding bb[4] = {
         {VKX_BINDLESS_2D, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, VKR_BINDLESS_TEXTURES, VK_SHADER_STAGE_ALL, NULL},
         {VKX_BINDLESS_2DA, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, VKR_BINDLESS_TEXTURES, VK_SHADER_STAGE_ALL, NULL},
@@ -305,15 +330,18 @@ static int draw_init(void) {
     VkDescriptorSetAllocateInfo bai = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, .descriptorPool = g_bindless_pool, .descriptorSetCount = 1, .pSetLayouts = &g_bindless_dsl};
     if ((br = vkAllocateDescriptorSets(g_vkd.dev, &bai, &g_bindless_set))) { LOG("[RED] vulkan draws: no bindless pool set (%d)", (int)br); return g_init = 0; }
     if (!feedback_init()) { LOG("[RED] vulkan draws: no bindless feedback layout/buffers"); return g_init = 0; }
-    VkDescriptorSetLayout sets[7] = {g_dsl, g_dsl, g_dsl, g_dsl, g_dsl, g_bindless_dsl, g_feedback_dsl};
+    VkDescriptorSetLayout sets[7] = {g_dsl[0], g_dsl[1], g_dsl[2], g_dsl[3], g_dsl[4], g_bindless_dsl, g_feedback_dsl};
+    VkDescriptorSetLayout csets[7] = {g_dsl[VKX_STAGE_CS], g_dsl[1], g_dsl[2], g_dsl[3], g_dsl[4], g_bindless_dsl, g_feedback_dsl};
     uint32_t nsets = g_feedback_enabled ? 7u : 6u;
     VkPipelineLayoutCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = nsets, .pSetLayouts = sets};
-    VkPipelineLayoutCreateInfo pc = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = nsets, .pSetLayouts = sets};
+    VkPipelineLayoutCreateInfo pc = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = nsets, .pSetLayouts = csets};
     if (vkCreatePipelineLayout(g_vkd.dev, &pi, NULL, &g_pl_gfx) || vkCreatePipelineLayout(g_vkd.dev, &pc, NULL, &g_pl_cs)) { LOG("[RED] vulkan draws: no pipeline layouts"); return g_init = 0; }
-    LOG("vulkan draws: shaders from %s (%d standard)%s%s%s, one set layout of %u bindings for every stage (%u uniform, %u storage, %u textures, %u images, %u texel buffers per set); bindless set %d has 3x%u sampled images + %u samplers", g_spv, nfiles - nmesh,
-        nmesh ? " and " : "", nmesh ? g_mesh_spv : "", nmesh ? " (native task/mesh)" : "", n,
-        g_per_set[0], g_per_set[1], g_per_set[2], g_per_set[3], g_per_set[4], VKX_BINDLESS_SET, VKR_BINDLESS_TEXTURES, VKR_BINDLESS_SAMPLERS);
-    precompile_start();   // after the layouts: a shader is compiled against g_dsl (started before it, a compiler thread passed a null layout and Mesa crashed in lookup_ycbcr_conversion)
+    LOG("vulkan draws: shaders from %s (%d standard)%s%s%s, per-stage union layouts; bindless set %d has 3x%u sampled images + %u samplers", g_spv, nfiles - nmesh,
+        nmesh ? " and " : "", nmesh ? g_mesh_spv : "", nmesh ? " (native task/mesh)" : "", VKX_BINDLESS_SET, VKR_BINDLESS_TEXTURES, VKR_BINDLESS_SAMPLERS);
+    static const char *const dn[NST] = {"vs", "ps", "gs", "hs/task", "ds/mesh", "cs"};
+    for (int domain = 0; domain < NST; domain++) LOG("vulkan draws: descriptor layout %s: %u uniform, %u storage, %u textures, %u images, %u texel buffers per set", dn[domain],
+        g_per_set[domain][0], g_per_set[domain][1], g_per_set[domain][2], g_per_set[domain][3], g_per_set[domain][4]);
+    precompile_start();   // after the layouts: a shader is compiled against them (started before them, a compiler thread passed a null layout and Mesa crashed in lookup_ycbcr_conversion)
     return g_init = 1;
 }
 static void parse_vkb(vks *s, const char *txt) {
@@ -537,7 +565,9 @@ static VkShaderCreateInfoEXT sh_ci(int st, VkShaderCodeTypeEXT type, const void 
 // The shader object of a key's stage and variant (gl: the GL-depth form of the last stage before rasterization), from the disk cache or compiled (and then cached).
 // spv: the fitted code. *compiled: 1 when it had to be compiled
 static VkShaderEXT sh_object(const char *key, int st, int gl, const uint32_t *spv, size_t nw, int *compiled) {
-    VkDescriptorSetLayout sets[7] = {g_dsl, g_dsl, g_dsl, g_dsl, g_dsl, g_bindless_dsl, g_feedback_dsl}; VkShaderEXT o = VK_NULL_HANDLE; char p[1500];
+    VkDescriptorSetLayout sets[7] = {g_dsl[0], g_dsl[1], g_dsl[2], g_dsl[3], g_dsl[4], g_bindless_dsl, g_feedback_dsl};
+    if (st == VKX_STAGE_CS) sets[0] = g_dsl[VKX_STAGE_CS];
+    VkShaderEXT o = VK_NULL_HANDLE; char p[1500];
     if (compiled) *compiled = 0;
     size_t gw = 0; uint32_t *g = gl ? spvr_gl_depth(spv, nw, &gw) : NULL;
     if (gl && !g) return VK_NULL_HANDLE;
@@ -926,17 +956,23 @@ typedef struct { VkDescriptorPool p[256]; uint16_t used[256]; int n, cur; uint8_
 #define SETC_PROBES 8
 typedef struct { uint64_t h; VkDescriptorSet set; } setc_ent;
 static setc_ent g_setc[CB_RING][SETC]; static uint64_t g_setc_hit, g_setc_miss;
-static pool_chain g_pools[CB_RING]; static int g_pool_slot = -1; static uint32_t g_sub_sets;
+static pool_chain g_pools[CB_RING][NST]; static int g_pool_slot = -1; static uint32_t g_sub_sets;
 static void gmem_log_poll(uint64_t done);
-static VkDescriptorPool pool_new(void) {
+static VkDescriptorPool pool_new(int st) {
+    if (st < 0 || st >= NST) return VK_NULL_HANDLE;
     VkDescriptorPoolSize ps[5]; uint32_t np = 0;
     static const VkDescriptorType T[5] = {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                                           VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER};
-    for (int k = 0; k < 5; k++) if (g_per_set[k]) ps[np++] = (VkDescriptorPoolSize){T[k], g_per_set[k] * POOL_SETS};
+    for (int k = 0; k < VKX_DESCRIPTOR_TYPE_COUNT; k++) if (g_per_set[st][k]) ps[np++] = (VkDescriptorPoolSize){T[k], g_per_set[st][k] * POOL_SETS};
     VkDescriptorPoolCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = POOL_SETS, .poolSizeCount = np, .pPoolSizes = ps};
     VkDescriptorPool p = VK_NULL_HANDLE;
     VkResult r = vkCreateDescriptorPool(g_vkd.dev, &pi, NULL, &p);
-    if (r != VK_SUCCESS) LOG("[RED] vulkan draws: vkCreateDescriptorPool failed: VkResult %d", (int)r);
+    if (r != VK_SUCCESS) LOG("[RED] vulkan draws: vkCreateDescriptorPool failed for stage domain %d: VkResult %d", st, (int)r);
+    else {
+        static uint64_t made[NST]; uint64_t n = ++made[st];
+        if (!(n & (n - 1))) LOG("vulkan draws: descriptor stage domain %d created pool %llu (%u sets; %u uniform, %u storage, %u textures, %u images, %u texel buffers per set)",
+            st, (unsigned long long)n, POOL_SETS, g_per_set[st][0], g_per_set[st][1], g_per_set[st][2], g_per_set[st][3], g_per_set[st][4]);
+    }
     return p;
 }
 static void arena_reset(int slot);
@@ -953,30 +989,34 @@ void vkx_sub_begin(int slot, VkCommandBuffer c, uint64_t done) {
         vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_GRAPHICS, g_pl_gfx, VKX_FEEDBACK_SET, 1, &g_feedback_set[slot], 0, NULL);
         vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_COMPUTE, g_pl_cs, VKX_FEEDBACK_SET, 1, &g_feedback_set[slot], 0, NULL);
     }
-    pool_chain *pc = &g_pools[slot];   // the slot's last submission is done (vk_replay.c waited for it)
-    for (int i = 0; i < pc->n; i++) {
-        // A failed reset leaves the pool unusable.  Replace it rather than
-        // carrying unknown driver state into the next submission.  A failed
-        // replacement remains null and stage_set fails closed at that pool.
-        if (!pc->p[i]) {
-            pc->p[i] = pool_new(); pc->used[i] = 0;
-            continue;
+    for (int st = 0; st < NST; st++) {
+        pool_chain *pc = &g_pools[slot][st];   // the slot's last submission is done (vk_replay.c waited for it)
+        for (int i = 0; i < pc->n; i++) {
+            // A failed reset leaves the pool unusable. Replace it rather than
+            // carrying unknown driver state into the next submission. A failed
+            // replacement remains null and stage_set fails closed at that pool.
+            if (!pc->p[i]) {
+                pc->p[i] = pool_new(st); pc->used[i] = 0;
+                continue;
+            }
+            VkResult r = vkResetDescriptorPool(g_vkd.dev, pc->p[i], 0);
+            if (r == VK_SUCCESS) { pc->used[i] = 0; continue; }
+            LOG("[RED] vulkan draws: vkResetDescriptorPool failed: VkResult %d stage %d pool %d used %u; replacing pool",
+                (int)r, st, i, (unsigned)pc->used[i]);
+            vkDestroyDescriptorPool(g_vkd.dev, pc->p[i], NULL);
+            pc->p[i] = pool_new(st); pc->used[i] = 0;
         }
-        VkResult r = vkResetDescriptorPool(g_vkd.dev, pc->p[i], 0);
-        if (r == VK_SUCCESS) { pc->used[i] = 0; continue; }
-        LOG("[RED] vulkan draws: vkResetDescriptorPool failed: VkResult %d pool %d used %u; replacing pool",
-            (int)r, i, (unsigned)pc->used[i]);
-        vkDestroyDescriptorPool(g_vkd.dev, pc->p[i], NULL);
-        pc->p[i] = pool_new(); pc->used[i] = 0;
+        pc->cur = 0; pc->limit_logged = 0;
     }
-    pc->cur = 0; pc->limit_logged = 0; g_sub_sets = 0; memset(g_setc[slot], 0, sizeof g_setc[slot]);
+    g_sub_sets = 0; memset(g_setc[slot], 0, sizeof g_setc[slot]);
     arena_reset(slot);
     g_pool_slot = slot;
 }
 int vkx_descriptor_pressure(void) {
-    return g_pool_slot >= 0 &&
-           vkx_descriptor_pressure_values(g_sub_sets,
-                                          (uint32_t)g_pools[g_pool_slot].cur);
+    uint32_t pools = 0;
+    if (g_pool_slot < 0) return 0;
+    for (int st = 0; st < NST; st++) pools += (uint32_t)g_pools[g_pool_slot][st].cur;
+    return vkx_descriptor_pressure_values(g_sub_sets, pools);
 }
 // ---- the driver banks c0 / c2 (nvn_mtl.m's layout): filled per draw / dispatch from the bound state, for shaders that read them ----
 // c0: per stage a storage buffer table (16 slots of address 64 + size 32 bits at base + 16 r: vertex 0x110, compute 0x310, geometry 0x410, pixel 0x510); compute also
@@ -1134,7 +1174,8 @@ void vkx_prof_take(uint64_t out[8]) { memcpy(out, g_prof_ns, sizeof g_prof_ns); 
 static int g_dprof = -1;
 static uint64_t mix64(uint64_t h, uint64_t v) { h ^= v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2); h *= 0xff51afd7ed558ccdull; return h ^ (h >> 33); }
 static VkDescriptorSet stage_set(int st, vks *s) {
-    VkDescriptorSet set = VK_NULL_HANDLE; pool_chain *pc = &g_pools[g_pool_slot];
+    if (st < 0 || st >= NST) return VK_NULL_HANDLE;
+    VkDescriptorSet set = VK_NULL_HANDLE; pool_chain *pc = &g_pools[g_pool_slot][st];
     VkWriteDescriptorSet wr[NBIND_MAX]; VkDescriptorBufferInfo bi[NBIND_MAX]; VkDescriptorImageInfo ii[NBIND_MAX]; int nw = 0;
     if (g_dprof < 0) g_dprof = getenv("DM_VK_PROF") != NULL;
     uint64_t pt0 = g_dprof ? mk_now() : 0;
@@ -1255,13 +1296,13 @@ static VkDescriptorSet stage_set(int st, vks *s) {
             if (pc->n == 256) {
                 if (!pc->limit_logged) {
                     pc->limit_logged = 1;
-                    LOG("[RED] vulkan draws: descriptor pool chain limit reached (%d pools; sets %llu, cache hits %llu, misses %llu)",
-                        pc->n, (unsigned long long)g_st_sets, (unsigned long long)g_setc_hit,
+                    LOG("[RED] vulkan draws: descriptor pool chain limit reached for stage %d (%d pools; sets %llu, cache hits %llu, misses %llu)",
+                        st, pc->n, (unsigned long long)g_st_sets, (unsigned long long)g_setc_hit,
                         (unsigned long long)g_setc_miss);
                 }
                 return VK_NULL_HANDLE;
             }
-            pc->p[pc->n] = pool_new(); pc->used[pc->n] = 0;
+            pc->p[pc->n] = pool_new(st); pc->used[pc->n] = 0;
             if (!pc->p[pc->n]) return VK_NULL_HANDLE;
             pc->n++;
         }
@@ -1269,7 +1310,7 @@ static VkDescriptorSet stage_set(int st, vks *s) {
             LOG("[RED] vulkan draws: descriptor pool %d is unavailable after reset/recreate failure", pc->cur);
             return VK_NULL_HANDLE;
         }
-        VkDescriptorSetAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, .descriptorPool = pc->p[pc->cur], .descriptorSetCount = 1, .pSetLayouts = &g_dsl};
+        VkDescriptorSetAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, .descriptorPool = pc->p[pc->cur], .descriptorSetCount = 1, .pSetLayouts = &g_dsl[st]};
         VkResult r = vkAllocateDescriptorSets(g_vkd.dev, &ai, &set);
         vkx_pool_alloc_action action = vkx_pool_alloc_result(r, pc->used[pc->cur]);
         if (action == VKX_POOL_ALLOC_OK) { pc->used[pc->cur]++; break; }

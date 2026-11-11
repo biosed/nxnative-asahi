@@ -32,6 +32,32 @@ int main(void) {
           "descriptor pressure trips exactly at the physical-pool high-water");
     check(vkx_descriptor_pressure_values(UINT32_MAX, UINT32_MAX),
           "descriptor pressure remains tripped above both high-waters");
+
+    vkx_descriptor_union u = {0};
+    check(vkx_descriptor_union_add(&u, VKX_STAGE_VS, 64, 't', 1) == 1,
+          "vertex binding enters the vertex layout domain");
+    check(vkx_descriptor_union_add(&u, VKX_STAGE_PS, 64, 't', 8192) == 1,
+          "same canonical binding can have a larger pixel-stage count");
+    check(vkx_descriptor_union_add(&u, VKX_STAGE_CS, 64, 't', 4) == 1,
+          "compute set zero has its own layout domain");
+    check(vkx_descriptor_union_add(&u, VKX_STAGE_TS, 200, 'u', 2) == 1 &&
+          vkx_descriptor_union_add(&u, VKX_STAGE_HS, 201, 's', 3) == 1,
+          "task and hull shaders share graphics set three without sharing bindings");
+    uint32_t total[VKX_DESCRIPTOR_TYPE_COUNT];
+    vkx_descriptor_union_totals(&u, vkx_descriptor_layout_domain(VKX_STAGE_VS), total);
+    check(total[2] == 1, "pixel mega-array capacity does not contaminate vertex sets");
+    vkx_descriptor_union_totals(&u, vkx_descriptor_layout_domain(VKX_STAGE_PS), total);
+    check(total[2] == 8192, "pixel layout retains its required dynamic array capacity");
+    vkx_descriptor_union_totals(&u, vkx_descriptor_layout_domain(VKX_STAGE_CS), total);
+    check(total[2] == 4, "graphics layouts do not contaminate compute set zero");
+    vkx_descriptor_union_totals(&u, vkx_descriptor_layout_domain(VKX_STAGE_TS), total);
+    check(total[0] == 2 && total[1] == 3,
+          "task/hull set-domain union accounts for both descriptor classes");
+    check(vkx_descriptor_union_add(&u, VKX_STAGE_PS, 64, 'u', 1) == 0,
+          "a descriptor-type conflict remains loud within one stage domain");
+    check(vkx_descriptor_union_add(&u, VKX_STAGE_PS,
+                                   VKX_DESCRIPTOR_BINDING_LIMIT, 't', 1) == -1,
+          "out-of-range canonical bindings are rejected");
     printf("t_vk_descriptor_pool: %s (%d failures)\n", bad ? "FAILED" : "passed", bad);
     return bad != 0;
 }
