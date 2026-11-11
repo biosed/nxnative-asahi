@@ -22,6 +22,7 @@
 #include "vk_cs_gpu_lifecycle.h"
 #include "vk_image_refs.h"
 #include "vk_tex_lifetime.h"
+#include "vk_passlog.h"
 int nvn_dpool_base(const void *pool, int tex);   // hle_nvn.c: a descriptor pool's ID base
 #include "../gfx/nvn/nvn_obj.h"
 #include "../gfx/nvn/nvn_queue.h"
@@ -2114,13 +2115,15 @@ static void dump_uploads(uint64_t fence) {
     g_ndump = 0;
 }
 static pthread_mutex_t g_shot_mu = PTHREAD_MUTEX_INITIALIZER; static long g_shot_k; static char g_shot_path[1024]; static uint64_t g_presents;
+static vkp_passlog g_passlog_next;
+void vkr_passdump_next(long frames) { vkp_passlog_request(&g_passlog_next, frames); }
 void dm_gfx_shot_at(long k, const char *path) { pthread_mutex_lock(&g_shot_mu); g_shot_k = (long)g_presents + k; snprintf(g_shot_path, sizeof g_shot_path, "%s", path); pthread_mutex_unlock(&g_shot_mu); }
 static int env_shot_init;
 static void shot_check(const tex_t *t) {
     if (!env_shot_init) { env_shot_init = 1; const char *e = getenv("DM_SHOT"); char *c; long k; if (e && (k = strtol(e, &c, 10)) > 0 && *c == ':') dm_gfx_shot_at(k, c + 1); }
     pthread_mutex_lock(&g_shot_mu);
     g_presents++;
-    { static long pk = -1; if (pk < 0) { const char *e = getenv("DM_VK_PASSLOG"); pk = e ? atol(e) : 0; } g_passlog = pk > 0 && (long)g_presents + 1 == pk; vkx_trace(g_passlog); g_pass0 = g_passes;
+    { static long pk = -1; if (pk < 0) { const char *e = getenv("DM_VK_PASSLOG"); pk = e ? atol(e) : 0; } int live = vkp_passlog_next(&g_passlog_next); g_passlog = live || (pk > 0 && (long)g_presents + 1 == pk); vkx_trace(g_passlog); g_pass0 = g_passes;
       { static int se; if (!se) { se = 1; const char *e = getenv("DM_VK_PASSSTOP"); g_passstop = e ? atol(e) : 0; } } if (g_passlog) LOG("[pass] present %llu begins", (unsigned long long)g_presents + 1); }
     int now = g_shot_k && (long)g_presents >= g_shot_k; char path[1024]; if (now) { snprintf(path, sizeof path, "%s", g_shot_path); g_shot_k = 0; }
     pthread_mutex_unlock(&g_shot_mu);

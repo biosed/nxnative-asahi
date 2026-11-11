@@ -90,6 +90,7 @@ int vkr_bindless_recent_tex_ids(uint64_t registered_after, int *ids,
                                 int cap);                              // current registrations from the new scene generation
 uint64_t vkr_submission_count(void);
 uint64_t vkr_mesh_issue_count(void);
+void vkr_passdump_next(long frames);   // DM_CTL passdump: trace the next bounded set of complete frames
 int vkr_tex_gpu_owned(uint64_t serial);
 uint32_t vkr_pick_mem(uint32_t bits, VkMemoryPropertyFlags want);
 uint64_t vkr_fence_next(void);   // the fence value the submission in progress will signal

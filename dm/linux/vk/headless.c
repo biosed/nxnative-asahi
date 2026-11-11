@@ -7,6 +7,7 @@
 #include "vk_mem.h"
 #include "front.h"
 #include "../gfx/nvn/nvn_obj.h"
+#include "vk_replay.h"
 #include "vk_window.h"
 #include <stdatomic.h>
 
@@ -79,7 +80,7 @@ void mtl_ab_gpu(uint64_t f, double gpu_ms, double frame_ms) { (void)f; (void)gpu
 void mtl_ub_present(double iv_ms) { (void)iv_ms; }
 
 // ---- DM_CTL graphics dumps ----
-void dm_gfx_passdump_next(long n) { (void)n; }
+void dm_gfx_passdump_next(long n) { vkr_passdump_next(n); }
 void dm_gfx_texdump_next(const char *path) { (void)path; }
 void dm_gfx_texlist(int target) { (void)target; }
 void dm_gfx_texraw(uint64_t serial, const char *path) { (void)serial; (void)path; }
