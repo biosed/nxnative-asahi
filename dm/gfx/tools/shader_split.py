@@ -2897,10 +2897,11 @@ def mesh_facts(key, st, ctl, code, keys, mesh_pairs):
     """Describe an NVN2 task/mesh program for the native translator.
 
     The layout is the workgroup from the control section and a compact list of
-    mesh output planes. ``-1`` separates per-primitive values; ``-2`` marks
-    generic vectors read by a paired pixel shader but written by neither the
-    per-vertex nor per-primitive output map. The latter need the same padded
-    ``(0, 0, 0, 1)`` treatment as absent vertex outputs.
+    mesh output planes. ``-5, n`` identifies the topology by its vertex count,
+    ``-4`` is the point-size plane, ``-1`` separates per-primitive values and
+    ``-2`` marks generic vectors read by a paired pixel shader but written by
+    neither output map. The latter need the same padded ``(0, 0, 0, 1)``
+    treatment as absent vertex outputs.
     """
     def warn(why):
         print(f'[RED] {st} program {key}: {why}', flush=True)
@@ -2914,15 +2915,20 @@ def mesh_facts(key, st, ctl, code, keys, mesh_pairs):
         return {'local': [threads, 1, 1], 'shared': 0,
                 'mesh': [0, 0, payload], 'pair': pairs}
 
+    verts = ctl[0x5f] or 3
+    if verts not in (1, 2, 3):
+        return warn(f'control +0x5f primitive vertex count {verts} is not 1, 2 or 3')
+
     # The first SPH output map describes per-vertex position and generic
     # vectors. Other output classes would shift this plane numbering and are
     # deliberately rejected until their layout is known.
-    if any(code[0x30:0x35]) or code[0x35] & 0xf or any(code[0x46:0x50]):
-        return warn('its SPH output map has outputs besides position and the generic vectors, whose planes are not known')
-    planes = ([c for c in range(4) if code[0x35] >> (4 + c) & 1] +
+    if any(code[0x30:0x35]) or code[0x35] & 0x7 or any(code[0x46:0x50]):
+        return warn('its SPH output map has outputs besides point size, position and the generic vectors, whose planes are not known')
+    planes = (([-4] if code[0x35] & 0x8 else []) +
+              [c for c in range(4) if code[0x35] >> (4 + c) & 1] +
               [4 + i for i in range(128)
                if code[0x36 + i // 8] >> (i % 8) & 1])
-    layout = [maxv, maxp, payload, *planes]
+    layout = [maxv, maxp, payload, -5, verts, *planes]
 
     flats, reads = set(), set()
     for ps in pairs:
