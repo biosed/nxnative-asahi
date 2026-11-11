@@ -42,6 +42,7 @@ int vkx_mesh_bridge(VkCommandBuffer c, const p_draw *d, vkx_mesh_submit *out); /
 void vkx_mesh_abort(void); // clear a pending binding-512 owner lease after any post-bridge failure
 int vkx_mesh_prebridge(VkCommandBuffer c, uint64_t ind); // outside rendering: copy an indirect mesh draw's {count, first} now, for that draw later in the pass
 void vkx_mesh_prebridge_barrier(VkCommandBuffer c);       // after the prebridges of a pass, before it begins
+void vkx_mesh_prebridge_stats(uint64_t *hits, uint64_t *misses, int *valid);   // diagnostic: indirect mesh draws that found their early copy, and not
 int vkx_mesh_prebridged(uint64_t ind);                     // an unused prebridge of this record is ready (the pass need not end for the draw)
 void vkx_mesh_prebridge_reset(void);                       // the pass ended: unused prebridges are dropped
 int vkx_prepare_mesh_program(VkCommandBuffer c, vkx_mesh_program_plan *plan); // proof-gated task(optional)+mesh+fragment preparation

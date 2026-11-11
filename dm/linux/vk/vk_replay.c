@@ -1410,9 +1410,10 @@ static void mesh_prebridge_ahead(VkCommandBuffer c, const uint8_t *p, const uint
     static int on = -1; if (on < 0) { const char *e = getenv("DM_VK_MESH_PREBRIDGE"); on = !(e && !strcmp(e, "0")); }
     if (!on || !vkd_mesh_active()) return;
     const uint8_t *st[16]; int ns = nret; memcpy(st, ret, sizeof *st * (size_t)nret);
-    int n = 0;
+    int n = 0; uint32_t stop = 0xffff;
+    static uint64_t scans, made, stops[64];
     for (int guard = 0; p && guard < 4096; guard++) {
-        op_hdr h; memcpy(&h, p, sizeof h); const void *a = p + 8;
+        op_hdr h; memcpy(&h, p, sizeof h); const void *a = p + 8; stop = h.op;
         switch (h.op) {
         case OP_END: if (ns) { p = st[--ns]; continue; } goto done;
         case OP_JUMP: memcpy(&p, a, 8); continue;
@@ -1428,6 +1429,10 @@ static void mesh_prebridge_ahead(VkCommandBuffer c, const uint8_t *p, const uint
             break;
         }
         case OP_UPDATE_UB: if (!ub_defer_on()) goto done; break;   // held until the pass ends, as the draws see it
+        case OP_SET_RT: if (!rt_same((const p_set_rt *)a)) goto done; break;   // the same targets again keep the pass (the game sets them before most draws)
+        // Counter reports are written by the host when the submission completes (gp_run; a timestamp's query is recorded in place), so none can change an
+        // indirect record read earlier in the same submission; a render condition only decides whether a later draw is skipped (a spare copy then)
+        case OP_REPORT_COUNTER: case OP_RESET_COUNTER: case OP_RENDER_COND:
         case OP_VIEWPORTS: case OP_SCISSOR: case OP_DEPTH_RANGE: case OP_BIND_PROGRAM: case OP_BIND_STATE: case OP_BIND_VATTR: case OP_BIND_VSTREAM:
         case OP_BIND_VBUF: case OP_BIND_UBO: case OP_BIND_SSBO: case OP_BIND_TEX: case OP_BIND_SAMP: case OP_STENCIL: case OP_POLY_OFFSET:
         case OP_SET_TEX_POOL: case OP_SET_SAMP_POOL: case OP_BLEND_COLOR: case OP_BIND_IMG: case OP_DEPTH_CLAMP: case OP_RAST_DISCARD:
@@ -1439,6 +1444,13 @@ static void mesh_prebridge_ahead(VkCommandBuffer c, const uint8_t *p, const uint
     }
 done:
     if (n) vkx_mesh_prebridge_barrier(c);
+    // DM_VK_PASS_GPU: what ends the look-ahead, per 4096 scans
+    if (g_pass_gpu) { scans++; made += (uint64_t)n; stops[stop < 64 ? stop : 63]++;
+        if (!(scans & 4095)) { char line[512]; int o = 0;
+            for (int k = 0; k < 64 && o < (int)sizeof line - 24; k++) if (stops[k]) o += snprintf(line + o, sizeof line - o, " op%d:%llu", k, (unsigned long long)stops[k]);
+            uint64_t hits, misses; int valid; vkx_mesh_prebridge_stats(&hits, &misses, &valid);
+            LOG("vulkan replay: mesh prebridge look-ahead %llu scans, %llu records copied; indirect mesh draws %llu used a copy, %llu did not; stopped at%s",
+                (unsigned long long)scans, (unsigned long long)made, (unsigned long long)hits, (unsigned long long)misses, line); } }
 }
 // DM_VK_PASS_GPU: which NVN barrier bits the game records, and whether each came inside a pass that had drawn, logged per 1024 barriers. A barrier ends the pass
 // today; one that only orders work the pass has not done could leave it open

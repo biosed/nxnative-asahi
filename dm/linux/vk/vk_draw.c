@@ -1486,6 +1486,8 @@ static int pb_find(uint64_t ind) {
     return -1;
 }
 int vkx_mesh_prebridged(uint64_t ind) { return pb_find(ind) >= 0; }
+static uint64_t g_pb_hits, g_pb_misses;
+void vkx_mesh_prebridge_stats(uint64_t *hits, uint64_t *misses, int *valid) { *hits = g_pb_hits; *misses = g_pb_misses; *valid = pb_valid(); }
 
 int vkx_mesh_bridge(VkCommandBuffer c, const p_draw *d, vkx_mesh_submit *out) {
     const vkx_mesh_caps *caps = vkd_mesh_active();
@@ -1525,6 +1527,7 @@ int vkx_mesh_bridge(VkCommandBuffer c, const p_draw *d, vkx_mesh_submit *out) {
     VkBuffer scratch; VkDeviceSize base; uint8_t *host = NULL;
     size_t bytes = d->ind ? 512 : 256;
     int pb = d->ind ? pb_find(d->ind) : -1;   // copied before the pass began (vkx_mesh_prebridge)
+    if (d->ind) { if (pb >= 0) g_pb_hits++; else g_pb_misses++; }
     if (pb >= 0) { scratch = g_pb[pb].b; base = g_pb[pb].base; g_pb[pb].used = 1; }
     else if (!arena_get(bytes, &scratch, &base, &host)) return mesh_bridge_failure("arena", d);
     VkDeviceSize first_off = base, record_off = base + 256;
