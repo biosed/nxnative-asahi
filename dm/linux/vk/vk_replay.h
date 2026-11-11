@@ -89,6 +89,7 @@ void vkr_cpu_written_refresh(void);   // before a submission's first draw: textu
 int vkr_bindless_recent_tex_ids(uint64_t registered_after, int *ids,
                                 int cap);                              // current registrations from the new scene generation
 uint64_t vkr_submission_count(void);
+uint64_t vkr_uniform_update_count(void);
 uint64_t vkr_mesh_issue_count(void);
 void vkr_passdump_next(long frames);   // DM_CTL passdump: trace the next bounded set of complete frames
 void vkr_texraw(uint64_t serial, const char *path);   // DM_CTL texraw: queue one host-image PNG readback

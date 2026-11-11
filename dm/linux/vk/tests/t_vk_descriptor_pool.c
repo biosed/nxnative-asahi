@@ -58,6 +58,17 @@ int main(void) {
     check(vkx_descriptor_union_add(&u, VKX_STAGE_PS,
                                    VKX_DESCRIPTOR_BINDING_LIMIT, 't', 1) == -1,
           "out-of-range canonical bindings are rejected");
+
+    vkx_bindless_handle_ids ids = vkx_bindless_ids((7u << 20) | 19u,
+                                                    1000, 200, 262144, 4096);
+    check(ids.texture == 1019 && ids.sampler == 207,
+          "combined handles use the same texture/sampler pool-base rule");
+    ids = vkx_bindless_ids(0, 1000, 200, 262144, 4096);
+    check(!ids.texture && !ids.sampler, "zero IDs remain null after rebasing");
+    ids = vkx_bindless_ids((4095u << 20) | 0xfffffu,
+                           262143, 4095, 262144, 4096);
+    check(!ids.texture && !ids.sampler,
+          "rebased IDs outside the persistent tables fail closed");
     printf("t_vk_descriptor_pool: %s (%d failures)\n", bad ? "FAILED" : "passed", bad);
     return bad != 0;
 }

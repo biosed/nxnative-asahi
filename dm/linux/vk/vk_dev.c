@@ -53,9 +53,19 @@ int vkd_init(int with_window) {
     VkPhysicalDeviceVulkan12Features f12 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, .pNext = &f13};
     VkPhysicalDeviceFeatures2 have = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &f12};
     vkGetPhysicalDeviceFeatures2(g_vkd.pd, &have);
-    if (!f13.dynamicRendering || !f12.bufferDeviceAddress || !f12.timelineSemaphore || !have.features.sparseBinding || !have.features.sparseResidencyBuffer) {
-        LOG("[RED] vulkan: %s lacks a required feature (dynamic rendering %d, buffer device address %d, timeline semaphores %d, sparse binding %d, sparse buffers %d)", g_vkd.props.deviceName,
-            f13.dynamicRendering, f12.bufferDeviceAddress, f12.timelineSemaphore, have.features.sparseBinding, have.features.sparseResidencyBuffer);
+    if (!f13.dynamicRendering || !f12.bufferDeviceAddress || !f12.timelineSemaphore ||
+        !f12.shaderSampledImageArrayNonUniformIndexing ||
+        !f12.descriptorBindingSampledImageUpdateAfterBind ||
+        !f12.descriptorBindingPartiallyBound ||
+        !f12.descriptorBindingUpdateUnusedWhilePending ||
+        !have.features.sparseBinding || !have.features.sparseResidencyBuffer) {
+        LOG("[RED] vulkan: %s lacks a required feature (dynamic rendering %d, buffer device address %d, timeline semaphores %d, sampled-image nonuniform %d, sampled-image update-after-bind %d, partially-bound %d, update-unused %d, sparse binding %d, sparse buffers %d)", g_vkd.props.deviceName,
+            f13.dynamicRendering, f12.bufferDeviceAddress, f12.timelineSemaphore,
+            f12.shaderSampledImageArrayNonUniformIndexing,
+            f12.descriptorBindingSampledImageUpdateAfterBind,
+            f12.descriptorBindingPartiallyBound,
+            f12.descriptorBindingUpdateUnusedWhilePending,
+            have.features.sparseBinding, have.features.sparseResidencyBuffer);
         return 0;
     }
     if (g_vkd.placed && !mp.memoryMapPlaced) g_vkd.placed = 0;

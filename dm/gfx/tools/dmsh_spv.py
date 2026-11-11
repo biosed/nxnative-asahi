@@ -13,7 +13,9 @@ HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, HERE)
 import dmsh_chain   # before XLATE is set: XLATE_DIR stays the pinned build in dmsh_xlate_bin
 from dmsh_spv_stage import STAGE_SET, StageError, import_native_translation
 from dmsh_spv_hmma import lower_file as lower_hmma_file, remove_outputs
+from dmsh_spv_htab import HtabError, transform_tex_ubo_tables
 from dmsh_spv_vector import optimize_vector_loads
+import dmsh_abi as _abi
 
 if len(sys.argv) < 3: sys.exit('usage: DM_GAME=<id> dmsh_spv.py <Switch package dir> <output dir> [key...]')
 DLL = os.path.join(dmsh_chain.XLATE_DIR, 'dmsh_xlate.dll')
@@ -67,7 +69,7 @@ def fix_caps(path):
     return len(add)
 
 class Translated(Exception): pass
-_run, _lock, _state = subprocess.run, threading.Lock(), {'jobs': 0, 'spv': 0, 'native_mesh': 0, 'failed': {}, 'caps': 0, 'hmma': 0, 'hmma_shaders': 0, 'vec2': 0, 'vec4': 0, 'vec_loads': 0, 'vec_shaders': 0, 'skipped_stage': {}, 'cross': 0}
+_run, _lock, _state = subprocess.run, threading.Lock(), {'jobs': 0, 'spv': 0, 'native_mesh': 0, 'failed': {}, 'caps': 0, 'hmma': 0, 'hmma_shaders': 0, 'htab_tables': 0, 'htab_loads': 0, 'htab_shaders': 0, 'vec2': 0, 'vec4': 0, 'vec_loads': 0, 'vec_shaders': 0, 'skipped_stage': {}, 'cross': 0}
 
 def lower_hmma(path):
     """Lower the current TensorPass HMMA helper and validate the final module."""
@@ -259,7 +261,7 @@ def vk_canon(key):
         if t in types and types[t][0] == 25: img = types[t][1]
         dim = {0: 1, 1: 2, 2: 3, 3: 4, 5: 5}.get(img[2], 2) if img else 0
         info[bind[a[1]]] = (dim, img[4] if img else 0, img[5] if img else 0, img[3] if img else 0, cnt)
-    remap, rows = {}, []
+    remap, rows, htab_tables = {}, [], []
     for b, es in sorted(by_binding.items()):
         main = next((e for e in es if not e['name'].endswith('Smplr')), es[0])
         smp = next((e for e in es if e['name'].endswith('Smplr')), None)
@@ -271,9 +273,23 @@ def vk_canon(key):
         if cb in used: cb = descriptor_binding(seq, 'duplicate', 'dup', desc)
         used[cb] = b; remap[b] = cb
         dim, arr, ms, dep, cnt = info.get(b, (0, 0, 0, 0, 1))
+        main_kind = main['kind']
+        samp_kind = smp['kind'] if smp else ''
+        if main_kind == _abi.KIND_TEX_UBO and cnt >= 33:
+            moff = main.get('off', 0) if main.get('off') is not None else 0
+            soff = smp.get('off', 0) if smp and smp.get('off') is not None else 0
+            if (not smp or samp_kind != _abi.KIND_SAMP_UBO or
+                    main.get('reg') != smp.get('reg') or moff != soff):
+                raise HtabError('binding %d large tex_ubo is not one combined handle table' % cb)
+            cbuf_reg = main.get('reg')
+            if cbuf_reg is None or not 0 <= cbuf_reg < 14:
+                raise HtabError('binding %d large tex_ubo has no canonical cbuf' % cb)
+            htab_tables.append({'binding': cb, 'cbuf_binding': 1 + cbuf_reg,
+                                'off': moff, 'count': cnt})
+            main_kind, samp_kind = _abi.KIND_TEX_HTAB, _abi.KIND_SAMP_HTAB
         sreg = smp.get('reg') if smp else ''
-        rows.append('\t'.join(str(x) for x in (cb, desc, main['kind'], '' if main.get('reg') is None else main['reg'], main.get('off', '') if main.get('off') is not None else '',
-                                                 smp['kind'] if smp else '', '' if sreg is None else (sreg if not isinstance(sreg, (list, tuple)) else sreg[1]),
+        rows.append('\t'.join(str(x) for x in (cb, desc, main_kind, '' if main.get('reg') is None else main['reg'], main.get('off', '') if main.get('off') is not None else '',
+                                                 samp_kind, '' if sreg is None else (sreg if not isinstance(sreg, (list, tuple)) else sreg[1]),
                                                  smp.get('off', '') if smp and smp.get('off') is not None else '', dim, arr, ms, dep, cnt)))
     st = STAGE_SET.get(vk['stage'], 0)
     b = open(os.path.join(OUT, key + '.spv'), 'rb').read(); w = list(struct.unpack('<%dI' % (len(b) // 4), b)); i = 5
@@ -285,6 +301,18 @@ def vk_canon(key):
             elif w[i + 2] == 33: w[i + 3] = remap.get(w[i + 3], w[i + 3])
         i += n
     data = struct.pack('<%dI' % len(w), *w)
+    htab = {'tables': 0, 'loads': 0}
+    if htab_tables:
+        data, htab = transform_tex_ubo_tables(
+            data, st, htab_tables, _abi.C2_TEX_BASE, _abi.C2_SAMP_BASE)
+        rows.append('\t'.join(str(x) for x in
+                    (17, 'u', _abi.KIND_DRVCB, 2, '', '', '', '', 0, 0, 0, 0, 1)))
+        job_path = os.path.join(OUT, key + '.job.json')
+        job = json.load(open(job_path))
+        job['vk_handle_tables'] = htab['tables']
+        job['vk_handle_table_loads'] = htab['loads']
+        with open(job_path, 'w') as jf:
+            json.dump(job, jf, indent=2, sort_keys=True); jf.write('\n')
     if vk['stage'] in ('ts', 'ms'):
         job = json.load(open(os.path.join(OUT, key + '.job.json')))
         if vk['stage'] == 'ms' and 'mesh_has_task' not in job:
@@ -340,6 +368,7 @@ def vk_canon(key):
             try: os.unlink(temp)
             except FileNotFoundError: pass
         raise
+    vector['htab_tables'] = htab['tables']; vector['htab_loads'] = htab['loads']
     return vector
 
 sys.argv = [os.path.join(HERE, 'dmsh_build.py')] + sys.argv[1:]
@@ -352,6 +381,7 @@ for f in sorted(os.listdir(OUT)):
     try:
         bs = vk_reflect(f[:-4])
         vector = vk_canon(f[:-4])
+        _state['htab_tables'] += vector['htab_tables']; _state['htab_loads'] += vector['htab_loads']; _state['htab_shaders'] += bool(vector['htab_tables'])
         _state['vec2'] += vector['groups2']; _state['vec4'] += vector['groups4']; _state['vec_loads'] += vector['scalar_loads']; _state['vec_shaders'] += bool(vector['scalar_loads'])
         for b in bs: _kinds[b['kind']] += 1; _noreg += b['kind'] in ('cbuf', 'tex', 'img', 'sbuf', 'samp', 'samp_tex', 'tbuf') and b.get('reg') is None
     except Exception as e:
@@ -361,6 +391,7 @@ for f in sorted(os.listdir(OUT)):
 print('Vulkan reflection (.vk.json): bindings by kind ' + ', '.join(f'{k} {v}' for k, v in _kinds.most_common()) + f'; without a slot {_noreg}')
 print(f'SPIR-V: {_state["spv"]} shaders written from {_state["jobs"]} jobs to {OUT} (native task/mesh imports {_state["native_mesh"]}); translation/reflection failed {len(_state["failed"])}; storage image capabilities added to {_state["caps"]}')
 print(f'SPIR-V HMMA: {_state["hmma"]} current-ABI helper calls lowered in {_state["hmma_shaders"]} compute shaders')
+print(f'SPIR-V handle tables: {_state["htab_tables"]} large per-draw arrays lowered to {_state["htab_loads"]} persistent-pool accesses in {_state["htab_shaders"]} shaders')
 print(f'SPIR-V vector loads: {_state["vec_loads"]} scalar loads coalesced as {_state["vec2"]} x 64-bit and {_state["vec4"]} x 128-bit groups in {_state["vec_shaders"]} shaders')
 print('SPIR-V stages omitted (no validated DMSH_VK_MESH_EXT_DIR input): ' + (', '.join(f'{k} {v}' for k, v in sorted(_state['skipped_stage'].items())) or 'none') + f'; Metal conversions bypassed {_state["cross"]}')
 for key, msg in list(_state['failed'].items())[:10]: print(f'  [RED] {key}: {msg}')

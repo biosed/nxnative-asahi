@@ -18,6 +18,8 @@
 #define DMSH_C2_SEPTEX 0x168             // separate textures (nvnCommandBufferBindSeparateTexture), slot r at 0x168 + 8 r; Unity, Unreal and RE Engine bind these
 #define DMSH_C2_SAMP 0x568               // separate samplers (nvnCommandBufferBindSeparateSampler), slot r at 0x568 + 8 r
 #define DMSH_C2_SEP_SLOTS 128            // slots of each separate table (textures, samplers)
+#define DMSH_C2_TEX_BASE 0x968           // bound texture-pool base for a shader that resolves a tex_htab handle through Vulkan's persistent pool
+#define DMSH_C2_SAMP_BASE 0x96C          // bound sampler-pool base for the same handle (the c2 tail is reserved driver data)
 #define DMSH_SEPTEX_SLOT0 128            // the texture slot the reflection gives separate texture 0: separate texture r is slot 128 + r, where the host binds it (nvn_obj.h NVN_SEPTEX_SLOT0)
 
 // c0: tables of DMSH_C0_ROW-byte entries (address 64 bits, size 32 bits), and a few single words

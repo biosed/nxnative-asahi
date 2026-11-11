@@ -2199,6 +2199,7 @@ static int reg_take(int *ids, int cap, int *list, int *n, uint8_t *flag) {
 int vkr_bindless_take_tex_dirty(int *ids, int cap) { return cap > 0 ? reg_take(ids, cap, g_tdirty, &g_ntdirty, g_tdflag) : 0; }
 int vkr_bindless_take_samp_dirty(int *ids, int cap) { return cap > 0 ? reg_take(ids, cap, g_sdirty, &g_nsdirty, g_sdflag) : 0; }
 uint64_t vkr_submission_count(void) { return atomic_load(&g_subs); }
+uint64_t vkr_uniform_update_count(void) { return g_ub_updates; }
 uint64_t vkr_mesh_issue_count(void) { return atomic_load(&g_mesh_issue_seq); }
 uint32_t vkr_pick_mem(uint32_t bits, VkMemoryPropertyFlags want) { return pick_mem(bits, want); }
 uint64_t vkr_fence_next(void) { return atomic_load(&g_fence) + 1; }

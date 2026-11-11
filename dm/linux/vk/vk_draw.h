@@ -13,6 +13,25 @@ enum {
     VKX_DESCRIPTOR_BINDING_LIMIT = 1024,
     VKX_DESCRIPTOR_TYPE_COUNT = 5,
 };
+
+typedef struct { uint32_t texture, sampler; } vkx_bindless_handle_ids;
+// An NVN handle stores a pool-local 20-bit texture ID and 12-bit sampler ID.
+// ID zero remains the null descriptor; nonzero IDs are rebased to the pools
+// bound by nvnCommandBufferSetTexturePool/SamplerPool and fail closed if the
+// persistent Vulkan tables cannot represent them.
+static inline vkx_bindless_handle_ids vkx_bindless_ids(uint32_t handle,
+                                                       int texture_base,
+                                                       int sampler_base,
+                                                       uint32_t texture_count,
+                                                       uint32_t sampler_count) {
+    uint32_t tl = handle & 0xfffffu, sl = handle >> 20;
+    uint64_t tg = texture_base >= 0 ? (uint64_t)tl + (uint32_t)texture_base : UINT64_MAX;
+    uint64_t sg = sampler_base >= 0 ? (uint64_t)sl + (uint32_t)sampler_base : UINT64_MAX;
+    return (vkx_bindless_handle_ids){
+        tl && tg < texture_count ? (uint32_t)tg : 0,
+        sl && sg < sampler_count ? (uint32_t)sg : 0,
+    };
+}
 typedef struct {
     char type[VKX_STATE_STAGE_COUNT][VKX_DESCRIPTOR_BINDING_LIMIT];
     uint32_t count[VKX_STATE_STAGE_COUNT][VKX_DESCRIPTOR_BINDING_LIMIT];

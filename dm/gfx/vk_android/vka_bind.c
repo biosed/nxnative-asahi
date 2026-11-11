@@ -163,6 +163,9 @@ void vka_drv_fill(const vka_bstate *s, int st, int bank, int pool, uint8_t *d) {
         }
         for (int r = 0; r < DMSH_C2_SEP_SLOTS; r++) { uint64_t h = tx[DMSH_SEPTEX_SLOT0 + r]; uint32_t v = C2_LOCAL(h); memcpy(d + DMSH_C2_SEPTEX + DMSH_C2_ROW * r, &v, 4); }
         for (int r = 0; r < DMSH_C2_SEP_SLOTS; r++) { uint64_t h = s->samp[st][r]; uint32_t v = C2_LOCAL(h); memcpy(d + DMSH_C2_SAMP + DMSH_C2_ROW * r, &v, 4); }
+        uint32_t tex_base = (uint32_t)s->tex_base, samp_base = (uint32_t)s->samp_base;
+        memcpy(d + DMSH_C2_TEX_BASE, &tex_base, 4);
+        memcpy(d + DMSH_C2_SAMP_BASE, &samp_base, 4);
 #undef C2_LOCAL
     }
 }

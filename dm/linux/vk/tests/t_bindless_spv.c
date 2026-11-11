@@ -12,12 +12,13 @@ static uint32_t decoration(const uint32_t *w, size_t n, uint32_t id, uint32_t de
 
 static size_t module(uint32_t *w) {
     size_t n = 0; uint32_t h[] = {0x07230203, 0x00010300, 0, 64, 0}; put(w, &n, h, 5);
-    // Four pool variables in the translator's original set/bindings and one
+    // Five pool variables in the translator's original set/bindings and one
     // ordinary descriptor which must remain untouched.
-    for (uint32_t id = 30; id <= 34; id++) { EMIT((4u<<16)|71, id, 34, 1); }
+    for (uint32_t id = 30; id <= 35; id++) { EMIT((4u<<16)|71, id, 34, 1); }
     EMIT((4u<<16)|71, 30, 33, 564); EMIT((4u<<16)|71, 31, 33, 564);
     EMIT((4u<<16)|71, 32, 33, 566); EMIT((4u<<16)|71, 33, 33, 660);
     EMIT((4u<<16)|71, 34, 33, 64);
+    EMIT((4u<<16)|71, 35, 33, 567);
     EMIT((4u<<16)|21, 1, 32, 0);                    // u32
     EMIT((3u<<16)|22, 2, 32);                       // f32
     EMIT((4u<<16)|43, 1, 3, 1048576);               // texture count
@@ -26,6 +27,9 @@ static size_t module(uint32_t *w) {
     EMIT((9u<<16)|25, 11, 2, 1, 0, 1, 0, 1, 0);    // image2DArray
     EMIT((9u<<16)|25, 12, 2, 1, 1, 0, 0, 1, 0);    // depth image2D
     EMIT((2u<<16)|26, 13);                          // sampler
+    EMIT((9u<<16)|25, 14, 2, 2, 0, 0, 0, 1, 0);    // image3D
+    EMIT((4u<<16)|28, 15, 14, 3);                   // image3D[texture count]
+    EMIT((4u<<16)|32, 16, 0, 15);                   // UniformConstant array pointer
     EMIT((4u<<16)|28, 20, 10, 3); EMIT((4u<<16)|28, 21, 11, 3);
     EMIT((4u<<16)|28, 22, 12, 3); EMIT((4u<<16)|28, 23, 13, 4);
     EMIT((4u<<16)|32, 24, 0, 20); EMIT((4u<<16)|32, 25, 0, 21);
@@ -34,6 +38,7 @@ static size_t module(uint32_t *w) {
     EMIT((4u<<16)|59, 24, 30, 0); EMIT((4u<<16)|59, 25, 31, 0);
     EMIT((4u<<16)|59, 26, 32, 0); EMIT((4u<<16)|59, 27, 33, 0);
     EMIT((4u<<16)|59, 28, 34, 0);
+    EMIT((4u<<16)|59, 16, 35, 0);
     return n;
 }
 #undef EMIT
@@ -46,7 +51,7 @@ static size_t feedback_module(uint32_t *w) {
     FEMIT((5u<<16)|15, 4, 20, 0x6e69616d, 0);    // Fragment main, no interface yet
     FEMIT((3u<<16)|16, 20, 7);                    // OriginUpperLeft
     FEMIT((4u<<16)|71, 30, 34, 5);               // pool set 5
-    FEMIT((4u<<16)|71, 30, 33, 0);               // texture-array binding 0
+    FEMIT((4u<<16)|71, 30, 33, 4);               // 3D texture-array binding 4
     FEMIT((2u<<16)|19, 2);                        // void
     FEMIT((4u<<16)|21, 1, 32, 0);                // u32
     FEMIT((3u<<16)|22, 3, 32);                    // f32
@@ -141,11 +146,12 @@ int main(int argc, char **argv) {
     if (argc == 4 && !strcmp(argv[1], "--feedback")) return rewrite_file(1, argv[2], argv[3]);
     uint32_t w[256]; size_t n = module(w), no = 0; unsigned patched = 0;
     uint32_t *o = spvr_bindless(w, n, 5, 32768, &no, &patched);
-    check(o && no == n && patched == 4, "all four pool variables recognised");
+    check(o && no == n && patched == 5, "all five pool variables recognised");
     check(o && decoration(o, no, 30, 33) == 0 && decoration(o, no, 31, 33) == 1 && decoration(o, no, 32, 33) == 2,
           "image pools canonicalised by 2D/array/depth shape");
     check(o && decoration(o, no, 33, 33) == 3, "sampler pool canonicalised");
-    check(o && decoration(o, no, 30, 34) == 5 && decoration(o, no, 31, 34) == 5 && decoration(o, no, 32, 34) == 5 && decoration(o, no, 33, 34) == 5,
+    check(o && decoration(o, no, 35, 33) == 4, "3D image pool canonicalised");
+    check(o && decoration(o, no, 30, 34) == 5 && decoration(o, no, 31, 34) == 5 && decoration(o, no, 32, 34) == 5 && decoration(o, no, 33, 34) == 5 && decoration(o, no, 35, 34) == 5,
           "pool variables moved to bindless set 5");
     check(o && constant(o, no, 3) == 32768 && constant(o, no, 4) == 4096, "texture count bounded and sampler count preserved");
     check(o && decoration(o, no, 34, 33) == 64 && decoration(o, no, 34, 34) == 1, "ordinary descriptor untouched");

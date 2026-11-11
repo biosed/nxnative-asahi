@@ -356,14 +356,16 @@ uint32_t *spvr_bindless(const uint32_t *code, size_t words, uint32_t set,
         i += z;
     }
     for (uint32_t var = 0; var < nid; var++) {
-        if (op[var] != OpVariable || (binding[var] < 564 || binding[var] > 566)) continue;
+        if (op[var] != OpVariable || (binding[var] < 564 || binding[var] > 567)) continue;
         uint32_t ptr = a[var], arr = ptr < nid && op[ptr] == OpTypePointer ? a[ptr] : UINT32_MAX;
         uint32_t elem = arr < nid && op[arr] == OpTypeArray ? a[arr] : UINT32_MAX;
         uint32_t len = arr < nid && op[arr] == OpTypeArray ? b[arr] : UINT32_MAX;
-        if (elem >= nid || len >= nid || op[elem] != OpTypeImage || op[len] != OpConstant || a[len] != 1048576 || a[elem] != 1) continue; // SpvDim2D
-        if (b[elem]) canonical[var] = 2;      // depth 2D
-        else if (c[elem]) canonical[var] = 1; // 2D array
-        else canonical[var] = 0;              // ordinary 2D
+        if (elem >= nid || len >= nid || op[elem] != OpTypeImage || op[len] != OpConstant || a[len] != 1048576) continue;
+        if (a[elem] == 2 && !b[elem] && !c[elem]) canonical[var] = 4; // ordinary 3D
+        else if (a[elem] != 1) continue;       // remaining pools are SpvDim2D
+        else if (b[elem]) canonical[var] = 2; // depth 2D
+        else if (c[elem]) canonical[var] = 1;// 2D array
+        else canonical[var] = 0;             // ordinary 2D
         limit_constant[len] = 1; (*patched)++;
     }
     for (uint32_t var = 0; var < nid; var++) {
@@ -458,7 +460,8 @@ uint32_t *spvr_bindless_feedback(const uint32_t *code, size_t words,
         }
     }
     for (uint32_t id = 1; id < bound; id++)
-        if (op[id] == OpVariable && set[id] == bindless_set && binding[id] <= 2) texture_var[id] = 1;
+        if (op[id] == OpVariable && set[id] == bindless_set &&
+            (binding[id] <= 2 || binding[id] == 4)) texture_var[id] = 1;
 
     bindless_feedback_patch p[512]; unsigned np = 0;
     uint32_t cur_label = 0;
