@@ -14,10 +14,10 @@ OUT := gen/$(GAME)
 GAME_GEN := $(HOST)/gen/$(GAME)
 GAME_DIR := $(if $(wildcard ../games/$(GAME)/game.tsv),../games/$(GAME),$(GAME_GEN)/profile)
 
-CPPFLAGS := -D_GNU_SOURCE -include compat/dm_compat.h -Icompat -I$(HOST) \
+CPPFLAGS := -D_GNU_SOURCE -DDM_LINUX -include compat/dm_compat.h -Icompat -I$(HOST) \
             -I../gfx/nvn -I../gfx/nvn/include -I../third_party/vulkan-headers/include \
             -I$(GAME_GEN) -I$(GAME_DIR)
-CFLAGS := -std=gnu11 -MMD -MP -O1 -g -fPIC -fvisibility=hidden -Wall -Wextra \
+CFLAGS := -std=gnu11 -MMD -MP -O2 -g -fPIC -fvisibility=hidden -Wall -Wextra \
           -Wno-unused-function -Wno-format -Wno-deprecated-declarations
 
 NVN_SRC := ../gfx/hle_nv.c ../gfx/hle_vi.c \
@@ -38,7 +38,7 @@ OBJ := $(NVN_OBJ) \
        $(patsubst %,$(OUT)/obj/linux/%.o,$(NULL_SRC))
 
 .DEFAULT_GOAL := null-renderer
-.PHONY: profile null-renderer vulkan-replay-objects nxasahi-renderer-objects nxasahi-renderer nxasahi-front vulkan-selftest vk-mem-selftest t_push t_skipcs t_gpstamp t_focus t_gmem_trace t_missing_log t_counter_report t_vk_stage t_vk_format t_vk_cs_gpu_lifecycle t_vk_mesh t_vk_mesh_compile t_vk_descriptor_pool t_vk_mesh_coverage t_vk_shader_resolve dmhost dmhost-vulkan t_fs_linux clean
+.PHONY: profile null-renderer vulkan-replay-objects nxasahi-renderer-objects nxasahi-renderer nxasahi-front vulkan-selftest vk-mem-selftest t_push t_skipcs t_gpstamp t_focus t_front_input t_gmem_trace t_missing_log t_counter_report t_nvn_capture t_nvn_queue t_vk_stage t_vk_compile_watch t_vk_shader_cache t_vk_format t_vk_cs_gpu_lifecycle t_vk_image_refs t_vk_gmem_map t_vk_bindless_lru t_vk_mesh t_vk_mesh_compile t_vk_descriptor_pool t_vk_mesh_coverage t_vk_shader_resolve t_vk_movie t_vk_linear t_vk_passlog t_vk_texraw dmhost dmhost-vulkan t_fs_linux clean
 
 # The consolidated asahi branch also carries the Linux host. Keep its object
 # namespace and rules separate so renderer-only checks remain bounded and a
@@ -111,6 +111,11 @@ $(OUT)/t_skipcs: vk/tests/t_skipcs.c vk/vk_skipcs.h | profile
 	$(CC) $(CPPFLAGS) -std=gnu11 -O1 -g -Wall -Wextra -Werror -Ivk -o $@ $<
 t_skipcs: $(OUT)/t_skipcs
 	$<
+$(OUT)/t_vk_movie: vk/tests/t_vk_movie.c vk/vk_movie.h | profile
+	@mkdir -p $(dir $@)
+	$(CC) $(CPPFLAGS) -std=gnu11 -O1 -g -Wall -Wextra -Werror -Ivk -o $@ $<
+t_vk_movie: $(OUT)/t_vk_movie
+	$<
 $(OUT)/t_gpstamp: vk/tests/t_gpstamp.c vk/vk_gpstamp.h | profile
 	@mkdir -p $(dir $@)
 	$(CC) $(CPPFLAGS) -std=gnu11 -O1 -g -Wall -Wextra -Werror -Ivk -o $@ $<
@@ -121,6 +126,11 @@ $(OUT)/t_focus: vk/tests/t_focus.c vk/front_focus.h | profile
 	$(CC) $(CPPFLAGS) -std=gnu11 -O1 -g -Wall -Wextra -Werror -Ivk -o $@ $<
 t_focus: $(OUT)/t_focus
 	$<
+$(OUT)/t_front_input: vk/tests/t_front_input.c vk/front_input.c | profile
+	@mkdir -p $(dir $@)
+	$(CC) $(CPPFLAGS) -std=gnu11 -O1 -g -Wall -Wextra -Werror -Ivk $$($(PKG_CONFIG) --cflags sdl3) -o $@ $< $$($(PKG_CONFIG) --libs sdl3) -lm
+t_front_input: $(OUT)/t_front_input
+	$< ../../../config/oot-keyboard.map
 $(OUT)/t_gmem_trace: vk/tests/t_gmem_trace.c vk/vk_gmem_trace.h vk/spv_reflect.c vk/spv_reflect.h | profile
 	@mkdir -p $(dir $@)
 	$(CC) $(CPPFLAGS) -std=gnu11 -O1 -g -Wall -Wextra -Werror -Ivk $$($(PKG_CONFIG) --cflags vulkan) -o $@ vk/tests/t_gmem_trace.c vk/spv_reflect.c
@@ -141,13 +151,59 @@ $(OUT)/t_counter_report: vk/tests/t_counter_report.c vk/vk_counter_report.h | pr
 	$(CC) $(CPPFLAGS) -std=gnu11 -O1 -g -Wall -Wextra -Werror -Ivk -o $@ $<
 t_counter_report: $(OUT)/t_counter_report
 	$<
+$(OUT)/t_nvn_capture: ../gfx/tests/t_capture.c ../gfx/nvn/nvn_capture.c ../gfx/nvn/nvn_capture.h ../gfx/nvn/nvn_obj.h | profile
+	@mkdir -p $(dir $@)
+	$(CC) $(CPPFLAGS) -std=gnu11 -O1 -g -Wall -Wextra -Wno-unused-function -o $@ ../gfx/tests/t_capture.c ../gfx/nvn/nvn_capture.c
+t_nvn_capture: $(OUT)/t_nvn_capture
+	$<
+$(OUT)/t_nvn_queue: vk/tests/t_nvn_queue.c ../gfx/nvn/nvn_queue.inc ../gfx/nvn/nvn_queue.h ../gfx/nvn/nvn_capture.h ../gfx/nvn/nvn_obj.h | profile
+	@mkdir -p $(dir $@)
+	$(CC) $(CPPFLAGS) -std=gnu11 -O1 -g -Wall -Wextra -Werror -Ivk -pthread -o $@ $<
+t_nvn_queue: $(OUT)/t_nvn_queue
+	$<
+	DM_NVN_QUEUE_SCHED=0 $< bypass
 $(OUT)/t_vk_stage: vk/tests/t_vk_stage.c vk/vk_stage.h | profile
 	@mkdir -p $(dir $@)
 	$(CC) $(CPPFLAGS) -std=gnu11 -O1 -g -Wall -Wextra -Werror -Ivk $$($(PKG_CONFIG) --cflags vulkan) -o $@ $<
 t_vk_stage: $(OUT)/t_vk_stage
 	$<
+$(OUT)/t_vk_compile_watch: vk/tests/t_vk_compile_watch.c vk/vk_compile_watch.h | profile
+	@mkdir -p $(dir $@)
+	$(CC) $(CPPFLAGS) -std=gnu11 -O1 -g -Wall -Wextra -Werror -Ivk -o $@ $<
+t_vk_compile_watch: $(OUT)/t_vk_compile_watch
+	$<
 
-$(OUT)/t_vk_format: vk/tests/t_vk_format.c vk/vk_replay.h vk/vk_fmt.c vk/vk_fmt.h ../gfx/tex/nvn_fmt_mtl.c ../gfx/tex/nvn_fmt_mtl.h | profile
+$(OUT)/t_vk_shader_cache: vk/tests/t_vk_shader_cache.c vk/vk_shader_cache.h | profile
+	@mkdir -p $(dir $@)
+	$(CC) $(CPPFLAGS) -std=gnu11 -O1 -g -Wall -Wextra -Werror -Ivk -o $@ $<
+t_vk_shader_cache: $(OUT)/t_vk_shader_cache
+	$<
+
+$(OUT)/t_vk_image_refs: vk/tests/t_vk_image_refs.c vk/vk_image_refs.h vk/vk_tex_lifetime.h | profile
+	@mkdir -p $(dir $@)
+	$(CC) $(CPPFLAGS) -std=gnu11 -O1 -g -Wall -Wextra -Werror -Ivk -o $@ $<
+t_vk_image_refs: $(OUT)/t_vk_image_refs
+	$<
+
+$(OUT)/t_vk_addr_set: vk/tests/t_vk_addr_set.c vk/vk_addr_set.h | profile
+	@mkdir -p $(dir $@)
+	$(CC) $(CPPFLAGS) -std=gnu11 -O1 -g -Wall -Wextra -Werror -Ivk -o $@ $<
+t_vk_addr_set: $(OUT)/t_vk_addr_set
+	$<
+
+$(OUT)/t_vk_gmem_map: vk/tests/t_vk_gmem_map.c vk/vk_gmem_map.h ../gfx/nvn/dmsh_abi.h | profile
+	@mkdir -p $(dir $@)
+	$(CC) $(CPPFLAGS) -std=gnu11 -O1 -g -Wall -Wextra -Werror -Ivk -o $@ $<
+t_vk_gmem_map: $(OUT)/t_vk_gmem_map
+	$<
+
+$(OUT)/t_vk_bindless_lru: vk/tests/t_vk_bindless_lru.c vk/vk_bindless_lru.h | profile
+	@mkdir -p $(dir $@)
+	$(CC) $(CPPFLAGS) -std=gnu11 -O1 -g -Wall -Wextra -Werror -Ivk -o $@ $<
+t_vk_bindless_lru: $(OUT)/t_vk_bindless_lru
+	$<
+
+$(OUT)/t_vk_format: vk/tests/t_vk_format.c vk/vk_replay.h vk/vk_fmt.c vk/vk_fmt.h vk/vk_swizzle.h ../gfx/tex/nvn_fmt_mtl.c ../gfx/tex/nvn_fmt_mtl.h | profile
 	@mkdir -p $(dir $@)
 	$(CC) $(CPPFLAGS) -std=gnu11 -O1 -g -Wall -Wextra -Werror -Ivk $$($(PKG_CONFIG) --cflags vulkan) -o $@ vk/tests/t_vk_format.c vk/vk_fmt.c ../gfx/tex/nvn_fmt_mtl.c
 t_vk_format: $(OUT)/t_vk_format
@@ -179,6 +235,22 @@ $(OUT)/t_vk_omap: vk/tests/t_vk_omap.c vk/vk_omap.h | profile
 	@mkdir -p $(dir $@)
 	$(CC) $(CPPFLAGS) -std=gnu11 -O1 -g -Wall -Wextra -Werror -Ivk -o $@ $<
 t_vk_omap: $(OUT)/t_vk_omap
+	$<
+$(OUT)/t_vk_linear: vk/tests/t_vk_linear.c vk/vk_linear_set.h | profile
+	@mkdir -p $(dir $@)
+	$(CC) $(CPPFLAGS) -std=gnu11 -O1 -g -Wall -Wextra -Werror -Ivk -o $@ $<
+t_vk_linear: $(OUT)/t_vk_linear
+	$<
+$(OUT)/t_vk_passlog: vk/tests/t_vk_passlog.c vk/vk_passlog.h | profile
+	@mkdir -p $(dir $@)
+	$(CC) $(CPPFLAGS) -std=gnu11 -O1 -g -Wall -Wextra -Werror -Ivk -o $@ $<
+t_vk_passlog: $(OUT)/t_vk_passlog
+	$<
+
+$(OUT)/t_vk_texraw: vk/tests/t_vk_texraw.c vk/vk_texraw.h | profile
+	@mkdir -p $(dir $@)
+	$(CC) $(CPPFLAGS) -std=gnu11 -O1 -g -Wall -Wextra -Werror -Ivk -o $@ $<
+t_vk_texraw: $(OUT)/t_vk_texraw
 	$<
 $(OUT)/t_vk_mesh_coverage: vk/tests/t_vk_mesh_coverage.c vk/spv_reflect.c vk/spv_reflect.h | profile
 	@mkdir -p $(dir $@)

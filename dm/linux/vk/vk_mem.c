@@ -9,6 +9,7 @@
 #include "dmsh_abi.h"
 #include "vk_dev.h"
 #include "vk_mem.h"
+#include "vk_gmem_map.h"
 #include "nvn_dirty.h"
 #include <sys/mman.h>
 #include <sys/syscall.h>
@@ -25,19 +26,27 @@ typedef struct {
     VkDeviceMemory *chunk;                               // one per vkm_granule(), VK_NULL_HANDLE until backed
     uint8_t *referenced;                                 // chunks reached by an explicit renderer GPU buffer lookup
     uint8_t *addressed;                                  // chunks in ranges NVN has handed to the GPU
+    uint8_t *backed_by;                                  // VKM_BACK_*: the path that first placed each chunk
+    uint8_t *raw_visible;                                // chunks exported in a raw-global lookup table
 } vkm_region;
 static vkm_region g_reg[VKM_MAXREG]; static int g_nreg;
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
 static uint64_t g_chunks, g_bytes; static _Atomic uint64_t g_refchunks;
+static uint64_t g_back_open_chunks, g_back_open_pages;
 static _Atomic uint64_t g_generation = 1;
+enum { VKM_BACK_CPU = 1, VKM_BACK_PROFILE = 2, VKM_BACK_POOL = 3 };
 enum { VKM_PROFILE_CHUNKS = 4096 };
 static uint8_t g_profile[VKM_MAXREG][VKM_PROFILE_CHUNKS];
+static uint8_t g_profile_miss_reported[VKM_MAXREG][VKM_PROFILE_CHUNKS];
+static unsigned g_profile_miss_reports;
 static int g_profile_loaded, g_profile_on;
+static int pool_mode(void);
 
 // A learned profile is a set of 32-MiB region/chunk pairs, one per line. It is
-// consumed only by the normal pre-open dm_gpu_commit path: selected chunks are
-// placed before SetHeapSize/MapPhysicalMemory opens their first CPU page. No
-// live mapping is ever replaced in this mode.
+// consumed by the normal pre-open dm_gpu_commit path: selected chunks are
+// placed before SetHeapSize/MapPhysicalMemory opens their first CPU page. In
+// pool mode it is audit-only: NVN-addressed ranges are checked against it, but
+// only the address exposure may place memory.
 static int profile_mode(void) {
     if (g_profile_loaded) return g_profile_on;
     g_profile_loaded = 1;
@@ -59,8 +68,14 @@ static int profile_mode(void) {
     }
     fclose(f);
     g_profile_on = n != 0;
-    if (g_profile_on) LOG("vulkan: guest-memory profile %s selects %u pre-open 32-MiB chunks", path, n);
-    else LOG("[RED] vulkan: guest-memory profile %s is empty; using full backing", path);
+    if (g_profile_on && pool_mode())
+        LOG("vulkan: guest-memory profile %s lists %u 32-MiB chunks (audit only; NVN addresses drive placement)", path, n);
+    else if (g_profile_on)
+        LOG("vulkan: guest-memory profile %s selects %u pre-open 32-MiB chunks", path, n);
+    else if (pool_mode())
+        LOG("[RED] vulkan: guest-memory profile %s is empty; pool coverage audit is disabled", path);
+    else
+        LOG("[RED] vulkan: guest-memory profile %s is empty; using full backing", path);
     return g_profile_on;
 }
 
@@ -90,19 +105,20 @@ uint64_t vkm_granule(void) {
     return v;
 }
 
-// Fresh Honeykrisp host-visible allocations are demand-zero shmem.  Leaving a
-// closed guest page untouched keeps it uncommitted until either the CPU opens
-// it or the GPU actually reads it.  The original bring-up explicitly wrote
-// zero to every closed page in every 32-MiB chunk, which charged the complete
-// 6.2-GiB heap and every mapped alias chunk even when the title never used
-// those pages.  This is opt-in until the physical selftest and title have both
-// exercised it; open pages are still copied byte-for-byte.
+// A guest chunk's closed pages must read zero when the guest opens them later (SetHeapSize opens the whole heap and the title's allocator trusts it).
+// The first bring-up wrote zero into every closed page of every 32-MiB chunk, which committed the complete 6.2-GiB heap and every mapped alias chunk
+// whether or not the title ever touched them: Ocarina of Time jumped from 7.9 to 12.3 GiB in five seconds at its first area load and stalled in reclaim
+// under a 12-GiB guard. Device memory is not zero by contract (a driver may hand back a recycled allocation: with the writes simply left out the title
+// aborted at startup on a stale allocator word, Result 0xd401), so the pages are left untouched only when the memory was allocated with
+// VK_MEMORY_ALLOCATE_ZERO_INITIALIZE_BIT_EXT (VK_EXT_zero_initialize_device_memory), which guarantees zero and lets the driver keep it uncommitted.
+// DM_VK_GMEM_DEMAND_ZERO=0 writes the zeroes as before; open pages are copied byte for byte either way.
 static int demand_zero_mode(void) {
     static int v = -1;
     if (v < 0) {
         const char *e = getenv("DM_VK_GMEM_DEMAND_ZERO");
-        v = e && strcmp(e, "0");
-        if (v) LOG("vulkan: closed guest pages stay demand-zero instead of being prefaulted (DM_VK_GMEM_DEMAND_ZERO=1)");
+        v = g_vkd.zero_init && !(e && !strcmp(e, "0"));
+        LOG("vulkan: closed guest pages %s (VK_EXT_zero_initialize_device_memory %s; DM_VK_GMEM_DEMAND_ZERO=0 writes them)",
+            v ? "stay demand-zero: the chunk memory is allocated zero-initialized" : "are written with zero", g_vkd.zero_init ? "present" : "absent");
     }
     return v;
 }
@@ -160,12 +176,53 @@ static void protect_runs(uint8_t *at, const uint8_t *open, size_t npg, size_t pg
     }
 }
 
+static uint64_t chunk_size(const vkm_region *r, uint64_t c) {
+    uint64_t off = c * vkm_granule();
+    return r->size - off < vkm_granule() ? r->size - off : vkm_granule();
+}
+
 static void ref_report(void) {
     uint64_t granule = vkm_granule();
-    LOG("vulkan: guest memory explicit GPU references reached %llu of %llu backed chunks (%llu of %llu MiB); raw-global pointer reads are additional",
-        (unsigned long long)atomic_load(&g_refchunks), (unsigned long long)g_chunks,
-        (unsigned long long)(atomic_load(&g_refchunks) * (granule >> 20)),
-        (unsigned long long)(g_bytes >> 20));
+    uint64_t by[4] = {0}, by_bytes[4] = {0};
+    uint64_t addressed = 0, addressed_bytes = 0, referenced = 0, referenced_bytes = 0;
+    uint64_t raw = 0, raw_bytes = 0, no_explicit = 0, no_explicit_bytes = 0;
+    uint64_t neither = 0, neither_bytes = 0;
+    pthread_mutex_lock(&g_mu);
+    for (int i = 0; i < g_nreg; i++) {
+        const vkm_region *r = &g_reg[i];
+        uint64_t nc = (r->size + granule - 1) / granule;
+        uint64_t rb = 0, rr = 0, ra = 0, rw = 0, rn = 0;
+        uint64_t rbb = 0, rrb = 0, rab = 0, rwb = 0, rnb = 0;
+        for (uint64_t c = 0; c < nc; c++) {
+            if (!r->chunk[c]) continue;
+            uint64_t n = chunk_size(r, c); unsigned cause = r->backed_by[c];
+            if (cause < 4) { by[cause]++; by_bytes[cause] += n; }
+            rb++; rbb += n;
+            if (r->referenced[c]) { referenced++; referenced_bytes += n; rr++; rrb += n; }
+            else { no_explicit++; no_explicit_bytes += n; }
+            if (r->addressed[c]) { addressed++; addressed_bytes += n; ra++; rab += n; }
+            if (r->raw_visible[c]) { raw++; raw_bytes += n; rw++; rwb += n; }
+            if (!r->referenced[c] && !r->addressed[c]) { neither++; neither_bytes += n; rn++; rnb += n; }
+        }
+        if (rb) LOG("vulkan: guest memory provenance region %d: backed %llu chunks/%llu MiB; explicit %llu/%llu MiB; NVN-addressed %llu/%llu MiB; raw-table-visible %llu/%llu MiB; neither explicit nor addressed %llu/%llu MiB",
+                    i, (unsigned long long)rb, (unsigned long long)(rbb >> 20),
+                    (unsigned long long)rr, (unsigned long long)(rrb >> 20),
+                    (unsigned long long)ra, (unsigned long long)(rab >> 20),
+                    (unsigned long long)rw, (unsigned long long)(rwb >> 20),
+                    (unsigned long long)rn, (unsigned long long)(rnb >> 20));
+    }
+    LOG("vulkan: guest memory provenance total: %llu chunks/%llu MiB backed (CPU full %llu/%llu MiB, CPU profile %llu/%llu MiB, live pool %llu/%llu MiB); explicit %llu/%llu MiB; NVN-addressed %llu/%llu MiB; raw-table-visible %llu/%llu MiB; not explicit %llu/%llu MiB; neither explicit nor addressed %llu/%llu MiB; %llu chunks had %llu CPU-open pages when placed",
+        (unsigned long long)g_chunks, (unsigned long long)(g_bytes >> 20),
+        (unsigned long long)by[VKM_BACK_CPU], (unsigned long long)(by_bytes[VKM_BACK_CPU] >> 20),
+        (unsigned long long)by[VKM_BACK_PROFILE], (unsigned long long)(by_bytes[VKM_BACK_PROFILE] >> 20),
+        (unsigned long long)by[VKM_BACK_POOL], (unsigned long long)(by_bytes[VKM_BACK_POOL] >> 20),
+        (unsigned long long)referenced, (unsigned long long)(referenced_bytes >> 20),
+        (unsigned long long)addressed, (unsigned long long)(addressed_bytes >> 20),
+        (unsigned long long)raw, (unsigned long long)(raw_bytes >> 20),
+        (unsigned long long)no_explicit, (unsigned long long)(no_explicit_bytes >> 20),
+        (unsigned long long)neither, (unsigned long long)(neither_bytes >> 20),
+        (unsigned long long)g_back_open_chunks, (unsigned long long)g_back_open_pages);
+    pthread_mutex_unlock(&g_mu);
 }
 
 void dm_gpu_region(void *base, size_t size) {
@@ -173,7 +230,7 @@ void dm_gpu_region(void *base, size_t size) {
     static int pool_reported;
     if (pool_mode()) {
         swap_hooks();
-        if (!pool_reported++) LOG("vulkan: guest heap/alias use anonymous pages until NVN memory pools expose them (DM_VK_GMEM_POOLS=1)");
+        if (!pool_reported++) LOG("[RED] vulkan: experimental live guest-memory placement enabled (DM_VK_GMEM_POOLS=1); not a gameplay baseline");
     }
     pthread_mutex_lock(&g_mu);
     if (g_nreg < VKM_MAXREG && size) {
@@ -184,6 +241,8 @@ void dm_gpu_region(void *base, size_t size) {
         r->chunk = calloc(n, sizeof *r->chunk);
         r->referenced = calloc(n, 1);
         r->addressed = calloc(n, 1);
+        r->backed_by = calloc(n, 1);
+        r->raw_visible = calloc(n, 1);
         if (!report_registered) { atexit(ref_report); report_registered = 1; }
     }
     pthread_mutex_unlock(&g_mu);
@@ -206,11 +265,23 @@ void vkm_addressed(const void *addr, uint64_t len) {
                                  (unsigned long long)c, (unsigned long long)(c * granule),
                                  (unsigned long long)(granule >> 20));
             }
-            if (profile_mode() && !r->chunk[c]) {
-                static _Atomic int misses;
-                if (atomic_fetch_add(&misses, 1) < 32)
-                    LOG("[RED] vulkan: guest-memory profile miss: region %d chunk %llu (offset %#llx)", i,
-                        (unsigned long long)c, (unsigned long long)(c * granule));
+        }
+        // The learned profile is always indexed in 32-MiB units, independent
+        // of the experimental pool placement granule. Report each uncovered
+        // profile chunk once; observing it must never place memory.
+        if (profile_mode()) {
+            for (uint64_t c = lo / VKM_CHUNK_DEFAULT;
+                 c * VKM_CHUNK_DEFAULT < hi; c++) {
+                int missing = c >= VKM_PROFILE_CHUNKS || !g_profile[i][c];
+                int fresh = c >= VKM_PROFILE_CHUNKS || !g_profile_miss_reported[i][c];
+                if (missing && fresh) {
+                    if (c < VKM_PROFILE_CHUNKS)
+                        g_profile_miss_reported[i][c] = 1;
+                    if (g_profile_miss_reports++ < 32)
+                        LOG("[RED] vulkan: guest-memory profile miss: region %d chunk %llu (offset %#llx)", i,
+                            (unsigned long long)c,
+                            (unsigned long long)(c * VKM_CHUNK_DEFAULT));
+                }
             }
         }
         break;
@@ -243,7 +314,7 @@ static int region_buffer(vkm_region *r) {
     return 1;
 }
 
-static int back_chunk(vkm_region *r, uint64_t ci) {
+static int back_chunk(vkm_region *r, uint64_t ci, unsigned cause) {
     uint64_t granule = vkm_granule();
     uint8_t *at = r->base + ci * granule;
     uint64_t len = r->size - ci * granule < granule ? r->size - ci * granule : granule;
@@ -262,7 +333,8 @@ static int back_chunk(vkm_region *r, uint64_t ci) {
         save = malloc(nopen * pg); size_t k = 0;
         for (size_t p = 0; p < npg; p++) if (open[p]) memcpy(save + pg * k++, at + p * pg, pg);
     }
-    VkMemoryAllocateInfo ma = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = len, .memoryTypeIndex = r->type};
+    VkMemoryAllocateFlagsInfo zf = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, .flags = VK_MEMORY_ALLOCATE_ZERO_INITIALIZE_BIT_EXT};
+    VkMemoryAllocateInfo ma = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = demand_zero_mode() ? &zf : NULL, .allocationSize = len, .memoryTypeIndex = r->type};
     VkDeviceMemory m; VkResult vr = vkAllocateMemory(g_vkd.dev, &ma, NULL, &m);
     if (vr) {
         if (swapping) { protect_runs(at, open, npg, pg, 1, PROT_READ | PROT_WRITE); swap_end(); nvn_dirty_unhold(); }
@@ -294,6 +366,10 @@ static int back_chunk(vkm_region *r, uint64_t ci) {
             else if (!demand_zero_mode()) memset(at + p * pg, 0, pg);
         }
     }
+    { static int zc = -1; if (zc < 0) { const char *e = getenv("DM_VK_GMEM_ZERO_CHECK"); zc = e && atoi(e) != 0; }   // diagnostic: do the untouched closed pages read zero? (reading commits them)
+      if (zc && demand_zero_mode()) { size_t bad = 0; for (size_t p = 0; p < npg; p++) if (!open[p]) { const uint64_t *w = (const uint64_t *)(at + p * pg); for (size_t i = 0; i < pg / 8; i++) if (w[i]) { bad++; break; } }
+          static _Atomic uint64_t tot, chunks; uint64_t t = atomic_fetch_add(&tot, bad) + bad, c = atomic_fetch_add(&chunks, 1) + 1;
+          if (bad || !(c & (c - 1))) LOG("%svulkan: zero check: chunk %p has %zu non-zero closed pages of %zu (%llu in %llu chunks so far)", bad ? "[RED] " : "", (void *)at, bad, npg - nopen, (unsigned long long)t, (unsigned long long)c); } }
     protect_runs(at, open, npg, pg, 0, PROT_NONE);
     if (swapping) { swap_end(); nvn_dirty_unhold(); }
     free(open); free(save);
@@ -305,7 +381,8 @@ static int back_chunk(vkm_region *r, uint64_t ci) {
     if (!vr) vr = vkWaitForFences(g_vkd.dev, 1, &f, VK_TRUE, UINT64_MAX);
     vkDestroyFence(g_vkd.dev, f, NULL);
     if (vr) die("vulkan: binding guest chunk %p into its region's buffer failed (%d)", (void *)at, (int)vr);
-    r->chunk[ci] = m; g_chunks++; g_bytes += len;
+    r->chunk[ci] = m; r->backed_by[ci] = (uint8_t)cause; g_chunks++; g_bytes += len;
+    if (nopen) { g_back_open_chunks++; g_back_open_pages += nopen; }
     atomic_fetch_add_explicit(&g_generation, 1, memory_order_release);
     if (!(g_chunks & (g_chunks - 1)) || (nopen && granule == VKM_CHUNK_DEFAULT)) LOG("vulkan: guest memory backed: %llu chunks, %llu MiB (chunk %p: %zu of %zu pages were open)", (unsigned long long)g_chunks,
                                                   (unsigned long long)(g_bytes >> 20), (void *)at, nopen, npg);
@@ -322,9 +399,10 @@ void dm_gpu_commit(void *addr, size_t size) {
         if (!r->buf && !region_buffer(r)) break;
         uint64_t granule = vkm_granule();
         uint64_t lo = (uint64_t)(a - r->base), hi = lo + size > r->size ? r->size : lo + size;
+        int profile = profile_mode();
         for (uint64_t c = lo / granule; c * granule < hi; c++) {
-            if (profile_mode() && (i >= VKM_MAXREG || c >= VKM_PROFILE_CHUNKS || !g_profile[i][c])) continue;
-            if (!r->chunk[c] && !back_chunk(r, c)) break;
+            if (profile && (i >= VKM_MAXREG || c >= VKM_PROFILE_CHUNKS || !g_profile[i][c])) continue;
+            if (!r->chunk[c] && !back_chunk(r, c, profile ? VKM_BACK_PROFILE : VKM_BACK_CPU)) break;
         }
         break;
     }
@@ -344,7 +422,7 @@ int vkm_pool_commit(const void *addr, uint64_t len) {
         uint64_t lo = (uint64_t)(a - r->base), hi = len > r->size - lo ? r->size : lo + len;
         if (!r->buf && !region_buffer(r)) { ok = 0; break; }
         for (uint64_t c = lo / granule; c * granule < hi; c++)
-            if (!r->chunk[c] && !back_chunk(r, c)) { ok = 0; break; }
+            if (!r->chunk[c] && !back_chunk(r, c, VKM_BACK_POOL)) { ok = 0; break; }
         hit = 1;
         break;
     }
@@ -376,7 +454,7 @@ int vkm_segments(uint64_t *lo, uint64_t *hi, uint64_t *gpu, int max) {
     int n = 0, more = 0;
     uint64_t granule = vkm_granule();
     for (int i = 0; i < g_nreg; i++) {
-        const vkm_region *r = &g_reg[i];
+        vkm_region *r = &g_reg[i];
         if (!r->buf) continue;
         uint64_t nc = (r->size + granule - 1) / granule;
         for (uint64_t c = 0; c < nc;) {
@@ -384,6 +462,7 @@ int vkm_segments(uint64_t *lo, uint64_t *hi, uint64_t *gpu, int max) {
             if (c == nc) break;
             uint64_t c0 = c; while (c < nc && r->chunk[c]) c++;
             if (n == max) { more = 1; continue; }
+            for (uint64_t k = c0; k < c; k++) r->raw_visible[k] = 1;
             uint64_t off = c0 * granule, end = c * granule;
             if (end > r->size) end = r->size;
             lo[n] = (uint64_t)(uintptr_t)r->base + off;
@@ -411,13 +490,9 @@ int vkm_gmem_map(void *dst, size_t size, uint64_t *generation) {
     uint64_t gen; int n;
     do { gen = vkm_generation(); n = vkm_segments(lo, hi, gpu, DMSH_GMEM_MAP_ENTRIES - 1); }
     while (gen != vkm_generation());
-    uint8_t *d = dst;
-    memset(d, 0xff, need); memset(d, 0, DMSH_GMEM_MAP_ENTRY);
-    for (int i = 0; i < n; i++) {
-        uint64_t e[4] = {lo[i], hi[i], gpu[i] - lo[i], 0};
-        memcpy(d + (size_t)(i + 1) * DMSH_GMEM_MAP_ENTRY, e, sizeof e);
-    }
+    int out = vkx_gmem_map_pack(dst, size, lo, hi, gpu, n);
+    if (out < 0) return -1;
     if (generation) *generation = gen;
-    return n;
+    return out;
 }
 void vkm_stats(uint64_t *chunks, uint64_t *bytes) { pthread_mutex_lock(&g_mu); *chunks = g_chunks; *bytes = g_bytes; pthread_mutex_unlock(&g_mu); }

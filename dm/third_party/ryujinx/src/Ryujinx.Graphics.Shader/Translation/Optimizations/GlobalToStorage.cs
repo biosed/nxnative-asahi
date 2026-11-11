@@ -73,13 +73,75 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
 
             private readonly List<Entry> _entries;
             private readonly Dictionary<LsKey, Dictionary<uint, SearchResult>> _sharedEntries;
+            private readonly Dictionary<(Instruction, StorageKind), int> _rawLastBindings;
+            private readonly Dictionary<(Instruction, StorageKind), int> _rawSameBaseFunctions;
             private readonly HelperFunctionManager _hfm;
+            private BasicBlock _rawBlock;
+            private Instruction _rawInst;
+            private StorageKind _rawStorageKind;
+            private Operand _rawBaseLo;
+            private Operand _rawBaseHi;
+            private int _rawFirstOffset;
 
             public GtsContext(HelperFunctionManager hfm)
             {
                 _entries = [];
                 _sharedEntries = new Dictionary<LsKey, Dictionary<uint, SearchResult>>();
+                _rawLastBindings = new Dictionary<(Instruction, StorageKind), int>();
+                _rawSameBaseFunctions = new Dictionary<(Instruction, StorageKind), int>();
                 _hfm = hfm;
+            }
+
+            public int GetOrAddRawLastBinding(ResourceManager resourceManager, Operation operation)
+            {
+                var key = (operation.Inst, operation.StorageKind);
+
+                if (!_rawLastBindings.TryGetValue(key, out int binding))
+                {
+                    binding = resourceManager.AddRawLastEntryMemory();
+                    _rawLastBindings.Add(key, binding);
+                }
+
+                return binding;
+            }
+
+            public bool TryGetRawSameBaseFunctionId(Operation operation, out int functionId)
+            {
+                return _rawSameBaseFunctions.TryGetValue((operation.Inst, operation.StorageKind), out functionId);
+            }
+
+            public int AddRawSameBaseFunction(Operation operation, Function function)
+            {
+                int functionId = _hfm.AddFunction(function);
+                _rawSameBaseFunctions.Add((operation.Inst, operation.StorageKind), functionId);
+                return functionId;
+            }
+
+            public bool MatchesRawBase(BasicBlock block, Operation operation, Operand baseLo, Operand baseHi, int constOffset)
+            {
+                if ((operation.Inst != Instruction.Load &&
+                     (operation.Inst != Instruction.Store || IsSmallInt(operation.StorageKind))) ||
+                    block != _rawBlock ||
+                    operation.Inst != _rawInst ||
+                    operation.StorageKind != _rawStorageKind ||
+                    !SameAddressOperand(block, baseLo, _rawBaseLo) ||
+                    !SameAddressOperand(block, baseHi, _rawBaseHi))
+                {
+                    return false;
+                }
+
+                long delta = (long)constOffset - _rawFirstOffset;
+                return delta >= -4096 && delta < 4096;
+            }
+
+            public void SetRawBase(BasicBlock block, Operation operation, Operand baseLo, Operand baseHi, int constOffset)
+            {
+                _rawBlock = block;
+                _rawInst = operation.Inst;
+                _rawStorageKind = operation.StorageKind;
+                _rawBaseLo = baseLo;
+                _rawBaseHi = baseHi;
+                _rawFirstOffset = constOffset;
             }
 
             public int AddFunction(Operation baseOp, bool isMultiTarget, IReadOnlyList<uint> targetCbs, Function function)
@@ -656,6 +718,21 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
             if (targetCbs.Count == 0)
             {
                 gpuAccessor.Log($"Global memory operation \"{operation.Inst}\" traced to no storage buffer: it goes through the memory pool table.");
+
+                DecomposeRawAddress(block, operation.GetSource(0), operation.GetSource(1), out Operand baseLo, out Operand baseHi, out int constOffset);
+
+                if (gtsContext.MatchesRawBase(block, operation, baseLo, baseHi, constOffset))
+                {
+                    if (gtsContext.TryGetRawSameBaseFunctionId(operation, out functionId))
+                    {
+                        return true;
+                    }
+
+                    int lastBinding = gtsContext.GetOrAddRawLastBinding(resourceManager, operation);
+                    return TryGenerateRawSameBaseStorageOp(gtsContext, resourceManager, operation, lastBinding, out functionId);
+                }
+
+                gtsContext.SetRawBase(block, operation, baseLo, baseHi, constOffset);
             }
 
             if (gtsContext.TryGetFunctionId(operation, isMultiTarget: true, targetCbs, out functionId))
@@ -870,7 +947,7 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
             // The entry this helper chose last in this invocation, if it holds the address: a shader reads a structure word after word from one pool, so all but the first access of a run
             // choose the entry the first one chose (Ocarina of Time's foliage mesh shader 73dc0b90c4082e43, 135 reads, took 10.9 ms of a 683x384 frame). The table's ranges are disjoint
             // (nvn_mtl.m gmem_map), so the search below would choose the same entry, and the host binds one table for a whole draw or dispatch. The word starts at 0, the empty entry
-            int lastBinding = resourceManager.AddRawLastEntryMemory();
+            int lastBinding = gtsContext.GetOrAddRawLastBinding(resourceManager, operation);
             Operand last = context.Load(StorageKind.LocalMemory, lastBinding);
             Operand lastEntry = context.IMultiply(last, Const(GmemMapEntryWords));
             Operand lastHolds = context.BitwiseAnd(AtOrBelow(MapWord(lastEntry, 1), MapWord(lastEntry, 0)), Below(MapWord(lastEntry, 3), MapWord(lastEntry, 2)));
@@ -889,14 +966,17 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
             context.BranchIfTrue(lblFound, hintFits);
 
             // The last entry whose start is at or below the address (entry 0 starts at 0, so there always is one)
-            Operand index = Const(0);
-
-            for (int step = 1 << (GmemMapLog2 - 1); step != 0; step >>= 1)
-            {
-                Operand candidate = context.IAdd(index, Const(step));
-                Operand entry = context.IMultiply(candidate, Const(GmemMapEntryWords));
-                index = context.ConditionalSelect(AtOrBelow(MapWord(entry, 1), MapWord(entry, 0)), candidate, index);
-            }
+            Operand index = Local();
+            Operand step = Local();
+            Operand lblSearch = Label();
+            context.Copy(index, Const(0));
+            context.Copy(step, Const(1 << (GmemMapLog2 - 1)));
+            context.MarkLabel(lblSearch);
+            Operand candidate = context.IAdd(index, step);
+            Operand entry = context.IMultiply(candidate, Const(GmemMapEntryWords));
+            context.Copy(index, context.ConditionalSelect(AtOrBelow(MapWord(entry, 1), MapWord(entry, 0)), candidate, index));
+            context.Copy(step, context.ShiftRightU32(step, Const(1)));
+            context.BranchIfTrue(lblSearch, context.ICompareNotEqual(step, Const(0)));
 
             context.Copy(selected, index);
             context.MarkLabel(lblFound);
@@ -987,6 +1067,7 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
             }
 
             context.MarkLabel(lblSkip);
+            context.Store(StorageKind.LocalMemory, lastBinding, Const(0));
 
             bool returnsValue = operation.Dest != null;
 
@@ -1007,6 +1088,288 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
                 0);
 
             functionId = gtsContext.AddFunction(operation, isMultiTarget: true, [], function);
+
+            return true;
+        }
+
+        private static bool TryGenerateRawSameBaseStorageOp(
+            GtsContext gtsContext,
+            ResourceManager resourceManager,
+            Operation operation,
+            int lastBinding,
+            out int functionId)
+        {
+            functionId = 0;
+
+            if (!resourceManager.TryGetStorageBufferBinding(GmemMapCbSlot, 0, write: false, out int mapBinding))
+            {
+                return false;
+            }
+
+            bool isSmall = IsSmallInt(operation.StorageKind);
+            int inArgumentsCount = operation.Inst == Instruction.Store ? 3 : 2;
+
+            EmitterContext context = new();
+
+            Operand addrLow = Argument(0);
+            Operand addrHigh = Argument(1);
+
+            Operand MapWord(Operand entry, int word)
+            {
+                return context.Load(StorageKind.StorageBuffer, mapBinding, Const(0), context.IAdd(entry, Const(word)));
+            }
+
+            Operand last = context.Load(StorageKind.LocalMemory, lastBinding);
+            Operand lblSkip = Label();
+            context.BranchIfFalse(lblSkip, context.ICompareNotEqual(last, Const(0)));
+
+            Operand found = context.IMultiply(last, Const(GmemMapEntryWords));
+            Operand wordLow = isSmall ? context.BitwiseAnd(addrLow, Const(~3)) : addrLow;
+            Operand hostLow = context.IAdd(wordLow, MapWord(found, 4));
+            Operand carry = context.ConditionalSelect(context.ICompareLessUnsigned(hostLow, wordLow), Const(1), Const(0));
+            Operand hostHigh = context.IAdd(context.IAdd(addrHigh, MapWord(found, 5)), carry);
+
+            Operand resultValue = null;
+
+            if (operation.Inst == Instruction.Load)
+            {
+                resultValue = context.Load(StorageKind.GlobalMemory, hostLow, hostHigh);
+
+                if (isSmall)
+                {
+                    Operand bitOffset = HelperFunctionManager.GetBitOffset(context, addrLow);
+
+                    resultValue = operation.StorageKind switch
+                    {
+                        StorageKind.GlobalMemoryS8 => context.BitfieldExtractS32(context.ShiftRightS32(resultValue, bitOffset), Const(0), Const(8)),
+                        StorageKind.GlobalMemoryS16 => context.BitfieldExtractS32(context.ShiftRightS32(resultValue, bitOffset), Const(0), Const(16)),
+                        StorageKind.GlobalMemoryU8 => context.BitwiseAnd(context.ShiftRightU32(resultValue, bitOffset), Const(byte.MaxValue)),
+                        _ => context.BitwiseAnd(context.ShiftRightU32(resultValue, bitOffset), Const(ushort.MaxValue)),
+                    };
+                }
+            }
+            else
+            {
+                context.Store(StorageKind.GlobalMemory, hostLow, hostHigh, Argument(2));
+            }
+
+            if (resultValue != null)
+            {
+                context.Return(resultValue);
+            }
+            else
+            {
+                context.Return();
+            }
+
+            context.MarkLabel(lblSkip);
+
+            bool returnsValue = operation.Dest != null;
+
+            if (returnsValue)
+            {
+                context.Return(Const(0));
+            }
+            else
+            {
+                context.Return();
+            }
+
+            Function function = new(
+                ControlFlowGraph.Create(context.GetOperations()).Blocks,
+                GetFunctionName(operation, isMultiTarget: true, []) + "RawSameBase",
+                returnsValue,
+                inArgumentsCount,
+                0);
+
+            functionId = gtsContext.AddRawSameBaseFunction(operation, function);
+
+            return true;
+        }
+
+        private static void DecomposeRawAddress(
+            BasicBlock block,
+            Operand addrLow,
+            Operand addrHigh,
+            out Operand baseLo,
+            out Operand baseHi,
+            out int constOffset)
+        {
+            addrLow = Utils.FindLastOperation(addrLow, block);
+            addrHigh = Utils.FindLastOperation(addrHigh, block);
+
+            if (addrLow.AsgOp is Operation addLo &&
+                addLo.Inst == Instruction.Add &&
+                addrHigh.AsgOp is Operation addHi &&
+                addHi.Inst == Instruction.Add)
+            {
+                Operand lo0 = addLo.GetSource(0);
+                Operand lo1 = addLo.GetSource(1);
+                Operand bLo = null;
+                Operand cOp = null;
+
+                if (lo0.Type == OperandType.LocalVariable && lo1.Type == OperandType.Constant)
+                {
+                    bLo = lo0;
+                    cOp = lo1;
+                }
+                else if (lo0.Type == OperandType.Constant && lo1.Type == OperandType.LocalVariable)
+                {
+                    bLo = lo1;
+                    cOp = lo0;
+                }
+
+                if (bLo != null)
+                {
+                    Operand hi0 = Utils.FindLastOperation(addHi.GetSource(0), block);
+                    Operand hi1 = Utils.FindLastOperation(addHi.GetSource(1), block);
+                    Operation hi0Op = hi0.AsgOp as Operation;
+                    Operation hi1Op = hi1.AsgOp as Operation;
+
+                    if (hi1Op?.Inst == Instruction.ConditionalSelect && hi0Op?.Inst != Instruction.ConditionalSelect)
+                    {
+                        baseLo = Utils.FindLastOperation(bLo, block);
+                        baseHi = hi0;
+                        constOffset = UnwrapScaledIndex(block, ref baseLo, ref baseHi) ? 0 : cOp.Value;
+                        return;
+                    }
+                    else if (hi0Op?.Inst == Instruction.ConditionalSelect && hi1Op?.Inst != Instruction.ConditionalSelect)
+                    {
+                        baseLo = Utils.FindLastOperation(bLo, block);
+                        baseHi = hi1;
+                        constOffset = UnwrapScaledIndex(block, ref baseLo, ref baseHi) ? 0 : cOp.Value;
+                        return;
+                    }
+                }
+            }
+
+            baseLo = addrLow;
+            baseHi = addrHigh;
+            constOffset = 0;
+            UnwrapScaledIndex(block, ref baseLo, ref baseHi);
+        }
+
+        private static bool UnwrapScaledIndex(BasicBlock block, ref Operand baseLo, ref Operand baseHi)
+        {
+            if (baseLo.AsgOp is not Operation addLo || addLo.Inst != Instruction.Add ||
+                baseHi.AsgOp is not Operation addHi || addHi.Inst != Instruction.Add)
+            {
+                return false;
+            }
+
+            Operand hi0 = Utils.FindLastOperation(addHi.GetSource(0), block);
+            Operand hi1 = Utils.FindLastOperation(addHi.GetSource(1), block);
+            Operation hi0Op = hi0.AsgOp as Operation;
+            Operation hi1Op = hi1.AsgOp as Operation;
+            Operation hiSumOp = null;
+
+            if (hi1Op?.Inst == Instruction.ConditionalSelect && hi0Op?.Inst == Instruction.Add)
+            {
+                hiSumOp = hi0Op;
+            }
+            else if (hi0Op?.Inst == Instruction.ConditionalSelect && hi1Op?.Inst == Instruction.Add)
+            {
+                hiSumOp = hi1Op;
+            }
+
+            if (hiSumOp == null)
+            {
+                return false;
+            }
+
+            Operand lo0 = Utils.FindLastOperation(addLo.GetSource(0), block);
+            Operand lo1 = Utils.FindLastOperation(addLo.GetSource(1), block);
+            Operand hs0 = Utils.FindLastOperation(hiSumOp.GetSource(0), block);
+            Operand hs1 = Utils.FindLastOperation(hiSumOp.GetSource(1), block);
+
+            static bool IsMulLo(Operand op) => (op.AsgOp as Operation)?.Inst is Instruction.Multiply or Instruction.ShiftLeft;
+            static bool IsMulHi(Operand op) => (op.AsgOp as Operation)?.Inst is Instruction.MultiplyHighU32 or Instruction.MultiplyHighS32 or Instruction.ShiftRightU32;
+
+            Operand arrLo = null;
+            Operand arrHi = null;
+
+            if (IsMulLo(lo0) && !IsMulLo(lo1))
+            {
+                arrLo = lo1;
+            }
+            else if (IsMulLo(lo1) && !IsMulLo(lo0))
+            {
+                arrLo = lo0;
+            }
+
+            if (IsMulHi(hs0) && !IsMulHi(hs1))
+            {
+                arrHi = hs1;
+            }
+            else if (IsMulHi(hs1) && !IsMulHi(hs0))
+            {
+                arrHi = hs0;
+            }
+
+            if (arrLo != null && arrHi != null)
+            {
+                baseLo = arrLo;
+                baseHi = arrHi;
+                return true;
+            }
+
+            return false;
+        }
+
+        private static bool SameAddressOperand(BasicBlock block, Operand a, Operand b, int depth = 0)
+        {
+            if (a == null || b == null)
+            {
+                return false;
+            }
+
+            a = Utils.FindLastOperation(a, block);
+            b = Utils.FindLastOperation(b, block);
+
+            if (a == b)
+            {
+                return true;
+            }
+
+            if (a.Type == OperandType.Constant && b.Type == OperandType.Constant)
+            {
+                return a.Value == b.Value;
+            }
+
+            if (depth >= 4 || a.AsgOp is not Operation opA || b.AsgOp is not Operation opB)
+            {
+                return false;
+            }
+
+            if (opA.Inst != opB.Inst || opA.StorageKind != opB.StorageKind || opA.SourcesCount != opB.SourcesCount)
+            {
+                return false;
+            }
+
+            switch (opA.Inst)
+            {
+                case Instruction.Add:
+                case Instruction.Multiply:
+                case Instruction.MultiplyHighS32:
+                case Instruction.MultiplyHighU32:
+                case Instruction.ShiftLeft:
+                case Instruction.ShiftRightU32:
+                case Instruction.ConditionalSelect:
+                case Instruction.CompareEqual:
+                case Instruction.CompareLessU32:
+                case Instruction.CompareGreaterU32:
+                    break;
+                default:
+                    return false;
+            }
+
+            for (int i = 0; i < opA.SourcesCount; i++)
+            {
+                if (!SameAddressOperand(block, opA.GetSource(i), opB.GetSource(i), depth + 1))
+                {
+                    return false;
+                }
+            }
 
             return true;
         }

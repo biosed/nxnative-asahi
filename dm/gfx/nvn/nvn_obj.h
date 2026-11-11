@@ -56,7 +56,7 @@ typedef struct { uint32_t magic; samp_par p; } samp_t;                          
 // The per-stage shader keys are not kept in prog_t: the game's real NVNprogram may be smaller than the header's 0xC0 (growing prog_t corrupted the adjacent object in Mario); see prog_keys in hle_nvn.c
 typedef struct { uint32_t magic, nstage; NVNshaderData sd[6]; uint64_t serial; } prog_t;     FITS(prog_t, NVNprogram);   // serial: table key for the replay layer's resolved result
 
-typedef struct { uint32_t magic, fenced; uint64_t fence; } sync_t;   /* fenced 2: by WindowAcquireTexture */                           FITS(sync_t, NVNsync);
+typedef struct { uint32_t magic, fenced; uint64_t fence; } sync_t;   /* fenced 1: physical, 2: acquire, 3: owned logical receipt */     FITS(sync_t, NVNsync);
 typedef struct { const pool_t *pool; int64_t off; } ev_builder_t;                             FITS(ev_builder_t, NVNeventBuilder);
 typedef struct { uint32_t magic; volatile uint32_t *val; const pool_t *pool; int64_t off; } ev_t; FITS(ev_t, NVNevent);   // pool / off: EventGetMemoryPool / Offset
 
@@ -108,7 +108,7 @@ enum {
     OP_BIND_PROGRAM, OP_BIND_STATE, OP_BIND_VATTR, OP_BIND_VSTREAM, OP_BIND_VBUF,
     OP_BIND_UBO, OP_BIND_SSBO, OP_BIND_TEX, OP_BIND_SAMP,
     OP_STENCIL, OP_POLY_OFFSET, OP_DRAW, OP_DRAW_IDX, OP_DISPATCH, OP_BARRIER,
-    OP_SET_TEX_POOL, OP_SET_SAMP_POOL, OP_COPY_B2T, OP_COPY_STRIDE, OP_BLEND_COLOR, OP_COPY_T2B, OP_BIND_IMG, OP_COPY_T2T, OP_RESET_COUNTER, OP_CLEAR_TEX, OP_CLEAR_BUF, OP_DEPTH_CLAMP, OP_RENDER_COND, OP_FENCE_SYNC, OP_TF_BIND, OP_TF_STATE, OP_RAST_DISCARD, OP_VP_SWIZZLE, OP_BIND_TEX1, OP_PRIM_RESTART, OP_BIND_UBO_SMALL, OP_BIND_VBUF1, OP_DRAW_TEX, OP_ALPHA_REF, OP_PUSH_CONST, OP_DLSS, OP_MULTI_DRAW, OP_COUNT_
+    OP_SET_TEX_POOL, OP_SET_SAMP_POOL, OP_COPY_B2T, OP_COPY_STRIDE, OP_BLEND_COLOR, OP_COPY_T2B, OP_BIND_IMG, OP_COPY_T2T, OP_RESET_COUNTER, OP_CLEAR_TEX, OP_CLEAR_BUF, OP_DEPTH_CLAMP, OP_RENDER_COND, OP_FENCE_SYNC, OP_TF_BIND, OP_TF_STATE, OP_RAST_DISCARD, OP_VP_SWIZZLE, OP_BIND_TEX1, OP_PRIM_RESTART, OP_BIND_UBO_SMALL, OP_BIND_VBUF1, OP_DRAW_TEX, OP_ALPHA_REF, OP_PUSH_CONST, OP_DLSS, OP_MULTI_DRAW, OP_WAIT_EVENT, OP_WAIT_SYNC, OP_COUNT_
 };
 // Payload (immediately follows op_hdr)
 typedef struct {
@@ -252,6 +252,8 @@ int mtl_snap_on(void); uint64_t mtl_snap_acquire_wait(void);   // present snapsh
 // Texture release (at Finalize)
 void mtl_tex_init(const tex_t *t);      // TextureInitialize: the serial belongs to a live texture object until mtl_tex_release
 void mtl_tex_release(tex_t *t);
+void mtl_tex_pin(const tex_t *t);       // queued immutable descriptor keeps this serial resolvable past guest Finalize
+void mtl_tex_unpin(uint64_t serial);
 void mtl_pkg_stats(uint64_t *uploads, uint64_t *reuploads);
 unsigned mtl_cpu_tex_count(void);   // live textures the CPU writes (retired snapshots are excluded)
 uint64_t mtl_pkg_edge_skips(void);   // packaged texture checks that found only writes beside the texture (pkg_edges_clean)

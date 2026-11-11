@@ -71,6 +71,7 @@ void mtl_exec(const uint8_t *p) {
     }
 }
 uint64_t mtl_sub_commit(void) { return ++g_fence; }
+uint64_t mtl_completed_fence(void) { return g_fence; }
 uint64_t mtl_last_fence(void) { return g_fence; }
 int mtl_wait(uint64_t fence, uint64_t timeout_ns) { (void)fence; (void)timeout_ns; return 1; }
 int mtl_wait_acq(uint64_t fence, uint64_t timeout_ns) { return mtl_wait(fence, timeout_ns); }
@@ -80,6 +81,8 @@ void mtl_drain(void) {}
 // textures, samplers, programs: no GPU objects
 void mtl_tex_init(const tex_t *t) { (void)t; }
 void mtl_tex_release(tex_t *t) { (void)t; }
+void mtl_tex_pin(const tex_t *t) { (void)t; }
+void mtl_tex_unpin(uint64_t serial) { (void)serial; }
 void mtl_tex_cpu_written(const tex_t *t) { (void)t; }
 void mtl_reg_tex(int id, const tex_t *t, const view_t *v) { (void)id; (void)t; (void)v; }
 void mtl_reg_image(int id, const tex_t *t, const view_t *v) { (void)id; (void)t; (void)v; }

@@ -66,11 +66,20 @@ static void walk(seg *s, uint8_t *bytes, const cap_ops *ops, const uint8_t *orig
 }
 
 int main(void) {
+    cap_queue_state single = {0}, multi_queue = {0}, waited = {0};
+    cap_queue_note(&single, 11, 0); cap_queue_note(&single, 11, 0);
+    CHECK(!cap_queue_unsupported(&single), "one logical queue without waits remains capturable");
+    cap_queue_note(&multi_queue, 11, 0); cap_queue_note(&multi_queue, 12, 0);
+    CHECK(cap_queue_unsupported(&multi_queue) && atomic_load(&multi_queue.unsupported) == CAP_QUEUE_MULTIPLE, "different logical queues are rejected before their physical order can be mistaken for queue semantics");
+    cap_queue_note(&waited, 11, 1);
+    CHECK(cap_queue_unsupported(&waited) && atomic_load(&waited.unsupported) == CAP_QUEUE_WAIT, "wait-only queue operations cannot disappear from a capture");
+    CHECK(cap_record_unsupported(OP_WAIT_EVENT) && cap_record_unsupported(OP_WAIT_SYNC), "standalone replay rejects logical waits");
+    CHECK(!cap_record_unsupported(OP_FENCE_SYNC) && !cap_record_unsupported(OP_SIGNAL_EVENT), "legacy fences and event signals remain replayable");
     char path[1024]; const char *tmp = getenv("TMPDIR"); snprintf(path, sizeof path, "%s/t_capture_XXXXXX", tmp && *tmp ? tmp : "/tmp");
     int fd = mkstemp(path); CHECK(fd >= 0, "temporary file"); close(fd);
     pool_a = calloc(1, 65536); pool_b = calloc(1, 16384);
     for (int i = 0; i < 65536; i += 64) pool_a[i] = (uint8_t)i;
-    game_pool = (pool_t){MAGIC('P', 'O', 'O', 'L'), 0x8, pool_a, 65536, NULL, 0};
+    game_pool = (pool_t){.magic = MAGIC('P', 'O', 'O', 'L'), .flags = 0x8, .mem = pool_a, .size = 65536};
     game_tex = (tex_t){.magic = MAGIC('T', 'E', 'X', 0), .mem = pool_a + 0x2000, .pool = &game_pool, .off = 0x2000, .serial = 77}; game_tex.L.size = 0x1000;
     game_prog = (prog_t){.magic = MAGIC('P', 'R', 'O', 'G'), .nstage = 2, .serial = 5};
     game_dpool = (dpool_t){&game_pool, 0x8000, 256};
@@ -130,7 +139,11 @@ int main(void) {
     { tex_t t = game_tex; cap_tex_fields(&t, &enc, NULL); cap_put(&w, CAP_TOBJ, 1, &t, sizeof t, 0); }
     uint64_t raw = w.raw, stored = w.stored;
     CHECK(cap_close(&w), "close");
+#ifdef __APPLE__
     CHECK(stored < raw, "the mostly-empty pools compress (LZFSE)");
+#else
+    CHECK(stored >= raw, "the portable raw fallback stores every capture byte");
+#endif
 
     // replay side: read the chunks, regions at fresh addresses, objects rebuilt, segments decoded
     cap_reader rd; CHECK(cap_load(&rd, path) == 1, "load");
@@ -188,6 +201,11 @@ int main(void) {
     FILE *f = fopen(path, "r+b"); fseeko(f, 0, SEEK_END); off_t n = ftello(f); fclose(f); truncate(path, n - 40);
     CHECK(cap_load(&rd, path) == 1, "a truncated capture still opens"); int r, bad = 0; while ((r = cap_next(&rd, &c, &d)) == 1) free(d); bad = r < 0; cap_unload(&rd);
     CHECK(bad, "a truncated capture ends in an error");
+    CHECK(cap_open(&w, path), "replace a rejected capture with a failure marker");
+    const char *why = cap_queue_unsupported(&waited);
+    cap_put(&w, CAP_FAIL, 0, why, strlen(why), 0); CHECK(cap_close(&w), "close rejected capture");
+    CHECK(cap_load(&rd, path) == 1 && cap_next(&rd, &c, &d) == 1 && c.tag == CAP_FAIL && c.raw == strlen(why) && !memcmp(d, why, c.raw), "failure reason survives the capture file round-trip");
+    free(d); cap_unload(&rd);
     unlink(path);
     printf("t_capture: %d checks, %d failed\n", checks, failed);
     return failed != 0;

@@ -1,6 +1,11 @@
 // Capture is optional; Linux uses explicit no-capture hooks for now.
 #include "nvn_capture.h"
 
+void nvn_cap_queue(uint64_t serial, int waits) {
+    (void)serial;
+    (void)waits;
+}
+
 void nvn_cap_submit(int n, const uint64_t *handles) {
     (void)n;
     (void)handles;

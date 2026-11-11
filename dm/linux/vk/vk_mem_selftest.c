@@ -1,8 +1,9 @@
 // Game-free contract test for vk_mem.c's hle_svc seam. It reserves a guest
 // region, opens and writes one CPU page, registers/commits it through the same
 // two callbacks as the runtime, and verifies both byte preservation and a GPU
-// copy from the sparse placed buffer. A second chunk proves that vkm_lookup
-// rejects uncommitted memory and accepts it only after dm_gpu_commit.
+// copy from the sparse placed buffer. It also proves that dm_gpu_commit leaves
+// CPU memory independent in pool mode: vkm_lookup rejects each chunk until the
+// explicit NVN pool commit places it.
 #include "dm.h"
 #include "dmsh_abi.h"
 #include "vk_dev.h"
@@ -43,6 +44,9 @@ static uint32_t mem_type(uint32_t bits, VkMemoryPropertyFlags want) {
 }
 
 int main(void) {
+    if (setenv("DM_VK_GMEM_POOLS", "1", 1) ||
+        setenv("DM_VK_GMEM_DEMAND_ZERO", "0", 1))
+        die("vk_mem selftest: could not select the pool/explicit-zero contract");
     if (!vkd_init(0) || !g_vkd.placed)
         die("vk_mem selftest: placed-memory Vulkan device is unavailable");
 
@@ -58,8 +62,18 @@ int main(void) {
 
     dm_gpu_region(guest, test_size);
     dm_gpu_commit(guest, COPY_SIZE);
+    uint64_t chunks = 0, bytes = 0;
+    vkm_stats(&chunks, &bytes);
+    if (chunks || bytes)
+        die("vk_mem selftest: CPU commit placed %llu chunks/%llu bytes before NVN exposed the pool",
+            (unsigned long long)chunks, (unsigned long long)bytes);
     if (!vkm_pool_commit(guest, COPY_SIZE))
         die("vk_mem selftest: first pool commit failed");
+    vkm_stats(&chunks, &bytes);
+    if (chunks != 1 || bytes != test_chunk)
+        die("vk_mem selftest: first pool commit placed %llu chunks/%llu bytes, expected 1/%llu",
+            (unsigned long long)chunks, (unsigned long long)bytes,
+            (unsigned long long)test_chunk);
 
     VkBuffer src = VK_NULL_HANDLE; VkDeviceSize src_off = 0;
     VkDeviceAddress src_gpu = 0;
@@ -73,11 +87,16 @@ int main(void) {
     uint8_t *map = malloc(map_size); uint64_t map_gen0 = 0;
     if (!map || vkm_gmem_map(map, map_size, &map_gen0) != 1)
         die("vk_mem selftest: could not encode the first raw-global map");
-    uint64_t e0[4], e1[4]; memcpy(e0, map, sizeof e0); memcpy(e1, map + DMSH_GMEM_MAP_ENTRY, sizeof e1);
+    uint64_t e0[4], e1[4], e2[4];
+    memcpy(e0, map, sizeof e0);
+    memcpy(e1, map + DMSH_GMEM_MAP_ENTRY, sizeof e1);
+    memcpy(e2, map + 2 * DMSH_GMEM_MAP_ENTRY, sizeof e2);
     if (e0[0] || e0[1] || e0[2] || e0[3] || e1[0] != slo[0] || e1[1] != shi[0] || e1[2] != sgpu[0] - slo[0] || e1[3])
         die("vk_mem selftest: raw-global entry bytes are wrong");
-    for (size_t i = 2 * DMSH_GMEM_MAP_ENTRY; i < 3 * DMSH_GMEM_MAP_ENTRY; i++)
-        if (map[i] != 0xff) die("vk_mem selftest: unused raw-global entry is not 0xff");
+    // Unused entries use UINT64_MAX only for the binary-search lower bound;
+    // their end and delta stay zero, and word 6 may hold a hash hint.
+    if (e2[0] != UINT64_MAX || e2[1] || e2[2])
+        die("vk_mem selftest: unused raw-global entry has the wrong sentinel");
     if (vkm_lookup(guest + test_chunk, COPY_SIZE, &src, &src_off, &src_gpu))
         die("vk_mem selftest: uncommitted second chunk is visible");
     for (uint32_t i = 0; i < COPY_SIZE / 4; i++)
@@ -130,12 +149,39 @@ int main(void) {
         die("vk_mem selftest: GPU copy did not see preserved guest bytes");
 
     dm_gpu_commit(guest + test_chunk, COPY_SIZE);
+    vkm_stats(&chunks, &bytes);
+    if (chunks != 1 || bytes != test_chunk)
+        die("vk_mem selftest: second CPU commit changed GPU placement to %llu chunks/%llu bytes",
+            (unsigned long long)chunks, (unsigned long long)bytes);
+    if (vkm_lookup(guest + test_chunk, COPY_SIZE, &src, &src_off, &src_gpu))
+        die("vk_mem selftest: second CPU commit made an unaddressed chunk visible");
     if (!vkm_pool_commit(guest + test_chunk, COPY_SIZE))
         die("vk_mem selftest: second pool commit failed");
-    // A closed page was deliberately never populated by vk_mem in demand-zero
-    // mode.  Opening it must still expose the guest OS's fresh-memory value.
+    // Read a page the CPU has never opened through the sparse Vulkan buffer
+    // before faulting it into the guest mapping. Explicit-zero mode must expose
+    // fresh placed memory as zero to both GPU and guest CPU.
+    if (!vkm_lookup(guest + test_chunk, COPY_SIZE, &src, &src_off, &src_gpu))
+        die("vk_mem selftest: explicitly zeroed page is not GPU-visible");
+    memset(dst_map, 0xa5, COPY_SIZE);
+    VK_CHECK(vkResetCommandPool(g_vkd.dev, pool, 0));
+    VK_CHECK(vkResetFences(g_vkd.dev, 1, &fence));
+    VK_CHECK(vkBeginCommandBuffer(cb, &cbi));
+    copy.srcOffset = src_off;
+    vkCmdCopyBuffer(cb, src, dst, 1, &copy);
+    VK_CHECK(vkEndCommandBuffer(cb));
+    pthread_mutex_lock(&g_vkd_qlock);
+    qr = vkQueueSubmit(g_vkd.q, 1, &si, fence);
+    pthread_mutex_unlock(&g_vkd_qlock);
+    if (qr != VK_SUCCESS)
+        die("vk_mem selftest: explicit-zero copy submit failed (%d)", qr);
+    VK_CHECK(vkWaitForFences(g_vkd.dev, 1, &fence, VK_TRUE, UINT64_MAX));
+    for (size_t i = 0; i < COPY_SIZE; i++)
+        if (((const uint8_t *)dst_map)[i])
+            die("vk_mem selftest: GPU saw nonzero fresh memory at byte %zu", i);
+    // A closed page was populated only in the temporary Vulkan map. Opening it
+    // through the placed guest address must expose the same fresh-memory value.
     if (mprotect(guest + test_chunk, pg, PROT_READ | PROT_WRITE))
-        die("vk_mem selftest: could not open the demand-zero page (errno=%d)", errno);
+        die("vk_mem selftest: could not open the explicitly zeroed page (errno=%d)", errno);
     for (size_t i = 0; i < pg; i++)
         if (guest[test_chunk + i])
             die("vk_mem selftest: fresh guest page is not zero at byte %zu", i);
@@ -151,14 +197,14 @@ int main(void) {
     memcpy(e1, map + DMSH_GMEM_MAP_ENTRY, sizeof e1);
     if (e1[0] != slo[0] || e1[1] != shi[0] || e1[2] != sgpu[0] - slo[0])
         die("vk_mem selftest: rebuilt raw-global entry is wrong");
-    uint64_t chunks = 0, bytes = 0; vkm_stats(&chunks, &bytes);
+    vkm_stats(&chunks, &bytes);
     if (chunks != 2 || bytes != test_size)
         die("vk_mem selftest: expected 2 chunks/%llu bytes, got %llu/%llu",
             (unsigned long long)test_size, (unsigned long long)chunks,
             (unsigned long long)bytes);
 
-    LOG("vk_mem selftest passed: CPU bytes preserved, GPU copy verified, "
-        "uncommitted chunk rejected, raw-global bytes/generation verified, cross-chunk lookup accepted (%llu MiB backed)",
+    LOG("vk_mem selftest passed: CPU commits allocated no Vulkan chunks, bytes preserved, GPU copy verified, "
+        "unaddressed chunk rejected, raw-global bytes/generation verified, cross-chunk lookup accepted (%llu MiB backed)",
         (unsigned long long)(bytes >> 20));
     free(map);
     return 0;

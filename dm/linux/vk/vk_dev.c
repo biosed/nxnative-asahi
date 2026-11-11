@@ -53,9 +53,19 @@ int vkd_init(int with_window) {
     VkPhysicalDeviceVulkan12Features f12 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, .pNext = &f13};
     VkPhysicalDeviceFeatures2 have = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &f12};
     vkGetPhysicalDeviceFeatures2(g_vkd.pd, &have);
-    if (!f13.dynamicRendering || !f12.bufferDeviceAddress || !f12.timelineSemaphore || !have.features.sparseBinding || !have.features.sparseResidencyBuffer) {
-        LOG("[RED] vulkan: %s lacks a required feature (dynamic rendering %d, buffer device address %d, timeline semaphores %d, sparse binding %d, sparse buffers %d)", g_vkd.props.deviceName,
-            f13.dynamicRendering, f12.bufferDeviceAddress, f12.timelineSemaphore, have.features.sparseBinding, have.features.sparseResidencyBuffer);
+    if (!f13.dynamicRendering || !f12.bufferDeviceAddress || !f12.timelineSemaphore ||
+        !f12.shaderSampledImageArrayNonUniformIndexing ||
+        !f12.descriptorBindingSampledImageUpdateAfterBind ||
+        !f12.descriptorBindingPartiallyBound ||
+        !f12.descriptorBindingUpdateUnusedWhilePending ||
+        !have.features.sparseBinding || !have.features.sparseResidencyBuffer) {
+        LOG("[RED] vulkan: %s lacks a required feature (dynamic rendering %d, buffer device address %d, timeline semaphores %d, sampled-image nonuniform %d, sampled-image update-after-bind %d, partially-bound %d, update-unused %d, sparse binding %d, sparse buffers %d)", g_vkd.props.deviceName,
+            f13.dynamicRendering, f12.bufferDeviceAddress, f12.timelineSemaphore,
+            f12.shaderSampledImageArrayNonUniformIndexing,
+            f12.descriptorBindingSampledImageUpdateAfterBind,
+            f12.descriptorBindingPartiallyBound,
+            f12.descriptorBindingUpdateUnusedWhilePending,
+            have.features.sparseBinding, have.features.sparseResidencyBuffer);
         return 0;
     }
     if (g_vkd.placed && !mp.memoryMapPlaced) g_vkd.placed = 0;
@@ -75,7 +85,22 @@ int vkd_init(int with_window) {
     VkPhysicalDeviceMeshShaderFeaturesEXT mesh_on = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT, .pNext = enable_tail,
         .taskShader = (mesh_pre.enable_extension || mesh_title_pre.enable_extension) ? mesh_feat.taskShader : VK_FALSE, .meshShader = VK_TRUE};
     f13.pNext = mesh_enable ? (void *)&mesh_on : enable_tail;
-    const char *dext[8]; uint32_t nd = 0;
+    // VK_EXT_zero_initialize_device_memory: memory that reads zero without the host writing it, so a guest chunk's closed pages need no memset and stay
+    // uncommitted (vk_mem.c). Asked on its own so the chain above keeps its shape
+    VkPhysicalDeviceZeroInitializeDeviceMemoryFeaturesEXT zi = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ZERO_INITIALIZE_DEVICE_MEMORY_FEATURES_EXT};
+    if (has_ext(g_vkd.pd, VK_EXT_ZERO_INITIALIZE_DEVICE_MEMORY_EXTENSION_NAME)) { VkPhysicalDeviceFeatures2 q = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &zi}; vkGetPhysicalDeviceFeatures2(g_vkd.pd, &q); }
+    g_vkd.zero_init = zi.zeroInitializeDeviceMemory == VK_TRUE;
+    if (g_vkd.zero_init) { zi.pNext = f13.pNext; f13.pNext = &zi; }
+    // VK_KHR_maintenance8: a non-constant Offset operand on OpImageFetch and friends (Ocarina of Time's compute shader d17eefaff4f0bc23 has one every frame).
+    // The shader chain validates such a module only for a device with this feature
+    VkPhysicalDeviceMaintenance8FeaturesKHR m8 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_8_FEATURES_KHR};
+    if (has_ext(g_vkd.pd, VK_KHR_MAINTENANCE_8_EXTENSION_NAME)) { VkPhysicalDeviceFeatures2 q = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &m8}; vkGetPhysicalDeviceFeatures2(g_vkd.pd, &q); }
+    g_vkd.maintenance8 = m8.maintenance8 == VK_TRUE;
+    if (g_vkd.maintenance8) { m8.pNext = f13.pNext; f13.pNext = &m8; }
+    LOG("vulkan: VK_KHR_maintenance8 %s, VK_EXT_zero_initialize_device_memory %s", g_vkd.maintenance8 ? "enabled" : "absent (a dynamic texel offset is not valid on this device)", g_vkd.zero_init ? "enabled" : "absent");
+    const char *dext[12]; uint32_t nd = 0;
+    if (g_vkd.zero_init) dext[nd++] = VK_EXT_ZERO_INITIALIZE_DEVICE_MEMORY_EXTENSION_NAME;
+    if (g_vkd.maintenance8) dext[nd++] = VK_KHR_MAINTENANCE_8_EXTENSION_NAME;
     if (g_vkd.shader_object) dext[nd++] = VK_EXT_SHADER_OBJECT_EXTENSION_NAME;
     if (g_vkd.index_u8) dext[nd++] = VK_KHR_INDEX_TYPE_UINT8_EXTENSION_NAME;
     if (mesh_enable) dext[nd++] = VK_EXT_MESH_SHADER_EXTENSION_NAME;

@@ -69,10 +69,13 @@ typedef struct vtex {
     uint64_t clean_at, last_sample; const void *span;   // dirty clock / last replay submission sampled; tracked range (nvn_dirty_span)
     uint64_t release_after;   // released: destroyed once the timeline passes this (0 = live)
     vkview *views;
-    const uint8_t *kmem, *kend; nvn_texdesc kd; uint32_t khash; int refs;   // the storage it is found by (vk_replay.c's sharing), and the texture objects that refer to it
+    const uint8_t *kmem, *kend; nvn_texdesc kd; uint32_t khash;
+    int refs, serial_refs;   // all references, and the subset represented in vk_replay.c's serial table
+    const void *pool;   // the NVN memory pool the storage is on: its Finalize retires the image (mtl_alias_drop_pool)
 } vtex;
 extern pthread_mutex_t g_tmu;   // the texture table
 vtex *vkr_tex_sampled(const tex_t *o, VkCommandBuffer upload_unused);   // under g_tmu: the image, loaded from guest memory first when it must be
+vtex *vkr_tex_target(const tex_t *o);                                   // under g_tmu: the image without loading guest content, for an overwrite
 vtex *vkr_tex_sampled_budgeted(const tex_t *o, uint64_t total_budget,
                                uint64_t single_max);   // speculative set-5 creation only; existing images are always returned
 void vkr_tex_gpu_write(vtex *t);                       // under g_tmu: mark an image as GPU-written
@@ -82,10 +85,14 @@ int vkr_bindless_take_tex_dirty(int *ids, int cap);                    // regist
 int vkr_bindless_take_samp_dirty(int *ids, int cap);
 int vkr_bindless_evict_old_speculative(uint64_t registered_before, int *ids,
                                        int cap, uint64_t *bytes);       // retire one bounded batch; returns affected current IDs
+void vkr_cpu_written_refresh(void);   // before a submission's first draw: textures the CPU wrote since they were loaded (vk_replay.c)
 int vkr_bindless_recent_tex_ids(uint64_t registered_after, int *ids,
                                 int cap);                              // current registrations from the new scene generation
 uint64_t vkr_submission_count(void);
+uint64_t vkr_uniform_update_count(void);
 uint64_t vkr_mesh_issue_count(void);
+void vkr_passdump_next(long frames);   // DM_CTL passdump: trace the next bounded set of complete frames
+void vkr_texraw(uint64_t serial, const char *path);   // DM_CTL texraw: queue one host-image PNG readback
 int vkr_tex_gpu_owned(uint64_t serial);
 uint32_t vkr_pick_mem(uint32_t bits, VkMemoryPropertyFlags want);
 uint64_t vkr_fence_next(void);   // the fence value the submission in progress will signal

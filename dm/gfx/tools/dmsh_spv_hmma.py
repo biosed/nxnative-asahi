@@ -381,6 +381,38 @@ def hmma_helper(module):
     }
 
 
+# Gathered A / B fragments kept for reuse within a basic block, most recently
+# used first.  Every kept fragment is 32 half-float values that stay live until
+# its last reuse: an unbounded cache kept ten B matrices live across thousands
+# of instructions in the NDSR kernel d99fbeeb53d38847 (five convolution layers
+# in one block), more than the AGX register file holds, and the driver spilled
+# 852 values and filled 877 per thread (36 / 31 before this lowering existed).
+# Two of each keeps the adjacent reuse the kernels actually have.
+# DMSH_HMMA_CACHE=<a>,<b> overrides it for measurements (0 = unbounded).
+HMMA_CACHE_A, HMMA_CACHE_B = 2, 2
+
+
+def _cache_limits():
+    text = os.environ.get('DMSH_HMMA_CACHE')
+    if not text:
+        return HMMA_CACHE_A, HMMA_CACHE_B
+    a, b = (int(part) for part in text.split(','))
+    if a < 0 or b < 0:
+        raise ValueError('DMSH_HMMA_CACHE=%s: limits are not negative' % text)
+    return a, b
+
+
+def _cache_keep(cache, key, limits):
+    """Mark key most recently used and drop the oldest of its kind past the limit."""
+    cache[key] = cache.pop(key)
+    limit = limits[0] if key[0] == 'A' else limits[1]
+    if not limit:
+        return
+    same = [k for k in cache if k[0] == key[0]]
+    for old in same[:max(0, len(same) - limit)]:
+        del cache[old]
+
+
 def hmma_lds(module):
     """Lower every recognized HMMA call, returning the number replaced.
 
@@ -419,6 +451,7 @@ def hmma_lds(module):
     for function in functions:
         first, last = module.function_range(function)
         out, values, cache = [], BlockValues(module), {}
+        limits = _cache_limits()
 
         def emit(op, ty, *operands):
             result = module.new_id()
@@ -441,14 +474,22 @@ def hmma_lds(module):
                 raise ValueError('%s call has %d arguments, expected %d' %
                                  (HMMA_NAME, len(args), HMMA_PARAMETERS))
             keys = [values.key_of_var(ptr) for ptr in args[:10]]
-            vals = [emit(OP_LOAD, i32, ptr) for ptr in args[:10]]
-            lane, base = vals[0], vals[1]
-            group = integer(OP_SHR_LOGICAL, lane, ci[2])
-            thread = integer(OP_BITWISE_AND, lane, ci[3])
             key_a = ('A', *keys[:6])
             key_b = ('B', *keys[:2], *keys[6:8])
             needed = [key for key in (key_a, key_b) if key not in cache]
             if needed:
+                load_indices = {0, 1}
+                if key_a in needed:
+                    load_indices.update((2, 3, 4, 5))
+                if key_b in needed:
+                    load_indices.update((6, 7))
+                vals = {
+                    i: emit(OP_LOAD, i32, args[i])
+                    for i in sorted(load_indices)
+                }
+                lane, base = vals[0], vals[1]
+                group = integer(OP_SHR_LOGICAL, lane, ci[2])
+                thread = integer(OP_BITWISE_AND, lane, ci[3])
                 base4 = integer(OP_SHR_LOGICAL, base, ci[2])
                 vi = integer(OP_SHR_LOGICAL, thread, ci[1])
                 comp0 = emit(
@@ -504,11 +545,16 @@ def hmma_lds(module):
                         vec = emit(OP_LOAD, uvec4, pointer)
                         packed += [emit(OP_COMPOSITE_EXTRACT, u32, vec, c)
                                    for c in range(4)]
-                    return [
+                    unpacked = [
                         emit(
                             OP_EXT_INST, v2f, glsl, GLSL_UNPACK_HALF_2X16,
                             packed[2 * (kw % 4) + kw // 4],
                         ) for kw in range(8)
+                    ]
+                    return [
+                        [emit(OP_COMPOSITE_EXTRACT, f32, pair, half)
+                         for half in range(2)]
+                        for pair in unpacked
                     ]
 
                 if key_a in needed:
@@ -523,11 +569,14 @@ def hmma_lds(module):
                     ]
                 out.extend(list(barrier) for barrier in helper['barrier'])
             a_fragments, b_fragments = cache[key_a], cache[key_b]
+            _cache_keep(cache, key_a, limits)
+            _cache_keep(cache, key_b, limits)
+            cvals = [emit(OP_LOAD, i32, args[i]) for i in (8, 9)]
             result_words = []
             for row in range(2):
                 cvec = emit(
                     OP_EXT_INST, v2f, glsl, GLSL_UNPACK_HALF_2X16,
-                    emit(OP_BITCAST, u32, vals[8 + row]),
+                    emit(OP_BITCAST, u32, cvals[row]),
                 )
                 accum = [
                     emit(OP_COMPOSITE_EXTRACT, f32, cvec, 0),
@@ -538,14 +587,8 @@ def hmma_lds(module):
                         for half in range(2):
                             accum[col] = emit(
                                 OP_EXT_INST, f32, glsl, GLSL_FMA,
-                                emit(
-                                    OP_COMPOSITE_EXTRACT, f32,
-                                    a_fragments[row][kw], half,
-                                ),
-                                emit(
-                                    OP_COMPOSITE_EXTRACT, f32,
-                                    b_fragments[col][kw], half,
-                                ),
+                                a_fragments[row][kw][half],
+                                b_fragments[col][kw][half],
                                 accum[col],
                             )
                 pair = emit(OP_COMPOSITE_CONSTRUCT, v2f, *accum)

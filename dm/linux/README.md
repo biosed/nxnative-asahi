@@ -212,6 +212,74 @@ publication/reuse lifecycle has a device-free check:
 make -C dm/linux GAME=0400486024DEC000 t_vk_cs_gpu_lifecycle
 ```
 
+### Compile visibility
+
+A shader the driver has not seen is compiled on the replay thread inside
+`vkCreateShadersEXT`, and a large kernel can hold it for a long time:
+Ocarina's NDVE compute shader `d15370a382630d4e` (7.4 MB of SPIR-V) takes
+about 57 s on Honeykrisp, during which the GPU heartbeat shows nothing
+submitted, which reads as a GPU hang. Every SPIR-V compile is entered in an
+in-flight table (`vk/vk_compile_watch.h`) while it runs:
+
+- a compile watcher thread logs `vulkan shader compile: N compiling, oldest
+  <key> stage <s> gl <g> <MB> MB SPIR-V for <seconds> s` every 5 s while a
+  compile has run for 2 s or more (`DM_VK_COMPILE_WATCH=0` leaves the thread
+  out);
+- `DM_VK_GPU_HEARTBEAT=1` appends the same text to each heartbeat line;
+- a finished compile of 1 s or more is always logged with its key, stage,
+  form, SPIR-V bytes, result and time, so the log names what to precompile
+  (`DM_VK_PRECOMPILE_ONLY=1 DM_VK_PRECOMPILE_KEYS=<keys>`);
+- `DM_VK_SHADER_COMPILE_LOG=1` logs the begin and end of every compile with
+  the fence value, for ordering against submissions.
+
+The table is bounded (16 compiles at once; more run unwatched and are
+counted), lock-free and allocation-free. Its device-free check:
+
+```sh
+make -C dm/linux GAME=0400486024DEC000 t_vk_compile_watch
+```
+
+### Movie enhancement cadence
+
+`DM_MOVIE_ENHANCE=0` is a bounded alternative for games whose shader map names
+an `nn::movie` NDVE network. The first frame keeps every intermediate network
+stage. Its last reflected stage must have exactly one sampled texture, one
+storage image and matching 2D dimensions; the Vulkan replay replaces that last
+stage with a copy or blit of the decoded input into its output. Only after that
+succeeds are the next frame's storage-buffer intermediate stages omitted. A
+refused copy restores the full network and disables the substitution for that
+final shader.
+
+The switch is off only when explicitly set; the generic runtime otherwise runs
+the game's complete network. It is distinct from `DM_VK_SKIP_CS`: colour
+conversion and the later NDSR scaler still run, and no title key is placed in a
+general skip list. Its reflection classification and fail-closed state have a
+device-free check:
+
+```sh
+make -C dm/linux GAME=0400486024DEC000 t_vk_movie
+```
+
+### Images retire with their memory pool
+
+A released texture object leaves its storage-backed image in the replay's
+storage table so the next object built over the same bytes with the same
+description finds it again (transient render targets are rebuilt every
+frame). Only a new image overlapping those bytes retired it. Ocarina of Time
+creates and finalizes memory pools continuously (16,384 in six minutes of
+play), and nothing is ever built over a finalized pool's bytes, so its render
+targets accumulated: GPU-owned image memory grew from 1.2 to 3.0 GiB in five
+minutes of standing still in Kokiri Forest, pushing the guarded process over
+`MemoryHigh` into multi-second reclaim stalls.
+
+`nvnMemoryPoolFinalize` now reaches the replay (`mtl_alias_drop_pool`, as on
+the Metal path): every image on the pool leaves the storage table, drops its
+serial references and retires behind its fence. The log counts them as
+`images retired with their finalized memory pools`. A texture object released
+before the replay thread created its image would otherwise keep a stale
+reference for good, which is why the references are dropped rather than
+waited for.
+
 ## Compatible 32-bit image views
 
 NVN shaders may address a compatible 32-bit colour image through an R32UI or

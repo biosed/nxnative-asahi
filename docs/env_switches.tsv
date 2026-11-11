@@ -103,6 +103,7 @@ DM_MOTION_AXES	switch	`=<map>` such as `x,-z,y`: maps Apple's controller axes to
 DM_MOTION_GAIN	switch	`=<gain>`: how fast the orientation is pulled toward the measured gravity, in rad/s per unit error (default 0.5; `0` integrates the gyro alone)
 DM_MOTION_HID	switch	On the Mac, `0` disables the passive Switch Pro Controller HID motion fallback (`motion_pro_mac.h`); enabled by default when exactly one physical Pro and one GameController Pro can use the same player slot; usable GameController motion takes priority
 DM_MOTION_LOG	diagnostic	`=1` logs player 1's mapped motion sample once a second per source (phone / GameController / controller HID; acceleration in G, gyro in revolutions/s), for checking the axes: flat and still reads acc 0 0 -1
+DM_MOVIE_ENHANCE	player	`0` leaves out the storage-buffer stages of an nn::movie NDVE enhancement network only after its final one-texture/one-image step has been replaced successfully by a decoded-frame copy; `1` or unset runs the complete network (`vk_draw.c` `movie_net_dispatch`)
 DM_MOVIE_TRACE	diagnostic	When set, the movie decoder logs every call with its thread and decoder (by default the first 12 calls, then every 2^k-th)
 DM_MSL_DIR	path	Parent folder of the shader libraries: NVN loads from `b-<chain version>/` or the one file `b-<chain version>.img` beneath it, Vulkan from `vk/`, GL from `gl/`; the app and the Mac launcher set it
 DM_NICK	switch	The account nickname the game sees (default `Player`)
@@ -162,7 +163,7 @@ DM_NVN_LAZY_CLEAR	switch	`0` makes clears with no draw after them open a pass of
 DM_NVN_LOADPROBE	diagnostic	`=1`, `2` or `3`: attachments whose load is skipped are cleared to a sentinel colour (`3` NaN; `1` NaN for float formats) and the sentinel pixels left at pass end are counted (should be 0)
 DM_NVN_LOG	diagnostic	`=1` logs the creation of NVN objects
 DM_NVN_MAGSCAN	diagnostic	`=<fs key>[:every[:phase]]`: device self-check that reads each pass's colour attachments every `every` frames (default 30) and logs `[mag]` lines for solid magenta 16×16 blocks or non-finite pixels
-DM_NVN_PASSDUMP	diagnostic	`=<f>`, `<f1>-<f2>` or `every:<n>`: logs every render pass of those frames (attachments, clears, shader keys, bindings, draw state, presents) for the `tbdr_*.py` tools
+DM_NVN_PASSDUMP	diagnostic	`=<f>`, `<f1>-<f2>` or `every:<n>`: logs every render pass of those frames (attachments, clears, shader keys, direct/indexed draw arguments, the actual pre-raster depth variant, bindings, draw state, presents) for the `tbdr_*.py` tools
 DM_NVN_PASSDUMP_ALL	diagnostic	`=1` makes `DM_NVN_PASSDUMP` record every draw and binding change, not only the first per pass and stage, including copies and inline uniform updates
 DM_NVN_PASSGPU	diagnostic	`=<file>` writes the GPU time of each render and compute pass from stage-boundary timestamp counters (off under Metal 4); also gives each dispatch its own encoder
 DM_NVN_PASSGPU_SERIAL	diagnostic	`=1` makes each encoder on the main command buffer wait until all earlier work has finished, so `DM_NVN_PASSGPU` times read each pass's exclusive time (totals read high)
@@ -171,6 +172,8 @@ DM_NVN_PREDICT	switch	`0` turns off the parallel precompile look-ahead: a pipeli
 DM_NVN_PREFETCH	switch	`0` turns off loading a program's shader libraries in the background when the game makes it (`nvnProgramSetShaders`); they load at its first draw instead
 DM_NVN_PROF	diagnostic	`=1` wraps the implemented NVN functions in a timing wrapper and collects the time each takes during recording
 DM_NVN_PROGTRACE	diagnostic	`=<vertex keys,...>` logs matching ProgramSetShaders calls and their guest backtraces
+DM_NVN_QUEUE_SCHED	diagnostic	`=0` bypasses Linux's logical NVN queue scheduler and replays submissions immediately in old mutex order, ignoring command-buffer event/sync waits; for guarded A/B diagnosis only, never a correctness mode. The 300-frame `logical queues` line reports command nodes, scheduler commits/final fences, dependency releases, cross-queue versus local waits, queue switches and parked time with either mode; replay can internally flush one scheduler commit into several Vulkan submits
+DM_NVN_QUEUE_YIELD	diagnostic	`=0` keeps the Linux logical-queue worker's submission lock for a whole recorded window instead of handing it to a waiting present or submit between nodes; with it the game's present blocked about 31 ms a frame in Ocarina of Time (frame 47.7 ms against 43.1 handed over). For A/B diagnosis only
 DM_NVN_REGLUM	diagnostic	`=x0,y0,x1,y1:<file>` (normalized coordinates): on every present records the present number, time, mean luminance and a grayscale thumbnail of that region, to check animation speed against frame rate
 DM_NVN_RP_AREA	switch	`0` makes passes on targets of 16 M pixels or more cover the whole target, as before; by default a draw pass that loads what it keeps stops at the far corner of its scissor when that is at most half the target
 DM_NVN_RT_CONTINUE	switch	`0` ends the pass whenever the game sets render targets, as before; by default SetRenderTargets naming the open pass's targets continues the pass
@@ -354,9 +357,12 @@ DM_UE_SHADERS	path	Folder of the Unreal shader code archives decoded by `uepak.p
 DM_UE_TEXTURE_POOL	switch	Megabytes Unreal's texture streaming pool (`r.Streaming.PoolSize`) is raised to, overriding the profile's `ue_texture_pool`; `0` keeps the game's own pool. On iOS only this switch turns it on (`Documents/env.txt`)
 DM_UPSCALER	player	`metalfx` draws the game's own upscaler shaders (agl's NDSR network, found by the shader map) with MetalFX's spatial scaler; `game` (the default) runs them
 DM_VK_CAPTURE	path	`=<dir>` (Mac) writes every SPIR-V module the game creates to `<dir>/<key>.spv`; the NSP script's Vulkan shader capture stage sets it
+DM_VK_COMPILE_WATCH	switch	`=0` leaves out the compile watcher thread that logs shader compiles in flight for 2 s or more every 5 s (vk_draw.c; the GPU heartbeat appends the same text); default on
 DM_VK_CS_GPU	diagnostic	`=1` timestamps Vulkan compute dispatches in place and logs `[vk-cs-gpu]` lines with frame, shader key, workgroup dimensions and GPU time; no submissions, waits or barriers are added (4,096 samples by default, at most 512 per command buffer)
 DM_VK_CS_GPU_LIMIT	diagnostic	With `DM_VK_CS_GPU=1`, sets the bounded total number of dispatch samples to log (1..65,536; default 4,096)
+DM_VK_GPU_HEARTBEAT	diagnostic	`=1` logs `vulkan GPU heartbeat: submitted/done/report-wait` once a second from the GPU-value thread (vk_replay.c), with any shader compile in flight for 2 s or more
 DM_VK_LOG	diagnostic	`=1` logs Vulkan object creation in the Vulkan-on-Metal layer
+DM_VK_SHADER_COMPILE_LOG	diagnostic	`=1` logs the begin and end of every shader compile with key, stage, form, fence value and elapsed time (vk_draw.c); compiles of 1 s or more are logged without it
 DM_VSYNC_HZ	switch	`=<Hz>`: rate at which a host thread fires the vi vsync event when the display link does not drive it (default 60)
 DM_WATCH	diagnostic	`=<s>` dumps all threads after that many seconds (SIGALRM) and turns on the stall watchdog; off unless set
 DM_WATCH_SAMPLE	diagnostic	`=<path>` (Mac): when the stall watchdog fires, samples the process for 1 s with `/usr/bin/sample` and writes the thread stacks to that path
