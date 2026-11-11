@@ -32,9 +32,17 @@ int renamex_np(const char *from, const char *to, unsigned flags);
 // Darwin names only the calling thread. Imported renderer code already uses
 // Linux's two-argument form, while current nxnative C still uses Darwin's
 // one-argument form, so accept both during the forward port.
+// Linux refuses (ERANGE) a name longer than 15 characters and leaves the thread
+// unnamed, so a profiler could not find e.g. "NVN queue replay": keep the first 15.
+#include <pthread.h>
+#include <string.h>
+static inline int dm_pthread_setname(pthread_t t, const char *name) {
+    char n[16]; strncpy(n, name, sizeof n - 1); n[sizeof n - 1] = 0;
+    return (pthread_setname_np)(t, n);
+}
 #define DM_PTHREAD_NAME_PICK(_1, _2, NAME, ...) NAME
-#define DM_PTHREAD_NAME_ONE(name) (pthread_setname_np)(pthread_self(), (name))
-#define DM_PTHREAD_NAME_TWO(thread, name) (pthread_setname_np)((thread), (name))
+#define DM_PTHREAD_NAME_ONE(name) dm_pthread_setname(pthread_self(), (name))
+#define DM_PTHREAD_NAME_TWO(thread, name) dm_pthread_setname((thread), (name))
 #define pthread_setname_np(...) DM_PTHREAD_NAME_PICK(__VA_ARGS__, DM_PTHREAD_NAME_TWO, DM_PTHREAD_NAME_ONE)(__VA_ARGS__)
 // Darwin's wait with a relative timeout
 #include <time.h>
