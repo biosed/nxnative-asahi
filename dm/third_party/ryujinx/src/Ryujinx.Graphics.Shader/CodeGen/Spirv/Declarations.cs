@@ -142,6 +142,17 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
                 context.Name(variable, buffer.Name);
                 context.Decorate(variable, Decoration.DescriptorSet, (LiteralInteger)setIndex);
                 context.Decorate(variable, Decoration.Binding, (LiteralInteger)buffer.Binding);
+
+                if (isBuffer && buffer.IsReadOnly)
+                {
+                    context.Decorate(variable, Decoration.NonWritable);
+                }
+
+                if (isBuffer && buffer.IsRestrict)
+                {
+                    context.Decorate(variable, Decoration.Restrict);
+                }
+
                 context.AddGlobalVariable(variable);
 
                 if (isBuffer)
