@@ -48,7 +48,10 @@ namespace Ryujinx.Graphics.Shader.StructuredIr
                     definition.Name,
                     definition.Type,
                     definition.IsReadOnly && existing.IsReadOnly,
-                    definition.IsRestrict || existing.IsRestrict);
+                    // Restrict is valid only when every observation proves the
+                    // binding cannot alias another resource.  A caller which
+                    // does not have that proof must conservatively remove it.
+                    definition.IsRestrict && existing.IsRestrict);
             }
 
             _storageBuffers[definition.Binding] = definition;
