@@ -73,25 +73,19 @@ static inline void vkx_descriptor_union_totals(const vkx_descriptor_union *u,
     }
 }
 
-// Keep descriptor-pool retry policy device-free and independently testable.
-// A capacity error is evidence that a pool is exhausted only after that pool
-// has successfully served at least one set.  Treating the same error from a
-// fresh pool as "full" would otherwise create and burn the whole pool chain.
-typedef enum {
-    VKX_POOL_ALLOC_FAIL = 0,
-    VKX_POOL_ALLOC_OK,
-    VKX_POOL_ALLOC_ADVANCE,
-} vkx_pool_alloc_action;
-static inline vkx_pool_alloc_action vkx_pool_alloc_result(VkResult r, uint32_t used) {
-    if (r == VK_SUCCESS) return VKX_POOL_ALLOC_OK;
-    if (used && (r == VK_ERROR_OUT_OF_POOL_MEMORY || r == VK_ERROR_FRAGMENTED_POOL))
-        return VKX_POOL_ALLOC_ADVANCE;
-    return VKX_POOL_ALLOC_FAIL;
-}
 enum {
+    VKX_DESCRIPTOR_POOL_SETS = 256,
     VKX_DESCRIPTOR_SET_HIGH_WATER = 8192,
     VKX_DESCRIPTOR_POOL_HIGH_WATER = 192,
 };
+// A pool allocates all of its same-layout sets together once.  Recording takes
+// each handle at most once until the owning ring-slot fence passes and its used
+// count is reset; the handles themselves stay valid and can then be rewritten.
+static inline int vkx_descriptor_set_take(uint16_t *used, uint16_t *index) {
+    if (*used >= VKX_DESCRIPTOR_POOL_SETS) return 0;
+    *index = (*used)++;
+    return 1;
+}
 static inline int vkx_descriptor_pressure_values(uint32_t sets, uint32_t pool) {
     return sets >= VKX_DESCRIPTOR_SET_HIGH_WATER ||
            pool >= VKX_DESCRIPTOR_POOL_HIGH_WATER;
