@@ -17,6 +17,7 @@
 #include "vk_skipcs.h"
 #include "vk_movie.h"
 #include "vk_upscaler.h"
+#include "vk_menu.h"
 #include "vk_cube.h"
 #include "vk_gmem_trace.h"
 #include "vk_missing_log.h"
@@ -83,9 +84,9 @@ typedef struct {
 #define VKX_MOVIE_SHADERS_MAX 64
 static vkx_movie_shader g_movie_shader[VKX_MOVIE_SHADERS_MAX];
 static int g_nmovie_shader;
-// The game's upscaler stages that read one texture and write one image (DM_GAME_UPSCALER_KEYS, vk_upscaler.h): kind 1 replaceable, 0 refused once
+// The game's upscaler stages that read one texture and write one image (DM_GAME_UPSCALER_KEYS, vk_upscaler.h); a refusal is remembered per replacement mode
 #define VKX_UPSCALER_SHADERS_MAX 96
-typedef struct { char key[17]; int kind, probed; vkbind input, output; } vkx_up_shader;
+typedef struct { char key[17]; int probed; unsigned refused_modes; vkbind input, output; } vkx_up_shader;
 static vkx_up_shader g_up_shader[VKX_UPSCALER_SHADERS_MAX];
 static int g_nup_shader;
 static vks *g_sh[1024]; static pthread_mutex_t g_shmu = PTHREAD_MUTEX_INITIALIZER;
@@ -240,7 +241,7 @@ static void upscaler_reflect(const char key[17], const vks *s) {
         return;
     }
     vkx_up_shader *u = &g_up_shader[g_nup_shader++];
-    snprintf(u->key, sizeof u->key, "%s", key); u->kind = 1; u->input = *input; u->output = *output;
+    snprintf(u->key, sizeof u->key, "%s", key); u->input = *input; u->output = *output;
 }
 static void shc_init(uint64_t layout_hash); static void precompile_start(void);
 static char (*g_keys)[17]; static int g_nkeys;   // every standard and native-mesh shader key (draw_init)
@@ -2321,11 +2322,16 @@ static int movie_net_dispatch(VkCommandBuffer c, const char key[17], const p_dis
     return 1;
 }
 
-// The game's upscaler or a plain scaler in its place (vk_upscaler.h: DM_UPSCALER, the player's choice; the network by default)
+// The game's upscaler or a plain scaler in its place (vk_upscaler.h: DM_UPSCALER, the player's choice; the network by default). Without DM_UPSCALER the
+// settings file's choice (vk_menu.h) is used; the in-game options menu changes it while the game runs (vkx_upscaler_set), from the next dispatch on
+static _Atomic int g_up_mode = -1;
 static int upscaler_mode(void) {
-    static int mode = -1;
+    int mode = atomic_load(&g_up_mode);
     if (mode < 0) {
-        int bad; const char *e = getenv("DM_UPSCALER"); mode = vkx_upscaler_parse(e, &bad);
+        int bad, file = VKX_UPSCALER_GAME, tier; const char *e = getenv("DM_UPSCALER");
+        mode = vkx_upscaler_parse(e, &bad);
+        if (!bad && (!e || !*e) && vkx_menu_settings_load(&file, &tier) & 1) mode = file;
+        atomic_store(&g_up_mode, mode);
         if (bad) LOG("[RED] DM_UPSCALER=%s: game, linear, fsr1 or probe; keeping the game's upscaler", e);
         else if (mode != VKX_UPSCALER_GAME) LOG("upscaler (DM_UPSCALER): %s; %d profile upscaler shaders, %d of them one texture in and one image out",
                                                  mode == VKX_UPSCALER_LINEAR ? "linear, the game's upscaling stages replaced by a bilinear scale (upscale_sqrt.comp)" :
@@ -2333,6 +2339,12 @@ static int upscaler_mode(void) {
                                                  DM_GAME_UPSCALER_N, g_nup_shader);
     }
     return mode;
+}
+int vkx_upscaler_current(void) { return upscaler_mode(); }
+void vkx_upscaler_set(int mode) {
+    if (mode != VKX_UPSCALER_GAME && mode != VKX_UPSCALER_LINEAR && mode != VKX_UPSCALER_FSR1) return;
+    if (atomic_exchange(&g_up_mode, mode) != mode)
+        LOG("upscaler: the options menu chose %s", mode == VKX_UPSCALER_FSR1 ? "FSR 1" : mode == VKX_UPSCALER_LINEAR ? "linear" : "the game's network");
 }
 static vkx_up_shader *upscaler_shader(const char key[17]) {
     for (int i = 0; i < g_nup_shader; i++) if (!strcmp(g_up_shader[i].key, key)) return &g_up_shader[i];
@@ -2505,7 +2517,7 @@ static int fsr_encode(VkCommandBuffer c, VkImageView siv, VkImageView div, vkx_r
 // 1 when the dispatch was done as a linear blit (DM_UPSCALER=linear), 0 to run the shader. probe logs the first dispatches of each stage and runs it.
 static int upscale_dispatch(VkCommandBuffer c, const char key[17], const p_dispatch *p) {
     int mode = upscaler_mode(); if (mode == VKX_UPSCALER_GAME || p->ind) return 0;
-    vkx_up_shader *u = upscaler_shader(key); if (!u || !u->kind) return 0;
+    vkx_up_shader *u = upscaler_shader(key); if (!u || (u->refused_modes & 1u << mode)) return 0;   // the replay thread alone reads and sets refused_modes
     int sid = movie_texture_id(&u->input);
     int did = u->output.reg >= 0 && u->output.reg < 32 ? (int)(S.img[5][u->output.reg] & 0xfffff) : 0;
     uint32_t v[8]; memcpy(v, vkr_push(1), sizeof v);
@@ -2556,10 +2568,10 @@ static int upscale_dispatch(VkCommandBuffer c, const char key[17], const p_dispa
         return 1;
     }
     g_up_kept++;
-    LOG("[RED] upscaler: %s cannot be drawn by the %s scaler (%s); the game's network runs for this shader from now on", key, mode == VKX_UPSCALER_FSR1 ? "FSR 1" : "linear",
+    LOG("[RED] upscaler: %s cannot be drawn by the %s scaler (%s); the game's network runs for this shader while that scaler is chosen", key, mode == VKX_UPSCALER_FSR1 ? "FSR 1" : "linear",
         !rects ? "push-constant rectangles do not fit its textures" : !vkx_upscaler_accept(ir, orr) ? "not an upscale" :
         !enc ? "not the sqrt RGB9E5 -> B10G11R11 encoding" : mode == VKX_UPSCALER_FSR1 && (ir.x || ir.y || orr.x || orr.y) ? "a rectangle not at the texture origin" : "texture shape, view or descriptor");
-    u->kind = 0;
+    u->refused_modes |= 1u << mode;   // that scaler only: the options menu may still choose another for this shader
     return 0;
 }
 

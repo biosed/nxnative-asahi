@@ -19,6 +19,8 @@
 #include "dm_input.h"
 #include <SDL3/SDL.h>
 #include <math.h>
+#include "vk_menu.h"
+int vkw_menu_toggle(void); int vkw_menu_open(void); void vkw_menu_action(int action);   // vk_window.c: the in-game options menu
 
 enum { T_BUTTONS = 17, T_LUP = T_BUTTONS, T_LDOWN, T_LLEFT, T_LRIGHT, T_RUP, T_RDOWN, T_RLEFT, T_RRIGHT, T_COUNT };   // 0..15 the NpadButton bits, 16 shake
 static const char *const TARGETS[T_COUNT] = {"A", "B", "X", "Y", "LS", "RS", "L", "R", "ZL", "ZR", "PLUS", "MINUS", "LEFT", "UP", "RIGHT", "DOWN", "SHAKE",
@@ -149,9 +151,51 @@ static pad_state eval(const player_t *pl, int32_t (*src)(const player_t *, int))
     return s;
 }
 static int32_t larger(int32_t a, int32_t b) { return abs(a) >= abs(b) ? a : b; }
+// The in-game options menu (vk_menu.h): player 1's Minus + Plus together, or F1 (input_key), opens and closes it. While it is open player 1's d-pad or left
+// stick moves through it, A or Plus (Return on the keyboard) changes a choice, B (Escape) closes it, and every player's game input is released. Buttons
+// still held when it closes stay away from the game until they are let go, so the press that closed it does not reach the game.
+enum { MENU_STICK_UP = 1 << 16, MENU_STICK_DOWN = 1 << 17, MENU_STICK_LEFT = 1 << 18, MENU_STICK_RIGHT = 1 << 19 };   // player 1's left stick past half, as buttons
+static uint64_t g_menu_prev, g_menu_hold;
+static void push(int p);
+static void release_all(void) {
+    for (int p = 0; p < DM_PLAYERS; p++) {
+        if (p == 0 && g_pl[0].keyboard) dm_input_set(0, 0, 0, 0, 0);
+        if (g_pl[p].gp || g_pl[p].keyboard || p == 0) dm_pad_set_player(p, 0, 0, 0, 0, 0);
+    }
+}
+static void menu_closed(uint64_t held) { g_menu_hold = held; for (int p = 0; p < DM_PLAYERS; p++) if (g_pl[p].gp || g_pl[p].keyboard) push(p); }
+// Player 1's input while the menu may take it: 1 when the menu took it (the game gets nothing)
+static int menu_input(pad_state k, pad_state c) {
+    uint64_t b = (k.b | c.b) & ~DM_BTN_SHAKE;
+    int32_t lx = larger(k.lx, c.lx), ly = larger(k.ly, c.ly);
+    if (ly > DM_STICK_MAX / 2) b |= MENU_STICK_UP; else if (ly < -DM_STICK_MAX / 2) b |= MENU_STICK_DOWN;
+    if (lx > DM_STICK_MAX / 2) b |= MENU_STICK_RIGHT; else if (lx < -DM_STICK_MAX / 2) b |= MENU_STICK_LEFT;
+    uint64_t edge = b & ~g_menu_prev; g_menu_prev = b;
+    const uint64_t combo = DM_BTN_PLUS | DM_BTN_MINUS;
+    if ((b & combo) == combo && (edge & combo)) {
+        if (vkw_menu_toggle()) release_all(); else menu_closed(b);
+        return 1;
+    }
+    if (!vkw_menu_open()) return 0;
+    if (edge & (DM_BTN_UP | MENU_STICK_UP)) vkw_menu_action(VKX_MENU_UP);
+    if (edge & (DM_BTN_DOWN | MENU_STICK_DOWN)) vkw_menu_action(VKX_MENU_DOWN);
+    if (edge & (DM_BTN_LEFT | MENU_STICK_LEFT)) vkw_menu_action(VKX_MENU_LEFT);
+    if (edge & (DM_BTN_RIGHT | MENU_STICK_RIGHT)) vkw_menu_action(VKX_MENU_RIGHT);
+    if (edge & (DM_BTN_A | DM_BTN_PLUS)) vkw_menu_action(VKX_MENU_ACCEPT);
+    if (edge & DM_BTN_B) vkw_menu_action(VKX_MENU_BACK);
+    if (!vkw_menu_open()) menu_closed(b);
+    return 1;
+}
 static void push(int p) {
     player_t *pl = &g_pl[p];
     pad_state k = eval(pl, src_key), c = eval(pl, src_pad);
+    if (p == 0 && menu_input(k, c)) return;
+    if (p != 0 && vkw_menu_open()) { dm_pad_set_player(p, 0, 0, 0, 0, 0); return; }
+    if (p == 0 && g_menu_hold) {   // still held from the menu: kept from the game until released
+        uint64_t held = (k.b | c.b) & g_menu_hold;
+        g_menu_hold = held;
+        k.b &= ~held; c.b &= ~held;
+    }
     if (p == 0) {   // the host ORs player 1's keyboard path and controller path
         if (pl->keyboard) dm_input_set(k.b, k.lx, k.ly, k.rx, k.ry);
         dm_pad_set_player(0, c.b, c.lx, c.ly, c.rx, c.ry);
@@ -166,6 +210,12 @@ static void players_changed(void) {
 
 void input_key(const SDL_KeyboardEvent *k) {
     if (k->repeat || (unsigned)k->scancode >= SDL_SCANCODE_COUNT) return;
+    if (k->scancode == SDL_SCANCODE_F1 || (k->scancode == SDL_SCANCODE_ESCAPE && vkw_menu_open())) {   // the options menu's keys: never the game's
+        if (!k->down) return;
+        if (k->scancode == SDL_SCANCODE_F1 ? vkw_menu_toggle() : (vkw_menu_action(VKX_MENU_BACK), vkw_menu_open())) release_all();
+        else { pad_state ks = eval(&g_pl[0], src_key), cs = eval(&g_pl[0], src_pad); menu_closed(ks.b | cs.b); }
+        return;
+    }
     g_keys[k->scancode] = k->down;
     if (input_log()) {
         pad_state s = eval(&g_pl[0], src_key);
