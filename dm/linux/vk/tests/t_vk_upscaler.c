@@ -19,6 +19,7 @@ int main(void)
     check(vkx_upscaler_parse("game", &b) == VKX_UPSCALER_GAME && !b, "game is the network");
     check(vkx_upscaler_parse("linear", &b) == VKX_UPSCALER_LINEAR && !b, "linear selects the plain scaler");
     check(vkx_upscaler_parse("probe", &b) == VKX_UPSCALER_PROBE && !b, "probe logs and keeps the network");
+    check(vkx_upscaler_parse("fsr1", &b) == VKX_UPSCALER_FSR1 && !b, "fsr1 selects the FSR 1 scaler");
     check(vkx_upscaler_parse("metalfx", &b) == VKX_UPSCALER_GAME && b, "an unknown value keeps the network and is reported");
 
     const char *list = "0253bd17deceee79,a335c1db6270c355,d99fbeeb53d38847";
@@ -44,6 +45,11 @@ int main(void)
     check(!vkx_upscaler_accept((vkx_rect){0, 0, 683, 384}, (vkx_rect){0, 0, 683, 384}), "an equal-size stage keeps the network");
     check(!vkx_upscaler_accept((vkx_rect){0, 0, 683, 384}, (vkx_rect){0, 0, 341, 192}), "a reduction keeps the network");
     check(!vkx_upscaler_accept((vkx_rect){0, 0, 683, 384}, (vkx_rect){0, 0, 2048, 300}), "shrinking in one direction keeps the network");
+
+    check(vkx_upscaler_fsr_rects((vkx_rect){0, 0, 683, 384}, (vkx_rect){0, 0, 2048, 1152}), "FSR takes an origin-aligned upscale");
+    check(!vkx_upscaler_fsr_rects((vkx_rect){8, 0, 683, 384}, (vkx_rect){0, 0, 2048, 1152}), "FSR refuses an offset input viewport");
+    check(!vkx_upscaler_fsr_rects((vkx_rect){0, 0, 683, 384}, (vkx_rect){0, 4, 2048, 1148}), "FSR refuses an offset output rectangle");
+    check(!vkx_upscaler_fsr_rects((vkx_rect){0, 0, 683, 384}, (vkx_rect){0, 0, 683, 384}), "FSR refuses a copy");
 
     printf("t_vk_upscaler: %s (%d failures)\n", bad ? "FAILED" : "passed", bad);
     return bad != 0;

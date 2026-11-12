@@ -76,7 +76,10 @@ GLSLC ?= glslc
 $(OUT)/vk_upscale_sqrt.spv.inc: vk/shaders/upscale_sqrt.comp | profile
 	@mkdir -p $(dir $@)
 	$(GLSLC) --target-env=vulkan1.3 -mfmt=c -o $@ $<
-$(OUT)/obj/linux/vk/vk_draw.o: $(OUT)/vk_upscale_sqrt.spv.inc
+$(OUT)/vk_upscale_fsr_%.spv.inc: vk/shaders/upscale_fsr_%.comp ../third_party/fidelityfx-fsr1/ffx_a.h ../third_party/fidelityfx-fsr1/ffx_fsr1.h | profile
+	@mkdir -p $(dir $@)
+	$(GLSLC) --target-env=vulkan1.3 -I../third_party/fidelityfx-fsr1 -mfmt=c -o $@ $<
+$(OUT)/obj/linux/vk/vk_draw.o: $(OUT)/vk_upscale_sqrt.spv.inc $(OUT)/vk_upscale_fsr_easu.spv.inc $(OUT)/vk_upscale_fsr_rcas.spv.inc
 $(OUT)/obj/linux/vk/vk_draw.o: CPPFLAGS += -I$(OUT)
 
 # -r resolves the whole current NVN layer against the selected backend while

@@ -2306,7 +2306,8 @@ static int upscaler_mode(void) {
         int bad; const char *e = getenv("DM_UPSCALER"); mode = vkx_upscaler_parse(e, &bad);
         if (bad) LOG("[RED] DM_UPSCALER=%s: game, linear or probe; keeping the game's upscaler", e);
         else if (mode != VKX_UPSCALER_GAME) LOG("upscaler (DM_UPSCALER): %s; %d profile upscaler shaders, %d of them one texture in and one image out",
-                                                 mode == VKX_UPSCALER_LINEAR ? "linear, the game's upscaling stages replaced by a bilinear scale (upscale_sqrt.comp)" : "probe, the game's network runs and its stages are logged",
+                                                 mode == VKX_UPSCALER_LINEAR ? "linear, the game's upscaling stages replaced by a bilinear scale (upscale_sqrt.comp)" :
+                                                 mode == VKX_UPSCALER_FSR1 ? "fsr1, the game's upscaling stages replaced by AMD FSR 1 (EASU + RCAS)" : "probe, the game's network runs and its stages are logged",
                                                  DM_GAME_UPSCALER_N, g_nup_shader);
     }
     return mode;
@@ -2367,6 +2368,113 @@ static VkDescriptorSet up_set(void) {
     if (g_up.gen[g_pool_slot] != g_arena_gen[g_pool_slot]) { g_up.gen[g_pool_slot] = g_arena_gen[g_pool_slot]; g_up.used[g_pool_slot] = 0; }
     return g_up.used[g_pool_slot] < UP_SETS_PER_SLOT ? g_up.set[g_pool_slot][g_up.used[g_pool_slot]++] : VK_NULL_HANDLE;
 }
+
+// DM_UPSCALER=fsr1: AMD FSR 1 (dm/third_party/fidelityfx-fsr1, MIT) as two compute passes, EASU into a RGBA16F intermediate of the output
+// size, then RCAS into the game's image (vk/shaders/upscale_fsr_*.comp). Objects made on first use; the intermediate is remade when the output
+// size changes (the old one is kept, as earlier parts may still read it; output sizes change only with the display mode)
+static const uint32_t g_fsr_easu_spv[] =
+#include "vk_upscale_fsr_easu.spv.inc"
+;
+static const uint32_t g_fsr_rcas_spv[] =
+#include "vk_upscale_fsr_rcas.spv.inc"
+;
+static struct { int state; VkDescriptorSetLayout dsl[2]; VkPipelineLayout pl[2]; VkPipeline pipe[2]; VkDescriptorPool pool;
+                VkDescriptorSet set[CB_RING][UP_SETS_PER_SLOT][2]; uint64_t gen[CB_RING]; int used[CB_RING];
+                VkImage mid; VkDeviceMemory midm; VkImageView midv; uint32_t mw, mh; int fresh; float sharp; } g_fsr;
+static int fsr_init(void) {
+    if (g_fsr.state) return g_fsr.state > 0;
+    g_fsr.state = -1;
+    const char *se = getenv("DM_UPSCALER_SHARPNESS"); g_fsr.sharp = se ? (float)atof(se) : 0.25f;   // RCAS stops of sharpness reduction: 0 sharpest
+    VkDescriptorType t0[2] = {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE};
+    const uint32_t *code[2] = {g_fsr_easu_spv, g_fsr_rcas_spv}; size_t size[2] = {sizeof g_fsr_easu_spv, sizeof g_fsr_rcas_spv};
+    uint32_t pcs[2] = {24, 12};
+    for (int k = 0; k < 2; k++) {
+        VkDescriptorSetLayoutBinding lb[2] = {{0, t0[k], 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL}, {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL}};
+        VkDescriptorSetLayoutCreateInfo lci = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 2, .pBindings = lb};
+        VkPushConstantRange pr = {VK_SHADER_STAGE_COMPUTE_BIT, 0, pcs[k]};
+        if (vkCreateDescriptorSetLayout(g_vkd.dev, &lci, NULL, &g_fsr.dsl[k]) != VK_SUCCESS) goto fail;
+        VkPipelineLayoutCreateInfo plci = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 1, .pSetLayouts = &g_fsr.dsl[k], .pushConstantRangeCount = 1, .pPushConstantRanges = &pr};
+        if (vkCreatePipelineLayout(g_vkd.dev, &plci, NULL, &g_fsr.pl[k]) != VK_SUCCESS) goto fail;
+        VkShaderModuleCreateInfo mci = {.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = size[k], .pCode = code[k]};
+        VkShaderModule sm; if (vkCreateShaderModule(g_vkd.dev, &mci, NULL, &sm) != VK_SUCCESS) goto fail;
+        VkComputePipelineCreateInfo cpi = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+            .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = sm, .pName = "main"}, .layout = g_fsr.pl[k]};
+        VkResult r = vkCreateComputePipelines(g_vkd.dev, VK_NULL_HANDLE, 1, &cpi, NULL, &g_fsr.pipe[k]);
+        vkDestroyShaderModule(g_vkd.dev, sm, NULL);
+        if (r != VK_SUCCESS) goto fail;
+    }
+    VkDescriptorPoolSize ps[2] = {{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, CB_RING * UP_SETS_PER_SLOT}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 3 * CB_RING * UP_SETS_PER_SLOT}};
+    VkDescriptorPoolCreateInfo pci = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = 2 * CB_RING * UP_SETS_PER_SLOT, .poolSizeCount = 2, .pPoolSizes = ps};
+    if (vkCreateDescriptorPool(g_vkd.dev, &pci, NULL, &g_fsr.pool) != VK_SUCCESS) goto fail;
+    for (int i = 0; i < CB_RING; i++) for (int j = 0; j < UP_SETS_PER_SLOT; j++) {
+        VkDescriptorSetAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, .descriptorPool = g_fsr.pool, .descriptorSetCount = 2, .pSetLayouts = g_fsr.dsl};
+        if (vkAllocateDescriptorSets(g_vkd.dev, &ai, g_fsr.set[i][j]) != VK_SUCCESS) goto fail;
+    }
+    g_fsr.state = 1;
+    LOG("upscaler: FSR 1 (EASU + RCAS, sharpness %.2f stops) ready", g_fsr.sharp);
+    return 1;
+fail:
+    LOG("[RED] upscaler: the FSR 1 scaler's Vulkan objects could not be made; the game's network runs");
+    return 0;
+}
+// The EASU intermediate (RGBA16F, w x h), made when the size changes
+static int fsr_mid(uint32_t w, uint32_t h) {
+    if (g_fsr.mid && g_fsr.mw == w && g_fsr.mh == h) return 1;
+    VkImageCreateInfo ic = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D, .format = VK_FORMAT_R16G16B16A16_SFLOAT,
+        .extent = {w, h, 1}, .mipLevels = 1, .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
+        .usage = VK_IMAGE_USAGE_STORAGE_BIT, .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
+    VkImage img; if (vkCreateImage(g_vkd.dev, &ic, NULL, &img) != VK_SUCCESS) return 0;
+    VkMemoryRequirements mr; vkGetImageMemoryRequirements(g_vkd.dev, img, &mr);
+    VkPhysicalDeviceMemoryProperties mp; vkGetPhysicalDeviceMemoryProperties(g_vkd.pd, &mp);
+    uint32_t ti = UINT32_MAX;
+    for (uint32_t i = 0; i < mp.memoryTypeCount && ti == UINT32_MAX; i++)
+        if ((mr.memoryTypeBits & (1u << i)) && (mp.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) ti = i;
+    VkMemoryAllocateInfo ma = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = mr.size, .memoryTypeIndex = ti};
+    VkDeviceMemory m; if (ti == UINT32_MAX || vkAllocateMemory(g_vkd.dev, &ma, NULL, &m) != VK_SUCCESS) { vkDestroyImage(g_vkd.dev, img, NULL); return 0; }
+    VkImageViewCreateInfo vc = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = img, .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = VK_FORMAT_R16G16B16A16_SFLOAT,
+        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+    VkImageView v; if (vkBindImageMemory(g_vkd.dev, img, m, 0) != VK_SUCCESS || vkCreateImageView(g_vkd.dev, &vc, NULL, &v) != VK_SUCCESS) { vkDestroyImage(g_vkd.dev, img, NULL); vkFreeMemory(g_vkd.dev, m, NULL); return 0; }
+    g_fsr.mid = img; g_fsr.midm = m; g_fsr.midv = v; g_fsr.mw = w; g_fsr.mh = h; g_fsr.fresh = 1;
+    LOG("upscaler: FSR 1 intermediate %ux%u RGBA16F (%llu KiB)", w, h, (unsigned long long)(mr.size >> 10));
+    return 1;
+}
+static VkDescriptorSet *fsr_sets(void) {
+    if (g_pool_slot < 0) return NULL;
+    if (g_fsr.gen[g_pool_slot] != g_arena_gen[g_pool_slot]) { g_fsr.gen[g_pool_slot] = g_arena_gen[g_pool_slot]; g_fsr.used[g_pool_slot] = 0; }
+    return g_fsr.used[g_pool_slot] < UP_SETS_PER_SLOT ? g_fsr.set[g_pool_slot][g_fsr.used[g_pool_slot]++] : NULL;
+}
+// The two FSR passes from siv (sampled, rectangle ir at the origin) to div (storage, rectangle orr at the origin)
+static int fsr_encode(VkCommandBuffer c, VkImageView siv, VkImageView div, vkx_rect ir, vkx_rect orr, uint32_t sw, uint32_t sh) {
+    if (!vkx_upscaler_fsr_rects(ir, orr) || !fsr_init() || !fsr_mid(orr.w, orr.h)) return 0;
+    VkDescriptorSet *set = fsr_sets(); if (!set) return 0;
+    VkDescriptorImageInfo ii[4] = {{g_up.samp, siv, VK_IMAGE_LAYOUT_GENERAL}, {VK_NULL_HANDLE, g_fsr.midv, VK_IMAGE_LAYOUT_GENERAL},
+                                   {VK_NULL_HANDLE, g_fsr.midv, VK_IMAGE_LAYOUT_GENERAL}, {VK_NULL_HANDLE, div, VK_IMAGE_LAYOUT_GENERAL}};
+    VkWriteDescriptorSet w[4] = {
+        {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set[0], .dstBinding = 0, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &ii[0]},
+        {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set[0], .dstBinding = 1, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .pImageInfo = &ii[1]},
+        {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set[1], .dstBinding = 0, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .pImageInfo = &ii[2]},
+        {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set[1], .dstBinding = 1, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .pImageInfo = &ii[3]},
+    };
+    vkUpdateDescriptorSets(g_vkd.dev, 4, w, 0, NULL);
+    VkImageMemoryBarrier ib = {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_SHADER_READ_BIT, .dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+        .oldLayout = g_fsr.fresh ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_GENERAL, .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .image = g_fsr.mid, .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+    vkCmdPipelineBarrier(c, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, NULL, 0, NULL, 1, &ib);   // the last part's RCAS read is done
+    g_fsr.fresh = 0;
+    struct { float in_view[2], in_size[2], out_size[2]; } pe = {{(float)ir.w, (float)ir.h}, {(float)sw, (float)sh}, {(float)orr.w, (float)orr.h}};
+    vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, g_fsr.pipe[0]);
+    vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_COMPUTE, g_fsr.pl[0], 0, 1, &set[0], 0, NULL);
+    vkCmdPushConstants(c, g_fsr.pl[0], VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pe, &pe);
+    vkCmdDispatch(c, (orr.w + 7) / 8, (orr.h + 7) / 8, 1);
+    ib.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT; ib.dstAccessMask = VK_ACCESS_SHADER_READ_BIT; ib.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+    vkCmdPipelineBarrier(c, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, NULL, 0, NULL, 1, &ib);   // EASU writes before RCAS reads
+    struct { float out_size[2], sharpness; } pr = {{(float)orr.w, (float)orr.h}, g_fsr.sharp};
+    vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, g_fsr.pipe[1]);
+    vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_COMPUTE, g_fsr.pl[1], 0, 1, &set[1], 0, NULL);
+    vkCmdPushConstants(c, g_fsr.pl[1], VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pr, &pr);
+    vkCmdDispatch(c, (orr.w + 7) / 8, (orr.h + 7) / 8, 1);
+    return 1;
+}
 // 1 when the dispatch was done as a linear blit (DM_UPSCALER=linear), 0 to run the shader. probe logs the first dispatches of each stage and runs it.
 static int upscale_dispatch(VkCommandBuffer c, const char key[17], const p_dispatch *p) {
     int mode = upscaler_mode(); if (mode == VKX_UPSCALER_GAME || p->ind) return 0;
@@ -2395,9 +2503,10 @@ static int upscale_dispatch(VkCommandBuffer c, const char key[17], const p_dispa
     // Only the encoding the network is known to use: sqrt(linear) in RGB9E5 in, linear B10G11R11 out (upscale_sqrt.comp); any other pair keeps the network
     int enc = sf == VK_FORMAT_E5B9G9R9_UFLOAT_PACK32 && df == VK_FORMAT_B10G11R11_UFLOAT_PACK32;
     ok = rects && enc && src != dst && src->img != dst->img && vkx_upscaler_accept(ir, orr) &&
-         src->target == NVN_TEXTURE_TARGET_2D && dst->target == NVN_TEXTURE_TARGET_2D && src->samples == 1 && dst->samples == 1 && up_init();
+         src->target == NVN_TEXTURE_TARGET_2D && dst->target == NVN_TEXTURE_TARGET_2D && src->samples == 1 && dst->samples == 1 && up_init();   // fsr1 uses its sampler too
     VkImageView siv = ok ? view_get(src, &u->input, &so, &sv, shv) : VK_NULL_HANDLE, div = ok ? image_view(dst, &u->output, &dv, dhv) : VK_NULL_HANDLE;
-    VkDescriptorSet set = siv && div ? up_set() : VK_NULL_HANDLE;
+    if (mode == VKX_UPSCALER_FSR1 && siv && div && fsr_encode(c, siv, div, ir, orr, src->w, src->h)) { vkr_tex_gpu_write(dst); done = 1; }
+    VkDescriptorSet set = !done && mode == VKX_UPSCALER_LINEAR && siv && div ? up_set() : VK_NULL_HANDLE;
     if (set) {   // the caller ended the pass and puts a full barrier after the dispatch (OP_DISPATCH in vk_replay.c), which also orders this one
         VkDescriptorImageInfo ii[2] = {{g_up.samp, siv, VK_IMAGE_LAYOUT_GENERAL}, {VK_NULL_HANDLE, div, VK_IMAGE_LAYOUT_GENERAL}};
         VkWriteDescriptorSet w[2] = {
@@ -2415,14 +2524,14 @@ static int upscale_dispatch(VkCommandBuffer c, const char key[17], const p_dispa
     }
     pthread_mutex_unlock(&g_tmu);
     if (done) {
-        if (!g_up_replaced++) LOG("upscaler: %s drawn by the linear scaler, %ux%u at %u,%u (format %d) -> %ux%u at %u,%u (format %d)",
-                                  key, ir.w, ir.h, ir.x, ir.y, (int)src->fmt, orr.w, orr.h, orr.x, orr.y, (int)dst->fmt);
+        if (!g_up_replaced++) LOG("upscaler: %s drawn by the %s scaler, %ux%u at %u,%u (format %d) -> %ux%u at %u,%u (format %d)",
+                                  key, mode == VKX_UPSCALER_FSR1 ? "FSR 1" : "linear", ir.w, ir.h, ir.x, ir.y, (int)src->fmt, orr.w, orr.h, orr.x, orr.y, (int)dst->fmt);
         return 1;
     }
     g_up_kept++;
-    LOG("[RED] upscaler: %s cannot be drawn by the linear scaler (%s); the game's network runs for this shader from now on", key,
+    LOG("[RED] upscaler: %s cannot be drawn by the %s scaler (%s); the game's network runs for this shader from now on", key, mode == VKX_UPSCALER_FSR1 ? "FSR 1" : "linear",
         !rects ? "push-constant rectangles do not fit its textures" : !vkx_upscaler_accept(ir, orr) ? "not an upscale" :
-        !enc ? "not the sqrt RGB9E5 -> B10G11R11 encoding" : "texture shape, view or descriptor");
+        !enc ? "not the sqrt RGB9E5 -> B10G11R11 encoding" : mode == VKX_UPSCALER_FSR1 && (ir.x || ir.y || orr.x || orr.y) ? "a rectangle not at the texture origin" : "texture shape, view or descriptor");
     u->kind = 0;
     return 0;
 }
