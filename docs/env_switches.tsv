@@ -364,7 +364,11 @@ DM_VK_CS_GPU	diagnostic	`=1` timestamps Vulkan compute dispatches in place and l
 DM_VK_CS_GPU_LIMIT	diagnostic	With `DM_VK_CS_GPU=1`, sets the bounded total number of dispatch samples to log (1..65,536; default 4,096)
 DM_VK_GPU_HEARTBEAT	diagnostic	`=1` logs `vulkan GPU heartbeat: submitted/done/report-wait` once a second from the GPU-value thread (vk_replay.c), with any shader compile in flight for 2 s or more
 DM_VK_LOG	diagnostic	`=1` logs Vulkan object creation in the Vulkan-on-Metal layer
+DM_VK_RELAX_CS	diagnostic	`=<key>[,<key>...]` omits the replay's full barrier only between bounded consecutive dispatches of these exact 16-hex-digit compute keys; unset changes nothing, and unrelated GPU work is ordered before it. Requires a driver which safely admits overlapping dependency-free application dispatches; use only for guarded scheduling experiments
+DM_VK_RELAX_CS_AB	diagnostic	`=<frames>` with `DM_VK_RELAX_CS`: relax only in odd phases of that many frames (even phases keep the full barrier), so one run compares both on the same route
+DM_VK_RELAX_CS_BATCH	diagnostic	With `DM_VK_RELAX_CS`, sets the selected dispatches per independently ordered batch (1..64, default 2); `1` is the no-overlap control
 DM_VK_SHADER_COMPILE_LOG	diagnostic	`=1` logs the begin and end of every shader compile with key, stage, form, fence value and elapsed time (vk_draw.c); compiles of 1 s or more are logged without it
+DM_VK_SKIP_CS	diagnostic	`=<key>[,<key>...]` drops dispatches of only these exact 16-hex-digit compute shader keys; unset changes nothing. This is a bounded diagnostic/workaround, not a substitute implementation
 DM_VSYNC_HZ	switch	`=<Hz>`: rate at which a host thread fires the vi vsync event when the display link does not drive it (default 60)
 DM_WATCH	diagnostic	`=<s>` dumps all threads after that many seconds (SIGALRM) and turns on the stall watchdog; off unless set
 DM_WATCH_SAMPLE	diagnostic	`=<path>` (Mac): when the stall watchdog fires, samples the process for 1 s with `/usr/bin/sample` and writes the thread stacks to that path
