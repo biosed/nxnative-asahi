@@ -35,6 +35,7 @@ int nvn_dpool_base(const void *pool, int tex);   // hle_nvn.c: a descriptor pool
 
 #include "vk_replay.h"
 #include "vk_addr_set.h"
+#include "vk_skipcs.h"   // the DM_VK_RELAX_CS barrier rule (vkx_relaxcs_barrier_before)
 #include "vk_cube.h"
 // Optional runtime-side bridge for Ocarina's decoded NV12 frame.  Keeping the
 // reference weak preserves standalone renderer/test links.
@@ -1183,6 +1184,29 @@ static void full_barrier(VkCommandBuffer c) {
     VkMemoryBarrier mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT, .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT};
     vkCmdPipelineBarrier(c, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
 }
+
+// Records which only change state may stay between selected dispatches in the
+// barrier-relax diagnostic.  Everything that can issue GPU work is ordered
+// before it unless it is another selected dispatch in the same bounded batch.
+static int relax_state_only(uint32_t op) {
+    switch (op) {
+    case OP_JUMP: case OP_CALL:
+    case OP_VIEWPORTS: case OP_SCISSOR: case OP_DEPTH_RANGE:
+    case OP_BIND_PROGRAM: case OP_BIND_STATE: case OP_BIND_VATTR:
+    case OP_BIND_VSTREAM: case OP_BIND_VBUF: case OP_BIND_VBUF1:
+    case OP_BIND_UBO: case OP_BIND_UBO_SMALL: case OP_BIND_SSBO:
+    case OP_BIND_SAMP: case OP_BIND_IMG:
+    case OP_STENCIL: case OP_POLY_OFFSET: case OP_BLEND_COLOR:
+    case OP_SET_TEX_POOL: case OP_SET_SAMP_POOL: case OP_COPY_STRIDE:
+    case OP_DEPTH_CLAMP: case OP_RENDER_COND: case OP_FENCE_SYNC:
+    case OP_TF_BIND: case OP_TF_STATE: case OP_RAST_DISCARD:
+    case OP_VP_SWIZZLE: case OP_PRIM_RESTART: case OP_PUSH_CONST:
+    case OP_ALPHA_REF:
+        return 1;
+    default:
+        return 0;
+    }
+}
 static VkImageSubresourceRange view_range(const vtex *t, const view_t *v, int has, VkImageAspectFlags asp) {
     VkImageSubresourceRange r = {asp, 0, 1, 0, t->layers};
     if (has && v->set_levels) { r.baseMipLevel = v->base_level; r.levelCount = v->nlevels ? v->nlevels : 1; }
@@ -1749,7 +1773,7 @@ void mtl_exec(const uint8_t *handle) {
     if (!g_on || !g_open) return;
     if (g_prof < 0) g_prof = getenv("DM_VK_PROF") != NULL;
     VkCommandBuffer c = g_cb[g_cb_i];
-    const uint8_t *p = handle, *ret[16]; int nret = 0;
+    const uint8_t *p = handle, *ret[16]; int nret = 0; unsigned relax_run = 0;
     for (uint64_t guard = 0; p && guard < 50000000; guard++) {
         int descriptor_split = vkx_descriptor_pressure();
         if (!g_noflush && ((g_flush_draws >= FLUSH_DRAWS && !g_rp_on) || descriptor_split)) {
@@ -1758,6 +1782,7 @@ void mtl_exec(const uint8_t *handle) {
             // Bound descriptor lifetime directly: attachments use LOAD/STORE,
             // so a pressured pass can be stored here and resumed by the next
             // draw without changing its contents.
+            if (relax_run) { full_barrier(c); relax_run = 0; }
             if (descriptor_split) rp_end(c);
             uint64_t ft = g_prof ? mono_ns() : 0;
             vkr_flush(); c = g_cb[g_cb_i];
@@ -1766,8 +1791,14 @@ void mtl_exec(const uint8_t *handle) {
         op_hdr h; memcpy(&h, p, sizeof h); const void *a = p + 8;
         if (h.op < 64) g_ops[h.op]++;
         uint64_t pt = g_prof ? mono_ns() : 0;
+        int relax_dispatch = h.op == OP_DISPATCH && vkx_dispatch_relax(a);
+        int relax_state = h.op == OP_BARRIER || relax_state_only(h.op);
+        if (relax_run && vkx_relaxcs_barrier_before(relax_run, relax_dispatch,
+                                                    relax_state, vkx_dispatch_relax_batch())) {
+            full_barrier(c); relax_run = 0;
+        }
         switch (h.op) {
-        case OP_END: if (nret) { p = ret[--nret]; continue; } return;
+        case OP_END: if (nret) { p = ret[--nret]; continue; } if (relax_run) full_barrier(c); return;
         case OP_JUMP: memcpy(&p, a, 8); continue;
         case OP_CALL: { const uint8_t *t; memcpy(&t, a, 8); if (nret == 16) { LOG("[RED] vulkan replay: command buffer calls nested deeper than 16"); return; } ret[nret++] = p + h.size; p = t; continue; }
         case OP_SET_RT: {
@@ -1888,13 +1919,13 @@ void mtl_exec(const uint8_t *handle) {
             if (g_rp_on && rp_drop_set() != g_rp_drop) rp_end(c);   // another set of duplicate slots to leave out (rp_drop_set)
             if (!g_rp_on) mesh_prebridge_ahead(c, p, ret, nret);
             if (rp_begin(c) && vkx_draw(c, h.op, a, h.size, g_rp_ncolor, g_rp_w, g_rp_h, g_rp_samples)) { g_rp_drew = 1; g_rp_draws++; } g_flush_draws++; break;
-        case OP_BARRIER: if (g_pass_gpu) barrier_census(*(const int32_t *)a); rp_end_keep(c); full_barrier(c); break;   // orders work, reads nothing: pending clears stay
+        case OP_BARRIER: if (g_pass_gpu) barrier_census(*(const int32_t *)a); rp_end_keep(c); full_barrier(c); relax_run = 0; break;   // orders work, reads nothing: pending clears stay
         case OP_COPY_T2T: op_copy_t2t(c, a); break;
         case OP_COPY_B2T: op_copy_bt(c, a, 1); break;
         case OP_COPY_T2B: op_copy_bt(c, a, 0); break;
         case OP_CLEAR_TEX: op_clear_tex(c, a); break;
         case OP_COPY_STRIDE: { const p_copy_stride *s = a; if (s->image) g_copy_img = s->stride; else g_copy_row = s->stride; break; }
-        case OP_DISPATCH: rp_end(c); vkx_dispatch(c, a); full_barrier(c); g_flush_draws++; break;
+        case OP_DISPATCH: rp_end(c); vkx_dispatch(c, a); if (relax_dispatch) relax_run++; else full_barrier(c); g_flush_draws++; break;
         case OP_UPDATE_UB: {   // {dst, n, data}: the bytes written into the buffer at this point of the GPU's work (UpdateUniformBuffer)
             uint64_t dst, n; memcpy(&dst, a, 8); memcpy(&n, (const uint8_t *)a + 8, 8);
             VkBuffer b; VkDeviceSize off; VkDeviceAddress g;

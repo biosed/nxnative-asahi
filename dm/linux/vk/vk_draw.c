@@ -2592,6 +2592,38 @@ static int skipcs(const uint8_t k8[8]) {
     LOG("vulkan draws: compute shader %s deliberately skipped by exact DM_VK_SKIP_CS; its dispatches are not run", key);
     return 1;
 }
+
+// Off-by-default scheduling probe.  It names exact shader keys, as the skip
+// diagnostic does, but changes only the replay barriers around consecutive
+// instances of the selected program.  vk_replay.c restores a full barrier at
+// the configured batch boundary and before any unrelated GPU operation.
+static vkx_skipcs g_relaxcs; static int g_relaxcs_read; static unsigned g_relaxcs_batch;
+static void relaxcs_init(void) {
+    if (g_relaxcs_read) return;
+    g_relaxcs_read = 1;
+    int bad_keys = vkx_skipcs_parse(&g_relaxcs, getenv("DM_VK_RELAX_CS"));
+    int bad_batch = 0; g_relaxcs_batch = vkx_relaxcs_batch_parse(getenv("DM_VK_RELAX_CS_BATCH"), &bad_batch);
+    if (g_relaxcs.on) LOG("vulkan draws: exact compute barrier-relax diagnostic: %d key%s, batches of %u dispatch%s",
+                          g_relaxcs.n, g_relaxcs.n == 1 ? "" : "s", g_relaxcs_batch, g_relaxcs_batch == 1 ? "" : "es");
+    if (bad_keys) LOG("[RED] vulkan draws: DM_VK_RELAX_CS: %d entries are not 16 hex digits: dropped", bad_keys);
+    if (bad_batch) LOG("[RED] vulkan draws: DM_VK_RELAX_CS_BATCH: expected 1..64; using 2");
+}
+uint64_t vkh_frame(void);   // headless.c: the frame being recorded
+// DM_VK_RELAX_CS_AB=<frames> (diagnostic): relax only in odd phases of that many frames, so one run compares relaxed (odd) against
+// ordinary barriers (even) on the same route (claude-tools/abphase.py)
+static unsigned relaxcs_ab(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_RELAX_CS_AB"); v = e ? atoi(e) : 0; if (v < 0) v = 0; } return (unsigned)v; }
+int vkx_dispatch_relax(const p_dispatch *p) {
+    (void)p; relaxcs_init();
+    if (!g_relaxcs.on || !S.prog[5]) return 0;
+    if (relaxcs_ab() && !((vkh_frame() / relaxcs_ab()) & 1)) return 0;
+    uint8_t k8[8];
+    for (int i = 0; i < NST && prog_key(S.prog[5], (unsigned)i, k8); i++) {
+        char key[17]; key_hex(k8, key);
+        if (vkx_skipcs_match(&g_relaxcs, key)) return 1;
+    }
+    return 0;
+}
+unsigned vkx_dispatch_relax_batch(void) { relaxcs_init(); return g_relaxcs_batch; }
 // Which compute shaders run, for the DM_VK_OPS line: dispatches per key since the last line (the OPS line is logged at powers of two of the submission count, so the
 // heavy section of a run names its kernels without a GPU profiler). Keys enter the table on their first dispatch; 64 is more than a title's live compute set
 #define DKEYS 64

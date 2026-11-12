@@ -35,3 +35,22 @@ static inline int vkx_skipcs_match(vkx_skipcs *c, const char *key) {
     for (int i = 0; i < c->n; i++) if (!strcmp(c->key[i], key)) { c->skipped++; return 1; }
     return 0;
 }
+
+// DM_VK_RELAX_CS_BATCH: number of selected consecutive dispatches allowed
+// before the diagnostic restores the ordinary full barrier.  One is a
+// no-overlap control; 64 covers the bounded hot blocks seen so far.
+static inline unsigned vkx_relaxcs_batch_parse(const char *s, int *bad) {
+    *bad = 0;
+    if (!s || !*s) return 2;
+    char *end = NULL;
+    unsigned long n = strtoul(s, &end, 10);
+    if (end == s || *end || n < 1 || n > 64) { *bad = 1; return 2; }
+    return (unsigned)n;
+}
+
+// Pure replay scheduling rule: a selected dispatch may follow the selected
+// run until its bounded batch is full; state records do not issue GPU work;
+// every other GPU operation is ordered before it.
+static inline int vkx_relaxcs_barrier_before(unsigned run, int selected, int state_only, unsigned batch) {
+    return run && ((selected && run >= batch) || (!selected && !state_only));
+}

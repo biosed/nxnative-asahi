@@ -118,6 +118,8 @@ void vkx_bind_handles(int what, const p_bind_handles *b, const uint64_t *h);   /
 void vkx_set_pool(int tex, int base);
 void vkx_trace(int on);
 void vkx_dispatch(VkCommandBuffer c, const p_dispatch *p);
+int vkx_dispatch_relax(const p_dispatch *p);       // exact-key diagnostic: current compute program is selected for bounded barrier relaxation
+unsigned vkx_dispatch_relax_batch(void);           // selected dispatches per independently ordered batch (1..64)
 // Graphics c0 + DMSH_C0_BASE_INSTANCE must describe the draw before its
 // descriptor set is built. Maxwell's instance ID omits this value, and the
 // translated shader adds the driver word when it indexes per-instance data.

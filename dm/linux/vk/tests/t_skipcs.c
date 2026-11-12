@@ -19,6 +19,18 @@ int main(void) {
           !vkx_skipcs_match(&c, "d15370a382630d4f"), "nearby and unrelated compute keys kept");
     check(c.skipped == 4, "selected dispatch count");
     check(vkx_skipcs_parse(&c, "d15370a382630d4") == 1 && !c.on && !vkx_skipcs_match(&c, "d15370a382630d4e"), "a key prefix is invalid, not a broad match");
+
+    int parse_bad = 0;
+    check(vkx_relaxcs_batch_parse(NULL, &parse_bad) == 2 && !parse_bad, "relax batch unset: safe pair default");
+    check(vkx_relaxcs_batch_parse("1", &parse_bad) == 1 && !parse_bad && vkx_relaxcs_batch_parse("64", &parse_bad) == 64 && !parse_bad,
+          "relax batch accepts the bounded range");
+    check(vkx_relaxcs_batch_parse("0", &parse_bad) == 2 && parse_bad && vkx_relaxcs_batch_parse("65", &parse_bad) == 2 && parse_bad &&
+          vkx_relaxcs_batch_parse("many", &parse_bad) == 2 && parse_bad, "relax batch rejects unbounded or malformed values");
+    check(!vkx_relaxcs_barrier_before(0, 1, 0, 2) && !vkx_relaxcs_barrier_before(1, 1, 0, 2) &&
+          vkx_relaxcs_barrier_before(2, 1, 0, 2), "selected dispatches share only their bounded batch");
+    check(!vkx_relaxcs_barrier_before(1, 0, 1, 2) && vkx_relaxcs_barrier_before(1, 0, 0, 2),
+          "state records stay inside a batch; unrelated GPU work is ordered");
+    check(vkx_relaxcs_barrier_before(1, 1, 0, 1), "batch one is the no-overlap control");
     printf("t_skipcs: %s (%d failures)\n", bad ? "FAILED" : "passed", bad);
     return bad != 0;
 }
