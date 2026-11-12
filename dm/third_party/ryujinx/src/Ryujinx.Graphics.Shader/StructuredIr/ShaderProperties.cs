@@ -39,6 +39,18 @@ namespace Ryujinx.Graphics.Shader.StructuredIr
 
         public void AddOrUpdateStorageBuffer(BufferDefinition definition)
         {
+            if (_storageBuffers.TryGetValue(definition.Binding, out BufferDefinition existing))
+            {
+                definition = new BufferDefinition(
+                    definition.Layout,
+                    definition.Set,
+                    definition.Binding,
+                    definition.Name,
+                    definition.Type,
+                    definition.IsReadOnly && existing.IsReadOnly,
+                    definition.IsRestrict || existing.IsRestrict);
+            }
+
             _storageBuffers[definition.Binding] = definition;
         }
 

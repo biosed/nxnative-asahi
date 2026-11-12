@@ -184,7 +184,7 @@ namespace Ryujinx.Graphics.Shader.Translation
             return setAndBinding.Binding;
         }
 
-        public bool TryGetStorageBufferBinding(int sbCbSlot, int sbCbOffset, bool write, out int binding)
+        public bool TryGetStorageBufferBinding(int sbCbSlot, int sbCbOffset, bool write, out int binding, bool restrict = false)
         {
             if (!TryGetSbSlot((byte)sbCbSlot, (ushort)sbCbOffset, out int slot))
             {
@@ -198,14 +198,20 @@ namespace Ryujinx.Graphics.Shader.Translation
             {
                 setAndBinding = _gpuAccessor.CreateStorageBufferBinding(slot);
                 _sbSlotToBindingMap[slot] = setAndBinding;
-                string slotNumber = slot.ToString(CultureInfo.InvariantCulture);
-                AddNewStorageBuffer(setAndBinding.SetIndex, setAndBinding.Binding, $"{_stagePrefix}_s{slotNumber}");
             }
 
             if (write)
             {
                 _sbSlotWritten |= 1u << slot;
             }
+
+            string slotNumber = slot.ToString(CultureInfo.InvariantCulture);
+            AddNewStorageBuffer(
+                setAndBinding.SetIndex,
+                setAndBinding.Binding,
+                $"{_stagePrefix}_s{slotNumber}",
+                isReadOnly: (_sbSlotWritten & (1u << slot)) == 0,
+                isRestrict: restrict);
 
             binding = setAndBinding.Binding;
             return true;
@@ -664,14 +670,21 @@ namespace Ryujinx.Graphics.Shader.Translation
             Properties.AddOrUpdateConstantBuffer(new(BufferLayout.Std140, setIndex, binding, name, type));
         }
 
-        private void AddNewStorageBuffer(int setIndex, int binding, string name)
+        private void AddNewStorageBuffer(int setIndex, int binding, string name, bool isReadOnly, bool isRestrict)
         {
             StructureType type = new(new[]
             {
                 new StructureField(AggregateType.Array | AggregateType.U32, "data", 0),
             });
 
-            Properties.AddOrUpdateStorageBuffer(new(BufferLayout.Std430, setIndex, binding, name, type));
+            Properties.AddOrUpdateStorageBuffer(new(
+                BufferLayout.Std430,
+                setIndex,
+                binding,
+                name,
+                type,
+                isReadOnly,
+                isRestrict));
         }
 
         public static string GetShaderStagePrefix(ShaderStage stage)

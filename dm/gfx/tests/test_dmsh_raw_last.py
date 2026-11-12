@@ -95,6 +95,10 @@ class RawLast(Translated):
     @unittest.skipUnless(shutil.which('spirv-dis'), 'needs spirv-dis')
     def test_two_guarded_loads_share_one_private_entry_word_in_spirv(self):
         dis = self.spv_dis((s2r_tid(9), s2r_tid(5), LDG, STORE, (LDG[0], LDG[1] | 4 << 40), STORE))
+        map_id = re.search(r'OpName (%\w+) "cp_s0"', dis)
+        self.assertIsNotNone(map_id, dis[:3000])
+        self.assertIn(f'OpDecorate {map_id.group(1)} NonWritable', dis)
+        self.assertIn(f'OpDecorate {map_id.group(1)} Restrict', dis)
         self.assertEqual(len(re.findall(r'OpVariable \S+ Private %\w+', dis)), 1, dis[1500:3500])
         main = dis[dis.index(' = OpFunction %void None'):]
         calls = re.findall(r'OpFunctionCall %int (%\w+)', main)
