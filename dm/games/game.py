@@ -102,7 +102,9 @@ def by_build(main_id):   # the profile whose build rows register this main build
 
 
 # agl's upscaler network (NDSR), by where the shader map found each key: the compute shaders of agl_ndsr.pck (Donkey Kong Bananza's 24 in its release library, Splatoon Raiders' 20 in its debug one)
-UPSCALER_SOURCE = re.compile(r'/agl_ndsr\.pck#')
+# and of its reconstruction variants agl_ndsr_vr.pck / agl_ndsr_vr_light.pck (Ocarina of Time: 20 and 17; its frame's upscaling stage is d99fbeeb53d38847, about 4.5 ms on an M1 Pro).
+# The hosts replace only a stage that reads one texture and writes one larger image (DM_UPSCALER); the network's other stages always run
+UPSCALER_SOURCE = re.compile(r'/agl_ndsr(?:_vr(?:_light)?)?\.pck#')
 
 
 MOVIE_NET_SOURCE = re.compile(r'#NDVE@')

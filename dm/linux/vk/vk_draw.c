@@ -16,6 +16,7 @@
 #include "vk_draw.h"
 #include "vk_skipcs.h"
 #include "vk_movie.h"
+#include "vk_upscaler.h"
 #include "vk_gmem_trace.h"
 #include "vk_missing_log.h"
 #include "vk_stage.h"
@@ -81,6 +82,11 @@ typedef struct {
 #define VKX_MOVIE_SHADERS_MAX 64
 static vkx_movie_shader g_movie_shader[VKX_MOVIE_SHADERS_MAX];
 static int g_nmovie_shader;
+// The game's upscaler stages that read one texture and write one image (DM_GAME_UPSCALER_KEYS, vk_upscaler.h): kind 1 replaceable, 0 refused once
+#define VKX_UPSCALER_SHADERS_MAX 96
+typedef struct { char key[17]; int kind, probed; vkbind input, output; } vkx_up_shader;
+static vkx_up_shader g_up_shader[VKX_UPSCALER_SHADERS_MAX];
+static int g_nup_shader;
 static vks *g_sh[1024]; static pthread_mutex_t g_shmu = PTHREAD_MUTEX_INITIALIZER;
 enum { VKX_BINDLESS_SET = 5, VKX_FEEDBACK_SET = 6, VKX_BINDLESS_2D = 0, VKX_BINDLESS_2DA = 1, VKX_BINDLESS_DEPTH = 2, VKX_BINDLESS_SAMP = 3, VKX_BINDLESS_3D = 4, VKX_BINDLESS_IMAGE_SHAPES = 4 };
 static const uint32_t g_bindless_image_binding[VKX_BINDLESS_IMAGE_SHAPES] = {
@@ -220,6 +226,21 @@ static void movie_reflect(const char key[17], const vks *s) {
     if (input) m->input = *input;
     if (output) m->output = *output;
 }
+static void upscaler_reflect(const char key[17], const vks *s) {
+    if (!DM_GAME_UPSCALER_N || !vkx_upscaler_named(DM_GAME_UPSCALER_KEYS, key)) return;
+    int nt = 0, ni = 0; const vkbind *input = NULL, *output = NULL;
+    for (int i = 0; i < s->nb; i++) {
+        if (s->bd[i].desc == 't') { nt++; input = &s->bd[i]; }
+        else if (s->bd[i].desc == 'i') { ni++; output = &s->bd[i]; }
+    }
+    if (nt != 1 || ni != 1) return;   // an intermediate stage of the network (several inputs or outputs): it always runs
+    if (g_nup_shader == VKX_UPSCALER_SHADERS_MAX) {
+        static int warned; if (!warned++) LOG("[RED] vulkan draws: upscaler reflection exceeds its %d-shader bound", VKX_UPSCALER_SHADERS_MAX);
+        return;
+    }
+    vkx_up_shader *u = &g_up_shader[g_nup_shader++];
+    snprintf(u->key, sizeof u->key, "%s", key); u->kind = 1; u->input = *input; u->output = *output;
+}
 static void shc_init(uint64_t layout_hash); static void precompile_start(void);
 static char (*g_keys)[17]; static int g_nkeys;   // every standard and native-mesh shader key (draw_init)
 static void cw_start(void);   // the compile watcher thread (below sh_object)
@@ -272,7 +293,7 @@ static int draw_init(void) {
             if (!vkx_shader_resolve(g_spv, g_mesh_spv, key, -1, &rr) || rr.mesh_ext != di) continue;
             uint8_t *txt; size_t nt; if (!read_file(rr.vkb, &txt, &nt)) continue;
             static vks tmp; tmp.nb = 0; parse_vkb(&tmp, (const char *)txt); free(txt); nfiles++; if (di) nmesh++;
-            if (!di) movie_reflect(key, &tmp);
+            if (!di) { movie_reflect(key, &tmp); upscaler_reflect(key, &tmp); }
             if (!(g_nkeys & 1023)) g_keys = realloc(g_keys, (g_nkeys + 1024) * sizeof *g_keys);
             memcpy(g_keys[g_nkeys], key, 17); g_nkeys++;
             for (int i = 0; i < tmp.nb; i++) {
@@ -2275,6 +2296,134 @@ static int movie_net_dispatch(VkCommandBuffer c, const char key[17], const p_dis
     return 1;
 }
 
+// The game's upscaler or a plain scaler in its place (vk_upscaler.h: DM_UPSCALER, the player's choice; the network by default)
+static int upscaler_mode(void) {
+    static int mode = -1;
+    if (mode < 0) {
+        int bad; const char *e = getenv("DM_UPSCALER"); mode = vkx_upscaler_parse(e, &bad);
+        if (bad) LOG("[RED] DM_UPSCALER=%s: game, linear or probe; keeping the game's upscaler", e);
+        else if (mode != VKX_UPSCALER_GAME) LOG("upscaler (DM_UPSCALER): %s; %d profile upscaler shaders, %d of them one texture in and one image out",
+                                                 mode == VKX_UPSCALER_LINEAR ? "linear, the game's upscaling stages replaced by a bilinear scale (upscale_sqrt.comp)" : "probe, the game's network runs and its stages are logged",
+                                                 DM_GAME_UPSCALER_N, g_nup_shader);
+    }
+    return mode;
+}
+static vkx_up_shader *upscaler_shader(const char key[17]) {
+    for (int i = 0; i < g_nup_shader; i++) if (!strcmp(g_up_shader[i].key, key)) return &g_up_shader[i];
+    return NULL;
+}
+static uint64_t g_up_replaced, g_up_kept;
+// The scaler (vk/shaders/upscale_sqrt.comp): one compute pipeline, a linear clamped sampler, and a few descriptor sets per command-buffer ring slot,
+// reused when that slot's arena is reset (its earlier GPU work is then done). Made on first use; a failure keeps the game's network
+static const uint32_t g_up_spv[] =
+#include "vk_upscale_sqrt.spv.inc"
+;
+#define UP_SETS_PER_SLOT 4
+static struct { int state; VkDescriptorSetLayout dsl; VkPipelineLayout pl; VkPipeline pipe; VkSampler samp; VkDescriptorPool pool;
+                VkDescriptorSet set[CB_RING][UP_SETS_PER_SLOT]; uint64_t gen[CB_RING]; int used[CB_RING]; } g_up;
+static int up_init(void) {
+    if (g_up.state) return g_up.state > 0;
+    g_up.state = -1;
+    VkDescriptorSetLayoutBinding lb[2] = {
+        {0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
+        {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
+    };
+    VkDescriptorSetLayoutCreateInfo lci = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 2, .pBindings = lb};
+    VkPushConstantRange pr = {VK_SHADER_STAGE_COMPUTE_BIT, 0, 40};
+    VkSamplerCreateInfo si = {.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO, .magFilter = VK_FILTER_LINEAR, .minFilter = VK_FILTER_LINEAR,
+        .mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST, .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+        .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, .maxLod = 0.0f};
+    VkDescriptorPoolSize ps[2] = {{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, CB_RING * UP_SETS_PER_SLOT}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, CB_RING * UP_SETS_PER_SLOT}};
+    VkDescriptorPoolCreateInfo pci = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = CB_RING * UP_SETS_PER_SLOT, .poolSizeCount = 2, .pPoolSizes = ps};
+    VkShaderModuleCreateInfo mci = {.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = sizeof g_up_spv, .pCode = g_up_spv};
+    VkShaderModule sm = VK_NULL_HANDLE;
+    if (vkCreateDescriptorSetLayout(g_vkd.dev, &lci, NULL, &g_up.dsl) != VK_SUCCESS) goto fail;
+    VkPipelineLayoutCreateInfo plci = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 1, .pSetLayouts = &g_up.dsl, .pushConstantRangeCount = 1, .pPushConstantRanges = &pr};
+    if (vkCreatePipelineLayout(g_vkd.dev, &plci, NULL, &g_up.pl) != VK_SUCCESS || vkCreateSampler(g_vkd.dev, &si, NULL, &g_up.samp) != VK_SUCCESS ||
+        vkCreateDescriptorPool(g_vkd.dev, &pci, NULL, &g_up.pool) != VK_SUCCESS || vkCreateShaderModule(g_vkd.dev, &mci, NULL, &sm) != VK_SUCCESS) goto fail;
+    VkComputePipelineCreateInfo cpi = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+        .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = sm, .pName = "main"}, .layout = g_up.pl};
+    VkResult r = vkCreateComputePipelines(g_vkd.dev, VK_NULL_HANDLE, 1, &cpi, NULL, &g_up.pipe);
+    vkDestroyShaderModule(g_vkd.dev, sm, NULL); sm = VK_NULL_HANDLE;
+    if (r != VK_SUCCESS) goto fail;
+    for (int i = 0; i < CB_RING; i++) {
+        VkDescriptorSetLayout l[UP_SETS_PER_SLOT]; for (int k = 0; k < UP_SETS_PER_SLOT; k++) l[k] = g_up.dsl;
+        VkDescriptorSetAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, .descriptorPool = g_up.pool, .descriptorSetCount = UP_SETS_PER_SLOT, .pSetLayouts = l};
+        if (vkAllocateDescriptorSets(g_vkd.dev, &ai, g_up.set[i]) != VK_SUCCESS) goto fail;
+    }
+    g_up.state = 1;
+    return 1;
+fail:
+    if (sm) vkDestroyShaderModule(g_vkd.dev, sm, NULL);
+    LOG("[RED] upscaler: the linear scaler's Vulkan objects could not be made; the game's network runs");
+    return 0;
+}
+// A descriptor set of the slot being recorded, or none (more scales in one part than the slot holds: the network runs for that one)
+static VkDescriptorSet up_set(void) {
+    if (g_pool_slot < 0) return VK_NULL_HANDLE;
+    if (g_up.gen[g_pool_slot] != g_arena_gen[g_pool_slot]) { g_up.gen[g_pool_slot] = g_arena_gen[g_pool_slot]; g_up.used[g_pool_slot] = 0; }
+    return g_up.used[g_pool_slot] < UP_SETS_PER_SLOT ? g_up.set[g_pool_slot][g_up.used[g_pool_slot]++] : VK_NULL_HANDLE;
+}
+// 1 when the dispatch was done as a linear blit (DM_UPSCALER=linear), 0 to run the shader. probe logs the first dispatches of each stage and runs it.
+static int upscale_dispatch(VkCommandBuffer c, const char key[17], const p_dispatch *p) {
+    int mode = upscaler_mode(); if (mode == VKX_UPSCALER_GAME || p->ind) return 0;
+    vkx_up_shader *u = upscaler_shader(key); if (!u || !u->kind) return 0;
+    int sid = movie_texture_id(&u->input);
+    int did = u->output.reg >= 0 && u->output.reg < 32 ? (int)(S.img[5][u->output.reg] & 0xfffff) : 0;
+    uint32_t v[8]; memcpy(v, vkr_push(1), sizeof v);
+    tex_t so = {0}, dso = {0}; view_t sv = {0}, dv = {0}; int shv = 0, dhv = 0, done = 0;
+    pthread_mutex_lock(&g_tmu);
+    int ok = sid && did && vkr_treg(sid, &so, &sv, &shv) && vkr_treg(did, &dso, &dv, &dhv);
+    vtex *src = ok ? vkr_tex_sampled(&so, VK_NULL_HANDLE) : NULL;
+    vtex *dst = ok ? vkr_tex_target(&dso) : NULL;
+    vkx_rect ir = {0}, orr = {0};
+    int rects = src && dst && vkx_upscaler_rect(v, src->w, src->h, &ir) && vkx_upscaler_rect(v + 4, dst->w, dst->h, &orr);
+    VkFormat sf = src ? vkr_view_format(src->fmt, &sv, shv) : VK_FORMAT_UNDEFINED, df = dst ? vkr_view_format(dst->fmt, &dv, dhv) : VK_FORMAT_UNDEFINED;
+    if (mode == VKX_UPSCALER_PROBE) {
+        if (u->probed < 4) {
+            u->probed++;
+            LOG("upscaler probe: %s groups %ux%ux%u: in tex %d %ux%u fmt %d view %d, out img %d %ux%u fmt %d view %d; c24 %u %u %u %u | %u %u %u %u; rectangles %s%s",
+                key, p->x, p->y, p->z, sid, src ? src->w : 0, src ? src->h : 0, src ? (int)src->fmt : -1, (int)sf, did, dst ? dst->w : 0, dst ? dst->h : 0, dst ? (int)dst->fmt : -1, (int)df,
+                v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], rects ? "valid" : "INVALID", rects && vkx_upscaler_accept(ir, orr) ? ", an upscale" : "");
+        }
+        pthread_mutex_unlock(&g_tmu);
+        return 0;
+    }
+    // Only the encoding the network is known to use: sqrt(linear) in RGB9E5 in, linear B10G11R11 out (upscale_sqrt.comp); any other pair keeps the network
+    int enc = sf == VK_FORMAT_E5B9G9R9_UFLOAT_PACK32 && df == VK_FORMAT_B10G11R11_UFLOAT_PACK32;
+    ok = rects && enc && src != dst && src->img != dst->img && vkx_upscaler_accept(ir, orr) &&
+         src->target == NVN_TEXTURE_TARGET_2D && dst->target == NVN_TEXTURE_TARGET_2D && src->samples == 1 && dst->samples == 1 && up_init();
+    VkImageView siv = ok ? view_get(src, &u->input, &so, &sv, shv) : VK_NULL_HANDLE, div = ok ? image_view(dst, &u->output, &dv, dhv) : VK_NULL_HANDLE;
+    VkDescriptorSet set = siv && div ? up_set() : VK_NULL_HANDLE;
+    if (set) {   // the caller ended the pass and puts a full barrier after the dispatch (OP_DISPATCH in vk_replay.c), which also orders this one
+        VkDescriptorImageInfo ii[2] = {{g_up.samp, siv, VK_IMAGE_LAYOUT_GENERAL}, {VK_NULL_HANDLE, div, VK_IMAGE_LAYOUT_GENERAL}};
+        VkWriteDescriptorSet w[2] = {
+            {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set, .dstBinding = 0, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &ii[0]},
+            {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set, .dstBinding = 1, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .pImageInfo = &ii[1]},
+        };
+        vkUpdateDescriptorSets(g_vkd.dev, 2, w, 0, NULL);
+        struct { int32_t in[4], out[4]; float size[2]; } pc = {{(int32_t)ir.x, (int32_t)ir.y, (int32_t)ir.w, (int32_t)ir.h},
+                                                              {(int32_t)orr.x, (int32_t)orr.y, (int32_t)orr.w, (int32_t)orr.h}, {(float)src->w, (float)src->h}};
+        vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, g_up.pipe);   // the game's next dispatch binds its own shader object and set again (vkx_dispatch)
+        vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_COMPUTE, g_up.pl, 0, 1, &set, 0, NULL);
+        vkCmdPushConstants(c, g_up.pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, &pc);
+        vkCmdDispatch(c, (orr.w + 7) / 8, (orr.h + 7) / 8, 1);
+        vkr_tex_gpu_write(dst); done = 1;
+    }
+    pthread_mutex_unlock(&g_tmu);
+    if (done) {
+        if (!g_up_replaced++) LOG("upscaler: %s drawn by the linear scaler, %ux%u at %u,%u (format %d) -> %ux%u at %u,%u (format %d)",
+                                  key, ir.w, ir.h, ir.x, ir.y, (int)src->fmt, orr.w, orr.h, orr.x, orr.y, (int)dst->fmt);
+        return 1;
+    }
+    g_up_kept++;
+    LOG("[RED] upscaler: %s cannot be drawn by the linear scaler (%s); the game's network runs for this shader from now on", key,
+        !rects ? "push-constant rectangles do not fit its textures" : !vkx_upscaler_accept(ir, orr) ? "not an upscale" :
+        !enc ? "not the sqrt RGB9E5 -> B10G11R11 encoding" : "texture shape, view or descriptor");
+    u->kind = 0;
+    return 0;
+}
+
 // Compute shaders left out on purpose (vk_skipcs.h: DM_VK_SKIP_CS exact keys): read once, each selected key logged once. The key is checked before shader_get,
 // so this dispatch neither requests a shader object nor reaches the command buffer (background prewarming may still compile it). Unset follows the original path.
 static vkx_skipcs g_skipcs; static int g_skipcs_read;
@@ -2320,6 +2469,7 @@ void vkx_dispatch(VkCommandBuffer c, const p_dispatch *p) {
     for (int i = 0; i < NST && !s && prog_key(S.prog[5], (unsigned)i, k8); i++) {
         char key[17]; key_hex(k8, key);
         if (movie_net_dispatch(c, key, p)) return;
+        if (upscale_dispatch(c, key, p)) { g_st_dispatched++; dkeys_note(key); return; }
         if (skipcs(k8)) { g_st_dskip++; return; }
         vks *t = shader_get(S.prog[5], i); if (t && t->stage == 5) s = t;
     }
