@@ -101,7 +101,9 @@ static void *keys_main(void *arg) {
         const key_step *s = &g_steps[i];
         for (;;) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); double el = (t.tv_sec - t0.tv_sec) + (t.tv_nsec - t0.tv_nsec) / 1e9;
                    if (s->frame ? (double)dm_guest_frame() >= s->at && (int64_t)dm_guest_frame() > released : el >= s->at) break; usleep(5000); }
-        LOG("DM_KEYS: %s%.2f press %#llx (hold %.2f %s)", s->frame ? "frame " : "", s->at, (unsigned long long)s->btn, s->hold, s->fhold ? "frames" : "s");
+        // the presented frame it lands on too: a route timed in seconds converts to frame steps ("f<frame>:..."), which load and compile stalls do not shift
+        LOG("DM_KEYS: %s%.2f press %#llx (hold %.2f %s) at frame %llu", s->frame ? "frame " : "", s->at, (unsigned long long)s->btn, s->hold, s->fhold ? "frames" : "s",
+            (unsigned long long)dm_guest_frame());
         if (s->tap) { dm_touch t = {0, s->tx, s->ty}; dm_touch_script(&t, 1); } else if (touching) dm_touch_script(NULL, 0);
         script_set(s->btn, s->lx, s->ly, s->rx, s->ry);
         uint64_t end = 0;
