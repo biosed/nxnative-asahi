@@ -124,6 +124,13 @@ void vkx_bind_handles(int what, const p_bind_handles *b, const uint64_t *h);   /
 void vkx_set_pool(int tex, int base);
 void vkx_trace(int on);
 void vkx_dispatch(VkCommandBuffer c, const p_dispatch *p);
+// Graphics c0 + DMSH_C0_BASE_INSTANCE must describe the draw before its
+// descriptor set is built. Maxwell's instance ID omits this value, and the
+// translated shader adds the driver word when it indexes per-instance data.
+static inline uint32_t vkx_draw_base_instance(const p_draw *d,
+                                              const p_draw_idx *x) {
+    return (uint32_t)(d ? d->base_instance : x ? x->base_instance : 0);
+}
 int vkx_draw(VkCommandBuffer c, uint32_t op, const void *a, uint32_t size, int ncolor, uint32_t rt_w, uint32_t rt_h, int samples); // 1 only when a Vulkan draw command was issued
 void vkx_bind_state(const p_bind_state *s);
 void vkx_viewports(const p_viewports *v); void vkx_scissor(const p_scissor *s); void vkx_depth_range(const p_depth_range *r);

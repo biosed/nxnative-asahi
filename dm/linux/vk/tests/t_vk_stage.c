@@ -1,10 +1,16 @@
 #include <stdio.h>
-#include "vk_stage.h"
+#include "vk_draw.h"
 
 static int bad;
 static void check(int c, const char *what) { if (!c) { printf("FAIL: %s\n", what); bad++; } }
 
 int main(void) {
+    p_draw d = {.base_instance = 7};
+    p_draw_idx x = {.base_instance = 3};
+    check(vkx_draw_base_instance(&d, NULL) == 7 &&
+          vkx_draw_base_instance(NULL, &x) == 3 &&
+          vkx_draw_base_instance(NULL, NULL) == 0,
+          "array and indexed draw records select their base instance");
     check(vkx_stage_of_name("ts set 3") == VKX_STAGE_TS && vkx_stage_of_name("ms set 4") == VKX_STAGE_MS,
           "TaskEXT and MeshEXT metadata names are recognized");
     check(vkx_stage_set(VKX_STAGE_TS) == 3 && vkx_stage_set(VKX_STAGE_MS) == 4,
