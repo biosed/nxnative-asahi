@@ -11,6 +11,7 @@
 #ifndef VK_UPSCALER_H
 #define VK_UPSCALER_H
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 
 enum { VKX_UPSCALER_GAME = 0, VKX_UPSCALER_LINEAR = 1, VKX_UPSCALER_PROBE = 2, VKX_UPSCALER_FSR1 = 3 };
@@ -47,6 +48,16 @@ static inline int vkx_upscaler_rect(const uint32_t v[4], uint32_t w, uint32_t h,
 // A stage to replace: the output rectangle is at least the input in both directions and larger in one (an upscale, not a copy or a reduction)
 static inline int vkx_upscaler_accept(vkx_rect in, vkx_rect out) {
     return out.w >= in.w && out.h >= in.h && (out.w > in.w || out.h > in.h);
+}
+
+// DM_UPSCALER_SHARPNESS: RCAS's reduction in stops, a finite number from 0 (sharpest) to 8; unset or empty gives 0.25. *bad is set for
+// anything else (a partial parse, a sign, inf/nan, out of range), and the default is used
+static inline float vkx_upscaler_sharpness(const char *e, int *bad) {
+    *bad = 0;
+    if (!e || !*e) return 0.25f;
+    char *end = NULL; float v = strtof(e, &end);
+    if (end == e || *end || !(v >= 0.0f && v <= 8.0f)) { *bad = 1; return 0.25f; }   // !(..) also rejects NaN
+    return v;
 }
 
 // FSR 1's EASU takes a top-left aligned input viewport and writes a whole output image: both rectangles must start at the texture origin

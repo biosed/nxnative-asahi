@@ -2304,7 +2304,7 @@ static int upscaler_mode(void) {
     static int mode = -1;
     if (mode < 0) {
         int bad; const char *e = getenv("DM_UPSCALER"); mode = vkx_upscaler_parse(e, &bad);
-        if (bad) LOG("[RED] DM_UPSCALER=%s: game, linear or probe; keeping the game's upscaler", e);
+        if (bad) LOG("[RED] DM_UPSCALER=%s: game, linear, fsr1 or probe; keeping the game's upscaler", e);
         else if (mode != VKX_UPSCALER_GAME) LOG("upscaler (DM_UPSCALER): %s; %d profile upscaler shaders, %d of them one texture in and one image out",
                                                  mode == VKX_UPSCALER_LINEAR ? "linear, the game's upscaling stages replaced by a bilinear scale (upscale_sqrt.comp)" :
                                                  mode == VKX_UPSCALER_FSR1 ? "fsr1, the game's upscaling stages replaced by AMD FSR 1 (EASU + RCAS)" : "probe, the game's network runs and its stages are logged",
@@ -2378,13 +2378,15 @@ static const uint32_t g_fsr_easu_spv[] =
 static const uint32_t g_fsr_rcas_spv[] =
 #include "vk_upscale_fsr_rcas.spv.inc"
 ;
+#define FSR_MIDS 4   // intermediates kept (one per output size seen; earlier parts may still read an older one, so none is freed while the replay runs)
 static struct { int state; VkDescriptorSetLayout dsl[2]; VkPipelineLayout pl[2]; VkPipeline pipe[2]; VkDescriptorPool pool;
                 VkDescriptorSet set[CB_RING][UP_SETS_PER_SLOT][2]; uint64_t gen[CB_RING]; int used[CB_RING];
-                VkImage mid; VkDeviceMemory midm; VkImageView midv; uint32_t mw, mh; int fresh; float sharp; } g_fsr;
+                struct { VkImage img; VkDeviceMemory mem; VkImageView view; uint32_t w, h; int fresh; } mid[FSR_MIDS]; int cur; float sharp; } g_fsr;
 static int fsr_init(void) {
     if (g_fsr.state) return g_fsr.state > 0;
     g_fsr.state = -1;
-    const char *se = getenv("DM_UPSCALER_SHARPNESS"); g_fsr.sharp = se ? (float)atof(se) : 0.25f;   // RCAS stops of sharpness reduction: 0 sharpest
+    int bad; const char *se = getenv("DM_UPSCALER_SHARPNESS"); g_fsr.sharp = vkx_upscaler_sharpness(se, &bad);   // RCAS stops of sharpness reduction: 0 sharpest
+    if (bad) LOG("[RED] DM_UPSCALER_SHARPNESS=%s: a number of stops from 0 to 8; using %.2f", se, g_fsr.sharp);
     VkDescriptorType t0[2] = {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE};
     const uint32_t *code[2] = {g_fsr_easu_spv, g_fsr_rcas_spv}; size_t size[2] = {sizeof g_fsr_easu_spv, sizeof g_fsr_rcas_spv};
     uint32_t pcs[2] = {24, 12};
@@ -2417,9 +2419,11 @@ fail:
     LOG("[RED] upscaler: the FSR 1 scaler's Vulkan objects could not be made; the game's network runs");
     return 0;
 }
-// The EASU intermediate (RGBA16F, w x h), made when the size changes
+// The EASU intermediate (RGBA16F, w x h): one per output size, at most FSR_MIDS sizes (a fifth size keeps the network, logged once)
 static int fsr_mid(uint32_t w, uint32_t h) {
-    if (g_fsr.mid && g_fsr.mw == w && g_fsr.mh == h) return 1;
+    for (int i = 0; i < FSR_MIDS; i++) if (g_fsr.mid[i].img && g_fsr.mid[i].w == w && g_fsr.mid[i].h == h) { g_fsr.cur = i; return 1; }
+    int slot = -1; for (int i = 0; i < FSR_MIDS && slot < 0; i++) if (!g_fsr.mid[i].img) slot = i;
+    if (slot < 0) { static int w1; if (!w1++) LOG("[RED] upscaler: FSR 1 has intermediates for %d output sizes already; a new size %ux%u keeps the game's network", FSR_MIDS, w, h); return 0; }
     VkImageCreateInfo ic = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D, .format = VK_FORMAT_R16G16B16A16_SFLOAT,
         .extent = {w, h, 1}, .mipLevels = 1, .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
         .usage = VK_IMAGE_USAGE_STORAGE_BIT, .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
@@ -2434,8 +2438,8 @@ static int fsr_mid(uint32_t w, uint32_t h) {
     VkImageViewCreateInfo vc = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = img, .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = VK_FORMAT_R16G16B16A16_SFLOAT,
         .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
     VkImageView v; if (vkBindImageMemory(g_vkd.dev, img, m, 0) != VK_SUCCESS || vkCreateImageView(g_vkd.dev, &vc, NULL, &v) != VK_SUCCESS) { vkDestroyImage(g_vkd.dev, img, NULL); vkFreeMemory(g_vkd.dev, m, NULL); return 0; }
-    g_fsr.mid = img; g_fsr.midm = m; g_fsr.midv = v; g_fsr.mw = w; g_fsr.mh = h; g_fsr.fresh = 1;
-    LOG("upscaler: FSR 1 intermediate %ux%u RGBA16F (%llu KiB)", w, h, (unsigned long long)(mr.size >> 10));
+    g_fsr.mid[slot].img = img; g_fsr.mid[slot].mem = m; g_fsr.mid[slot].view = v; g_fsr.mid[slot].w = w; g_fsr.mid[slot].h = h; g_fsr.mid[slot].fresh = 1; g_fsr.cur = slot;
+    LOG("upscaler: FSR 1 intermediate %ux%u RGBA16F (%llu KiB), %d of %d sizes", w, h, (unsigned long long)(mr.size >> 10), slot + 1, FSR_MIDS);
     return 1;
 }
 static VkDescriptorSet *fsr_sets(void) {
@@ -2447,8 +2451,9 @@ static VkDescriptorSet *fsr_sets(void) {
 static int fsr_encode(VkCommandBuffer c, VkImageView siv, VkImageView div, vkx_rect ir, vkx_rect orr, uint32_t sw, uint32_t sh) {
     if (!vkx_upscaler_fsr_rects(ir, orr) || !fsr_init() || !fsr_mid(orr.w, orr.h)) return 0;
     VkDescriptorSet *set = fsr_sets(); if (!set) return 0;
-    VkDescriptorImageInfo ii[4] = {{g_up.samp, siv, VK_IMAGE_LAYOUT_GENERAL}, {VK_NULL_HANDLE, g_fsr.midv, VK_IMAGE_LAYOUT_GENERAL},
-                                   {VK_NULL_HANDLE, g_fsr.midv, VK_IMAGE_LAYOUT_GENERAL}, {VK_NULL_HANDLE, div, VK_IMAGE_LAYOUT_GENERAL}};
+    VkImageView mv = g_fsr.mid[g_fsr.cur].view;
+    VkDescriptorImageInfo ii[4] = {{g_up.samp, siv, VK_IMAGE_LAYOUT_GENERAL}, {VK_NULL_HANDLE, mv, VK_IMAGE_LAYOUT_GENERAL},
+                                   {VK_NULL_HANDLE, mv, VK_IMAGE_LAYOUT_GENERAL}, {VK_NULL_HANDLE, div, VK_IMAGE_LAYOUT_GENERAL}};
     VkWriteDescriptorSet w[4] = {
         {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set[0], .dstBinding = 0, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &ii[0]},
         {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set[0], .dstBinding = 1, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .pImageInfo = &ii[1]},
@@ -2457,10 +2462,10 @@ static int fsr_encode(VkCommandBuffer c, VkImageView siv, VkImageView div, vkx_r
     };
     vkUpdateDescriptorSets(g_vkd.dev, 4, w, 0, NULL);
     VkImageMemoryBarrier ib = {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_SHADER_READ_BIT, .dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
-        .oldLayout = g_fsr.fresh ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_GENERAL, .newLayout = VK_IMAGE_LAYOUT_GENERAL,
-        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .image = g_fsr.mid, .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+        .oldLayout = g_fsr.mid[g_fsr.cur].fresh ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_GENERAL, .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .image = g_fsr.mid[g_fsr.cur].img, .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
     vkCmdPipelineBarrier(c, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, NULL, 0, NULL, 1, &ib);   // the last part's RCAS read is done
-    g_fsr.fresh = 0;
+    g_fsr.mid[g_fsr.cur].fresh = 0;
     struct { float in_view[2], in_size[2], out_size[2]; } pe = {{(float)ir.w, (float)ir.h}, {(float)sw, (float)sh}, {(float)orr.w, (float)orr.h}};
     vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, g_fsr.pipe[0]);
     vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_COMPUTE, g_fsr.pl[0], 0, 1, &set[0], 0, NULL);
