@@ -51,7 +51,7 @@ static inline int vkx_upscaler_accept(vkx_rect in, vkx_rect out) {
 }
 
 // DM_UPSCALER_SHARPNESS: RCAS's reduction in stops, a finite number from 0 (sharpest) to 8; unset or empty gives 0.25. *bad is set for
-// anything else (a partial parse, a sign, inf/nan, out of range), and the default is used
+// anything else (a partial parse, inf/nan, a negative or out-of-range value), and the default is used; a leading '+' is accepted, as strtof takes it
 static inline float vkx_upscaler_sharpness(const char *e, int *bad) {
     *bad = 0;
     if (!e || !*e) return 0.25f;
