@@ -56,6 +56,7 @@ int main(void)
     check(vkx_upscaler_sharpness("1.5", &b) == 1.5f && !b, "a fraction parses");
     check(vkx_upscaler_sharpness("8", &b) == 8.0f && !b, "8 stops is the upper bound");
     check(vkx_upscaler_sharpness("-1", &b) == 0.25f && b, "a negative value is refused");
+    check(vkx_upscaler_sharpness("+1", &b) == 1.0f && !b, "a leading plus is accepted");
     check(vkx_upscaler_sharpness("9", &b) == 0.25f && b, "more than 8 stops is refused");
     check(vkx_upscaler_sharpness("nan", &b) == 0.25f && b, "nan is refused");
     check(vkx_upscaler_sharpness("inf", &b) == 0.25f && b, "inf is refused");
