@@ -1,0 +1,26 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// DM_UPSCALER=fsr1, pass 1 (vk_upscaler.h): AMD FSR 1 EASU from the game's NDSR input (sqrt(linear) colour in RGB9E5) into a
+// RGBA16F intermediate of the output size, in the same sqrt space (FSR expects perceptual input). Input viewport and output are
+// top-left aligned (vk_draw.c checks the rectangles' origins).
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0) uniform sampler2D src;
+layout(set = 0, binding = 1, rgba16f) uniform writeonly image2D mid;
+layout(push_constant) uniform P { vec2 in_view; vec2 in_size; vec2 out_size; } p;
+#define A_GPU 1
+#define A_GLSL 1
+#include "ffx_a.h"
+#define FSR_EASU_F 1
+AF4 FsrEasuRF(AF2 q) { return textureGather(src, q, 0); }
+AF4 FsrEasuGF(AF2 q) { return textureGather(src, q, 1); }
+AF4 FsrEasuBF(AF2 q) { return textureGather(src, q, 2); }
+#include "ffx_fsr1.h"
+void main()
+{
+    AU2 ip = AU2(gl_GlobalInvocationID.xy);
+    if (ip.x >= uint(p.out_size.x) || ip.y >= uint(p.out_size.y)) return;
+    AU4 c0, c1, c2, c3;
+    FsrEasuCon(c0, c1, c2, c3, p.in_view.x, p.in_view.y, p.in_size.x, p.in_size.y, p.out_size.x, p.out_size.y);
+    AF3 c; FsrEasuF(c, ip, c0, c1, c2, c3);
+    imageStore(mid, ivec2(ip), vec4(c, 1.0));
+}

@@ -1,17 +1,20 @@
 // The game's own upscaler network (agl's NDSR, DM_GAME_UPSCALER_KEYS from the shader map) or a plain scaler in its place: the player's choice,
-// DM_UPSCALER=game (default) | linear | probe. Device-free decisions only; vk_draw.c does the Vulkan work (upscale_dispatch).
+// DM_UPSCALER=game (default) | linear | fsr1 | probe. Device-free decisions only; vk_draw.c does the Vulkan work (upscale_dispatch).
 //   game    the network runs, as before.
 //   linear  a network stage that reads one texture and writes one image, from its push-constant input rectangle to a strictly larger output
 //           rectangle, in the encoding agl's NDSR uses (sqrt(linear) RGB9E5 in, linear B10G11R11 out), is replaced by a bilinear scale between those
 //           rectangles (vk/shaders/upscale_sqrt.comp); anything else, or anything the device refuses, runs the network.
+//   fsr1    as linear, but AMD FSR 1 (EASU edge-adaptive upscale, then RCAS sharpening; dm/third_party/fidelityfx-fsr1, MIT) in the
+//           network's sqrt space; both rectangles must start at the texture origin.
 //   probe   the network runs; the first dispatches of each upscaling stage log their textures, formats and push-constant rectangles.
 // The look changes (a plain filter instead of the game's network), so it is never the default.
 #ifndef VK_UPSCALER_H
 #define VK_UPSCALER_H
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 
-enum { VKX_UPSCALER_GAME = 0, VKX_UPSCALER_LINEAR = 1, VKX_UPSCALER_PROBE = 2 };
+enum { VKX_UPSCALER_GAME = 0, VKX_UPSCALER_LINEAR = 1, VKX_UPSCALER_PROBE = 2, VKX_UPSCALER_FSR1 = 3 };
 
 // The mode of a DM_UPSCALER value; *bad is set for a value that is none of them (the network is kept)
 static inline int vkx_upscaler_parse(const char *e, int *bad) {
@@ -19,6 +22,7 @@ static inline int vkx_upscaler_parse(const char *e, int *bad) {
     if (!e || !*e || !strcmp(e, "game")) return VKX_UPSCALER_GAME;
     if (!strcmp(e, "linear")) return VKX_UPSCALER_LINEAR;
     if (!strcmp(e, "probe")) return VKX_UPSCALER_PROBE;
+    if (!strcmp(e, "fsr1")) return VKX_UPSCALER_FSR1;
     *bad = 1; return VKX_UPSCALER_GAME;
 }
 
@@ -44,6 +48,21 @@ static inline int vkx_upscaler_rect(const uint32_t v[4], uint32_t w, uint32_t h,
 // A stage to replace: the output rectangle is at least the input in both directions and larger in one (an upscale, not a copy or a reduction)
 static inline int vkx_upscaler_accept(vkx_rect in, vkx_rect out) {
     return out.w >= in.w && out.h >= in.h && (out.w > in.w || out.h > in.h);
+}
+
+// DM_UPSCALER_SHARPNESS: RCAS's reduction in stops, a finite number from 0 (sharpest) to 8; unset or empty gives 0.25. *bad is set for
+// anything else (a partial parse, a sign, inf/nan, out of range), and the default is used
+static inline float vkx_upscaler_sharpness(const char *e, int *bad) {
+    *bad = 0;
+    if (!e || !*e) return 0.25f;
+    char *end = NULL; float v = strtof(e, &end);
+    if (end == e || *end || !(v >= 0.0f && v <= 8.0f)) { *bad = 1; return 0.25f; }   // !(..) also rejects NaN
+    return v;
+}
+
+// FSR 1's EASU takes a top-left aligned input viewport and writes a whole output image: both rectangles must start at the texture origin
+static inline int vkx_upscaler_fsr_rects(vkx_rect in, vkx_rect out) {
+    return !in.x && !in.y && !out.x && !out.y && vkx_upscaler_accept(in, out);
 }
 
 #endif

@@ -1,0 +1,24 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// DM_UPSCALER=fsr1, pass 2: AMD FSR 1 RCAS sharpening of the EASU intermediate, still in sqrt space, then squared back to
+// linear for the game's B10G11R11 image (as the NDSR network writes it).
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0, rgba16f) uniform readonly image2D mid;
+layout(set = 0, binding = 1, r11f_g11f_b10f) uniform writeonly image2D dst;
+layout(push_constant) uniform P { vec2 out_size; float sharpness; } p;
+#define A_GPU 1
+#define A_GLSL 1
+#include "ffx_a.h"
+#define FSR_RCAS_F 1
+AF4 FsrRcasLoadF(ASU2 q) { return imageLoad(mid, clamp(ivec2(q), ivec2(0), ivec2(p.out_size) - 1)); }
+void FsrRcasInputF(inout AF1 r, inout AF1 g, inout AF1 b) {}
+#include "ffx_fsr1.h"
+void main()
+{
+    AU2 ip = AU2(gl_GlobalInvocationID.xy);
+    if (ip.x >= uint(p.out_size.x) || ip.y >= uint(p.out_size.y)) return;
+    AU4 con; FsrRcasCon(con, p.sharpness);
+    AF1 r, g, b; FsrRcasF(r, g, b, ip, con);
+    vec3 c = max(vec3(r, g, b), vec3(0.0));
+    imageStore(dst, ivec2(ip), vec4(c * c, 1.0));
+}
