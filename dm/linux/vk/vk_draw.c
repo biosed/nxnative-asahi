@@ -17,6 +17,7 @@
 #include "vk_skipcs.h"
 #include "vk_movie.h"
 #include "vk_upscaler.h"
+#include "vk_cube.h"
 #include "vk_gmem_trace.h"
 #include "vk_missing_log.h"
 #include "vk_stage.h"
@@ -763,7 +764,13 @@ static VkImageView view_get(vtex *t, const vkbind *b, const tex_t *o, const view
     VkImageViewType vt = b->dim == 3 ? VK_IMAGE_VIEW_TYPE_3D : b->dim == 4 ? (b->arr ? VK_IMAGE_VIEW_TYPE_CUBE_ARRAY : VK_IMAGE_VIEW_TYPE_CUBE)
                        : b->arr ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;
     if ((vt == VK_IMAGE_VIEW_TYPE_3D) != (t->d > 1)) return VK_NULL_HANDLE;   // the image is not of this kind
-    if ((vt == VK_IMAGE_VIEW_TYPE_CUBE || vt == VK_IMAGE_VIEW_TYPE_CUBE_ARRAY) && t->layers % 6) return VK_NULL_HANDLE;
+    if ((vt == VK_IMAGE_VIEW_TYPE_CUBE || vt == VK_IMAGE_VIEW_TYPE_CUBE_ARRAY) && !vkx_cube_view_ok(t->cube_ok, t->layers)) {
+        static _Atomic int said;   // a cube binding over an image that cannot be a cube: refused here rather than an invalid view in the driver
+        if (!t->cube_ok && !atomic_exchange(&said, 1))
+            LOG("[RED] vulkan draws: a cube binding samples a %ux%u image of %u layers (NVN target %d) that cannot be viewed as a cube; it samples nothing (further cases not logged)",
+                t->w, t->h, t->layers, t->target);
+        return VK_NULL_HANDLE;
+    }
     VkComponentMapping sw = tex_swizzle(o, ov, has_v); VkFormat vf = vkr_view_format(t->fmt, ov, has_v);
     uint64_t key = (uint32_t)vt | (uint32_t)sw.r << 4 | (uint32_t)sw.g << 8 | (uint32_t)sw.b << 12 | (uint32_t)sw.a << 16 | (uint64_t)(uint32_t)vf << 32;   // the view type, components and compatible format (below 0x80000000: attachment views)
     for (vkview *v = t->views; v; v = v->next) if (v->key == key) return v->view;

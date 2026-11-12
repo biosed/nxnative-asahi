@@ -35,6 +35,7 @@ int nvn_dpool_base(const void *pool, int tex);   // hle_nvn.c: a descriptor pool
 
 #include "vk_replay.h"
 #include "vk_addr_set.h"
+#include "vk_cube.h"
 // Optional runtime-side bridge for Ocarina's decoded NV12 frame.  Keeping the
 // reference weak preserves standalone renderer/test links.
 extern int dm_codec_movie_nv12_present(void *dst, uint32_t w, uint32_t h) __attribute__((weak));
@@ -579,7 +580,9 @@ static vtex *tex_get(const tex_t *o) {
         }
     }
     // a 3D image that can be a render target is rendered slice by slice through 2D-array views of it (2D_ARRAY_COMPATIBLE)
-    VkImageCreateFlags cf = (tg == NVN_TEXTURE_TARGET_CUBEMAP || tg == NVN_TEXTURE_TARGET_CUBEMAP_ARRAY) && layers % 6 == 0 ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0;
+    // any image a shader could sample as a cube through a retargeted view, not only one NVN created as a cubemap (vk_cube.h)
+    const int cube_ok = vkx_cube_compatible(tg == NVN_TEXTURE_TARGET_3D, d->width ? d->width : 1, h, layers, samples);
+    VkImageCreateFlags cf = cube_ok ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0;
     if (tg == NVN_TEXTURE_TARGET_3D && (use & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)) cf |= VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT;
     VkFormat views[6] = {f}; uint32_t nviews = 1;
     add_view_format(views, &nviews, vkr_srgb_twin(f));
@@ -614,7 +617,7 @@ static vtex *tex_get(const tex_t *o) {
     if (mt == UINT32_MAX || vkAllocateMemory(g_vkd.dev, &ma, NULL, &t->mem) || vkBindImageMemory(g_vkd.dev, t->img, t->mem, 0)) {
         LOG("[RED] vulkan replay: no memory for image %ux%u", ci.extent.width, h); vkDestroyImage(g_vkd.dev, t->img, NULL); free(t); return NULL; }
     t->serial = o->serial; t->fmt = f; t->aspect = asp; t->bytes = mr.size; t->speculative = t_spec_budget || t_spec_max; t->w = ci.extent.width; t->h = h; t->d = depth; t->layers = layers; t->levels = ci.mipLevels; t->samples = samples;
-    t->target = tg; t->usage = use; t->fresh = 1;
+    t->target = tg; t->usage = use; t->fresh = 1; t->cube_ok = cube_ok;
     g_live++; atomic_fetch_add(&g_image_bytes, t->bytes); if (t->speculative) atomic_fetch_add(&g_spec_image_bytes, t->bytes);
     t->kmem = kmem; t->kend = kend; t->kd = *d; t->khash = kh; t->pool = o->pool;
     t->next = g_stab[kh]; g_stab[kh] = t;

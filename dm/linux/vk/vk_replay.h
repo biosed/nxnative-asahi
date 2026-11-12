@@ -63,6 +63,7 @@ typedef struct vtex {
     uint64_t bytes;            // VkMemoryRequirements.size of the image allocation
     int speculative;           // created only to populate a bindless ID; charged to that separate strict budget
     uint32_t w, h, d, layers, levels, samples; int target, fresh;   // fresh: still VK_IMAGE_LAYOUT_UNDEFINED
+    int cube_ok;              // created VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT (vk_cube.h): a shader may view it as a cube
     VkImageUsageFlags usage;
     int gpu_owned;            // written by the GPU (a render target, cleared, a copy destination): its content is the GPU's, never reloaded from guest memory
     int uploaded; uint64_t stamp;   // loaded from guest memory, at this dirty-tracking stamp (nvn_dirty.c)
