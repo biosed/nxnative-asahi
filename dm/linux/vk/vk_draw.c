@@ -1019,9 +1019,13 @@ static void bindless_update(VkCommandBuffer c) {
             g_bindless_retry_n);
 }
 
-// ---- descriptor sets: a pool per ring slot, reset when its submission is reused ----
-#define POOL_SETS 256   // sets per pool; a submission takes as many pools as it needs, all reset when its ring slot is reused
-typedef struct { VkDescriptorPool p[256]; uint16_t used[256]; int n, cur; uint8_t limit_logged; } pool_chain;
+// ---- descriptor sets: persistent same-layout sets in pools owned by each ring slot ----
+#define POOL_SETS VKX_DESCRIPTOR_POOL_SETS
+// A submission takes as many pools as it needs. Each pool allocates its 256 sets
+// in one driver call and keeps their handles; after the ring-slot fence passes,
+// recording rewrites the sets from index zero without resetting the pool. The
+// pools are process-lifetime; any future destroy path must also free set[i].
+typedef struct { VkDescriptorPool p[256]; VkDescriptorSet *set[256]; uint16_t used[256]; int n, cur; uint8_t limit_logged; } pool_chain;
 // Sets made in this ring slot, by a hash of everything written into them: a draw whose stage would get the same descriptors takes the set already made (allocating and
 // writing a set per stage per draw was the host's largest cost after the dirty checks). Emptied with the slot's pools.  Keep the cache comfortably above the
 // submission high-water below: with the old 4K table, an eight-entry collision window could fill, after which repeated states were allocated but never cached.
@@ -1031,8 +1035,13 @@ typedef struct { uint64_t h; VkDescriptorSet set; } setc_ent;
 static setc_ent g_setc[CB_RING][SETC]; static uint64_t g_setc_hit, g_setc_miss;
 static pool_chain g_pools[CB_RING][NST]; static int g_pool_slot = -1; static uint32_t g_sub_sets;
 static void gmem_log_poll(uint64_t done);
-static VkDescriptorPool pool_new(int st) {
+static void pool_discard(VkDescriptorPool p, VkDescriptorSet *sets) {
+    free(sets);
+    if (p) vkDestroyDescriptorPool(g_vkd.dev, p, NULL);
+}
+static VkDescriptorPool pool_new(int st, VkDescriptorSet **sets_out) {
     if (st < 0 || st >= NST) return VK_NULL_HANDLE;
+    *sets_out = NULL;
     VkDescriptorPoolSize ps[5]; uint32_t np = 0;
     static const VkDescriptorType T[5] = {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                                           VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER};
@@ -1040,12 +1049,30 @@ static VkDescriptorPool pool_new(int st) {
     VkDescriptorPoolCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = POOL_SETS, .poolSizeCount = np, .pPoolSizes = ps};
     VkDescriptorPool p = VK_NULL_HANDLE;
     VkResult r = vkCreateDescriptorPool(g_vkd.dev, &pi, NULL, &p);
-    if (r != VK_SUCCESS) LOG("[RED] vulkan draws: vkCreateDescriptorPool failed for stage domain %d: VkResult %d", st, (int)r);
-    else {
-        static uint64_t made[NST]; uint64_t n = ++made[st];
-        if (!(n & (n - 1))) LOG("vulkan draws: descriptor stage domain %d created pool %llu (%u sets; %u uniform, %u storage, %u textures, %u images, %u texel buffers per set)",
-            st, (unsigned long long)n, POOL_SETS, g_per_set[st][0], g_per_set[st][1], g_per_set[st][2], g_per_set[st][3], g_per_set[st][4]);
+    if (r != VK_SUCCESS) {
+        LOG("[RED] vulkan draws: vkCreateDescriptorPool failed for stage domain %d: VkResult %d", st, (int)r);
+        return VK_NULL_HANDLE;
     }
+    VkDescriptorSet *sets = calloc(POOL_SETS, sizeof(*sets));
+    if (!sets) {
+        LOG("[RED] vulkan draws: no host memory for %u persistent descriptor-set handles in stage domain %d", POOL_SETS, st);
+        pool_discard(p, NULL);
+        return VK_NULL_HANDLE;
+    }
+    VkDescriptorSetLayout layouts[POOL_SETS];
+    for (int i = 0; i < POOL_SETS; i++) layouts[i] = g_dsl[st];
+    VkDescriptorSetAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, .descriptorPool = p,
+                                      .descriptorSetCount = POOL_SETS, .pSetLayouts = layouts};
+    r = vkAllocateDescriptorSets(g_vkd.dev, &ai, sets);
+    if (r != VK_SUCCESS) {
+        LOG("[RED] vulkan draws: vkAllocateDescriptorSets failed for a fresh persistent pool in stage domain %d: VkResult %d", st, (int)r);
+        pool_discard(p, sets);
+        return VK_NULL_HANDLE;
+    }
+    *sets_out = sets;
+    static uint64_t made[NST]; uint64_t n = ++made[st];
+    if (!(n & (n - 1))) LOG("vulkan draws: descriptor stage domain %d created persistent pool %llu (%u sets; %u uniform, %u storage, %u textures, %u images, %u texel buffers per set)",
+        st, (unsigned long long)n, POOL_SETS, g_per_set[st][0], g_per_set[st][1], g_per_set[st][2], g_per_set[st][3], g_per_set[st][4]);
     return p;
 }
 static void arena_reset(int slot);
@@ -1064,21 +1091,10 @@ void vkx_sub_begin(int slot, VkCommandBuffer c, uint64_t done) {
     }
     for (int st = 0; st < NST; st++) {
         pool_chain *pc = &g_pools[slot][st];   // the slot's last submission is done (vk_replay.c waited for it)
-        for (int i = 0; i < pc->n; i++) {
-            // A failed reset leaves the pool unusable. Replace it rather than
-            // carrying unknown driver state into the next submission. A failed
-            // replacement remains null and stage_set fails closed at that pool.
-            if (!pc->p[i]) {
-                pc->p[i] = pool_new(st); pc->used[i] = 0;
-                continue;
-            }
-            VkResult r = vkResetDescriptorPool(g_vkd.dev, pc->p[i], 0);
-            if (r == VK_SUCCESS) { pc->used[i] = 0; continue; }
-            LOG("[RED] vulkan draws: vkResetDescriptorPool failed: VkResult %d stage %d pool %d used %u; replacing pool",
-                (int)r, st, i, (unsigned)pc->used[i]);
-            vkDestroyDescriptorPool(g_vkd.dev, pc->p[i], NULL);
-            pc->p[i] = pool_new(st); pc->used[i] = 0;
-        }
+        // The fence makes every set in this slot writable again. Keep both the
+        // driver allocation and handles; only the submission-local use cursor
+        // and hash table are reset.
+        for (int i = 0; i < pc->n; i++) pc->used[i] = 0;
         pc->cur = 0; pc->limit_logged = 0;
     }
     g_sub_sets = 0; memset(g_setc[slot], 0, sizeof g_setc[slot]);
@@ -1447,24 +1463,23 @@ static VkDescriptorSet stage_set(int st, vks *s) {
                 }
                 return VK_NULL_HANDLE;
             }
-            pc->p[pc->n] = pool_new(st); pc->used[pc->n] = 0;
+            pc->p[pc->n] = pool_new(st, &pc->set[pc->n]); pc->used[pc->n] = 0;
             if (!pc->p[pc->n]) return VK_NULL_HANDLE;
             pc->n++;
         }
-        if (!pc->p[pc->cur]) {
-            LOG("[RED] vulkan draws: descriptor pool %d is unavailable after reset/recreate failure", pc->cur);
+        if (!pc->p[pc->cur] || !pc->set[pc->cur]) {
+            LOG("[RED] vulkan draws: persistent descriptor pool %d is unavailable", pc->cur);
             return VK_NULL_HANDLE;
         }
-        VkDescriptorSetAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, .descriptorPool = pc->p[pc->cur], .descriptorSetCount = 1, .pSetLayouts = &g_dsl[st]};
-        VkResult r = vkAllocateDescriptorSets(g_vkd.dev, &ai, &set);
-        vkx_pool_alloc_action action = vkx_pool_alloc_result(r, pc->used[pc->cur]);
-        if (action == VKX_POOL_ALLOC_OK) { pc->used[pc->cur]++; break; }
-        if (action == VKX_POOL_ALLOC_ADVANCE) { pc->cur++; continue; }
-        LOG("[RED] vulkan draws: vkAllocateDescriptorSets failed: VkResult %d pool %d used %u%s",
-            (int)r, pc->cur, (unsigned)pc->used[pc->cur],
-            (r == VK_ERROR_OUT_OF_POOL_MEMORY || r == VK_ERROR_FRAGMENTED_POOL) ? " (fresh-pool capacity failure)" : "");
-        return VK_NULL_HANDLE;
+        uint16_t index;
+        if (!vkx_descriptor_set_take(&pc->used[pc->cur], &index)) { pc->cur++; continue; }
+        set = pc->set[pc->cur][index];
+        break;
     }
+    // A retained set can still contain bindings written for an earlier shader
+    // in this layout domain. Every binding statically used by s is present in
+    // s->bd and rewritten above; other union-layout bindings are shader-inactive.
+    // Preserve that invariant if descriptor reflection or unioning changes.
     for (int i = 0; i < nw; i++) wr[i].dstSet = set;
     if (nw) vkUpdateDescriptorSets(g_vkd.dev, (uint32_t)nw, wr, 0, NULL);
     g_st_sets++; g_sub_sets++; g_setc_miss++; if (g_dprof) { g_prof_ns[5] += mk_now() - pt1; g_prof_ns[7]++; }

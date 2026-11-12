@@ -7,22 +7,17 @@ static void check(int c, const char *what) {
 }
 
 int main(void) {
-    check(vkx_pool_alloc_result(VK_SUCCESS, 0) == VKX_POOL_ALLOC_OK,
-          "success from a fresh pool is accepted");
-    check(vkx_pool_alloc_result(VK_SUCCESS, 255) == VKX_POOL_ALLOC_OK,
-          "success from a used pool is accepted");
-    check(vkx_pool_alloc_result(VK_ERROR_OUT_OF_POOL_MEMORY, 1) == VKX_POOL_ALLOC_ADVANCE,
-          "used out-of-pool advances");
-    check(vkx_pool_alloc_result(VK_ERROR_FRAGMENTED_POOL, 17) == VKX_POOL_ALLOC_ADVANCE,
-          "used fragmented pool advances");
-    check(vkx_pool_alloc_result(VK_ERROR_OUT_OF_POOL_MEMORY, 0) == VKX_POOL_ALLOC_FAIL,
-          "fresh out-of-pool fails closed");
-    check(vkx_pool_alloc_result(VK_ERROR_FRAGMENTED_POOL, 0) == VKX_POOL_ALLOC_FAIL,
-          "fresh fragmented pool fails closed");
-    check(vkx_pool_alloc_result(VK_ERROR_DEVICE_LOST, 42) == VKX_POOL_ALLOC_FAIL,
-          "device loss never advances");
-    check(vkx_pool_alloc_result(VK_ERROR_INITIALIZATION_FAILED, 42) == VKX_POOL_ALLOC_FAIL,
-          "non-capacity error never advances");
+    uint16_t used = 0, index = UINT16_MAX;
+    for (uint16_t i = 0; i < VKX_DESCRIPTOR_POOL_SETS; i++) {
+        check(vkx_descriptor_set_take(&used, &index) && index == i,
+              "each persistent descriptor set is taken once in order");
+    }
+    check(!vkx_descriptor_set_take(&used, &index) &&
+          used == VKX_DESCRIPTOR_POOL_SETS && index == VKX_DESCRIPTOR_POOL_SETS - 1,
+          "a full persistent pool refuses another set without wrapping");
+    used = 0;
+    check(vkx_descriptor_set_take(&used, &index) && index == 0 && used == 1,
+          "a completed ring slot reuses its first persistent set");
     check(!vkx_descriptor_pressure_values(VKX_DESCRIPTOR_SET_HIGH_WATER - 1,
                                           VKX_DESCRIPTOR_POOL_HIGH_WATER - 1),
           "descriptor pressure stays clear below both submission high-waters");
