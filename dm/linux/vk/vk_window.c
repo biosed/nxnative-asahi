@@ -7,6 +7,9 @@
 #include "vk_window.h"
 #include "vk_dev.h"
 int vkx_origin_ll(void);   // vk_draw.c
+int vkx_upscaler_current(void); void vkx_upscaler_set(int mode);   // vk_draw.c: the upscaler in use, and the options menu's change of it
+#include "vk_menu.h"
+#include "vk_upscaler.h"
 #include "../gfx/nvn/nvn_obj.h"
 // vk_replay.c: the image of a presented texture, made ready in c if new; and the replay's timeline
 void *vkr_present_acquire(const tex_t *o);
@@ -123,6 +126,81 @@ static int cpu_image(VkCommandBuffer c, VkImage *img, uint32_t *w, uint32_t *h) 
     barrier(c, g_cimg, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
     *img = g_cimg; *w = cw; *h = ch; return 1;
 }
+// ---- the in-game options menu (vk_menu.h) ----
+// The menu's state lives here: front_input.c opens it and steps it (vkw_menu_*), the present thread draws it. A change of upscaler applies at once
+// (vkx_upscaler_set); every change is kept in the settings file
+static pthread_mutex_t g_menu_mu = PTHREAD_MUTEX_INITIALIZER;
+static vkx_menu g_menu; static uint64_t g_menu_gen = 1; static int g_menu_ready;
+static void menu_ready_locked(void) {
+    if (g_menu_ready) return;
+    g_menu_ready = 1;
+    const char *e = getenv("DM_GFX_SCALE");
+    g_menu.tier_running = e && e[0] >= '0' && e[0] <= '2' && !e[1] ? e[0] - '0' : 0;
+    int up = VKX_UPSCALER_GAME, tier = g_menu.tier_running;
+    vkx_menu_settings_load(&up, &tier);
+    g_menu.tier = tier;
+    g_menu.upscaler = vkx_upscaler_current();   // what the game is drawn with now (DM_UPSCALER wins over the file)
+    if (g_menu.upscaler != VKX_UPSCALER_GAME && g_menu.upscaler != VKX_UPSCALER_FSR1 && g_menu.upscaler != VKX_UPSCALER_LINEAR) g_menu.upscaler = VKX_UPSCALER_GAME;
+}
+int vkw_menu_toggle(void) {
+    pthread_mutex_lock(&g_menu_mu); menu_ready_locked();
+    g_menu.open = !g_menu.open; if (g_menu.open) g_menu.sel = 0; g_menu_gen++;
+    int open = g_menu.open;
+    pthread_mutex_unlock(&g_menu_mu);
+    LOG("options menu %s", open ? "opened (F1 / Minus + Plus); the game gets no input while it is open" : "closed");
+    return open;
+}
+int vkw_menu_open(void) { pthread_mutex_lock(&g_menu_mu); int o = g_menu.open; pthread_mutex_unlock(&g_menu_mu); return o; }
+void vkw_menu_action(int action) {
+    pthread_mutex_lock(&g_menu_mu); menu_ready_locked();
+    int changed = vkx_menu_action(&g_menu, action); g_menu_gen++;
+    int up = g_menu.upscaler, tier = g_menu.tier;
+    pthread_mutex_unlock(&g_menu_mu);
+    if (changed & VKX_MENU_CHANGED_UPSCALER) vkx_upscaler_set(up);
+    if (changed & (VKX_MENU_CHANGED_UPSCALER | VKX_MENU_CHANGED_TIER)) {
+        char path[1024]; int named = vkx_menu_settings_path(path, sizeof path);
+        if (!vkx_menu_settings_save(up, tier)) LOG("[RED] options menu: the settings file %s cannot be written; the choice holds for this run only", named ? path : "(no path: set DM_SETTINGS or HOME)");
+        else if (changed & VKX_MENU_CHANGED_TIER) LOG("options menu: graphics tier %d saved to %s; it applies on the next launch", tier, path);
+    }
+    if (changed & VKX_MENU_CHANGED_OPEN) LOG("options menu closed");
+}
+// The menu's pixels per frame slot, in a host-visible buffer copied over the picture: redrawn when the menu or the size changed
+static VkBuffer g_mbuf[VKW_FRAMES]; static VkDeviceMemory g_mmem[VKW_FRAMES]; static void *g_mmap[VKW_FRAMES]; static size_t g_msz[VKW_FRAMES];
+static uint64_t g_mgen[VKW_FRAMES]; static unsigned g_mw[VKW_FRAMES], g_mh[VKW_FRAMES];
+static void menu_overlay(VkCommandBuffer c, uint32_t i) {
+    pthread_mutex_lock(&g_menu_mu);
+    vkx_menu m = g_menu; uint64_t gen = g_menu_gen;
+    pthread_mutex_unlock(&g_menu_mu);
+    if (!m.open) return;
+    int bgra = g_fmt == VK_FORMAT_B8G8R8A8_UNORM || g_fmt == VK_FORMAT_B8G8R8A8_SRGB, rgba = g_fmt == VK_FORMAT_R8G8B8A8_UNORM || g_fmt == VK_FORMAT_R8G8B8A8_SRGB;
+    if (!bgra && !rgba) { static int said; if (!said++) LOG("[RED] options menu: swapchain format %d is not 8-bit RGBA or BGRA; the menu is not drawn", (int)g_fmt); return; }
+    unsigned s = vkx_menu_scale_for(g_ext.width, g_ext.height), w, h; vkx_menu_size(s, &w, &h);
+    if (w > g_ext.width || h > g_ext.height) return;
+    unsigned k = g_slot; size_t n = (size_t)w * h * 4;
+    if (g_msz[k] < n) {
+        if (g_mbuf[k]) { vkUnmapMemory(g_dev, g_mmem[k]); vkDestroyBuffer(g_dev, g_mbuf[k], NULL); vkFreeMemory(g_dev, g_mmem[k], NULL); g_mbuf[k] = VK_NULL_HANDLE; g_msz[k] = 0; }
+        VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = n, .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT};
+        VkMemoryRequirements mr; VkMemoryAllocateInfo ma = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        if (vkCreateBuffer(g_dev, &bi, NULL, &g_mbuf[k])) { g_mbuf[k] = VK_NULL_HANDLE; return; }
+        vkGetBufferMemoryRequirements(g_dev, g_mbuf[k], &mr); ma.allocationSize = mr.size;
+        ma.memoryTypeIndex = vkr_pick_mem(mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        if (vkAllocateMemory(g_dev, &ma, NULL, &g_mmem[k]) || vkBindBufferMemory(g_dev, g_mbuf[k], g_mmem[k], 0) || vkMapMemory(g_dev, g_mmem[k], 0, n, 0, &g_mmap[k])) {
+            vkDestroyBuffer(g_dev, g_mbuf[k], NULL); g_mbuf[k] = VK_NULL_HANDLE; return;
+        }
+        g_msz[k] = n; g_mgen[k] = 0;
+    }
+    if (g_mgen[k] != gen || g_mw[k] != w || g_mh[k] != h) {
+        uint8_t *px = g_mmap[k];
+        vkx_menu_draw(&m, s, px, w, h);
+        if (bgra) for (size_t q = 0; q < n; q += 4) { uint8_t t = px[q]; px[q] = px[q + 2]; px[q + 2] = t; }
+        g_mgen[k] = gen; g_mw[k] = w; g_mh[k] = h;
+    }
+    barrier(c, g_img[i], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);   // after the picture's blit
+    VkBufferImageCopy r = {.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                           .imageOffset = {(int32_t)(g_ext.width - w) / 2, (int32_t)(g_ext.height - h) / 2, 0}, .imageExtent = {w, h, 1}};
+    vkCmdCopyBufferToImage(c, g_mbuf[k], g_img[i], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &r);
+}
 static int record(VkCommandBuffer c, uint32_t i, uint64_t ticket, const src_t *s) {
     VkCommandBufferBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
     vkBeginCommandBuffer(c, &bi);
@@ -149,6 +227,7 @@ static int record(VkCommandBuffer c, uint32_t i, uint64_t ticket, const src_t *s
                           .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .dstOffsets = {{dx, dy, 0}, {dx + dw, dy + dh, 1}}};
         if (s->cpu || vkx_origin_ll()) { bl.dstOffsets[0].y = dy + dh; bl.dstOffsets[1].y = dy; }   // lower-left origin: the game's image is bottom-up (Pokémon: Let's Go; GL's read-back rows), shown flipped
         vkCmdBlitImage(c, src, VK_IMAGE_LAYOUT_GENERAL, g_img[i], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bl, VK_FILTER_LINEAR);
+        menu_overlay(c, i);
         barrier(c, g_img[i], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0);
         vkEndCommandBuffer(c);
         return 1;

@@ -15,6 +15,10 @@ void dm_pad_set_player(int player, uint64_t buttons, int32_t lx, int32_t ly, int
 }
 void dm_pad_players(uint32_t mask) { (void)mask; }
 uint32_t dm_player_npad(int player) { return (uint32_t)player; }
+static int g_menu_is_open, g_menu_toggles, g_menu_actions;   // the options menu (vk_window.c), stubbed
+int vkw_menu_toggle(void) { g_menu_toggles++; return g_menu_is_open = !g_menu_is_open; }
+int vkw_menu_open(void) { return g_menu_is_open; }
+void vkw_menu_action(int action) { g_menu_actions++; if (action == 6 /* VKX_MENU_BACK */) g_menu_is_open = 0; }
 
 #include "../front_input.c"
 
@@ -50,6 +54,37 @@ int main(int argc, char **argv) {
     CHECK(g_buttons == DM_BTN_B, "Escape maps to B");
     key(SDL_SCANCODE_ESCAPE, false);
     CHECK(g_buttons == 0, "Escape release clears B");
+
+    // The options menu: F1 opens it, and the game sees released input while it is open
+    key(SDL_SCANCODE_F1, true);
+    CHECK(g_menu_is_open && g_menu_toggles == 1 && g_buttons == 0, "F1 opens the menu with the game's input released");
+    key(SDL_SCANCODE_F1, false);
+    CHECK(g_menu_is_open, "F1's release changes nothing");
+    int acts = g_menu_actions;
+    key(SDL_SCANCODE_DOWN, true);
+    CHECK(g_menu_actions == acts + 1 && g_buttons == 0, "Down moves in the menu, not in the game");
+    key(SDL_SCANCODE_DOWN, false);
+    key(SDL_SCANCODE_RETURN, true);
+    CHECK(g_menu_actions == acts + 2 && g_buttons == 0, "Return (A) changes a choice, not the game");
+    key(SDL_SCANCODE_RETURN, false);
+    key(SDL_SCANCODE_ESCAPE, true);
+    CHECK(!g_menu_is_open && g_buttons == 0, "Escape closes the menu and does not press B in the game");
+    key(SDL_SCANCODE_ESCAPE, false);
+    CHECK(g_buttons == 0, "Escape's release after closing leaves the game's input clear");
+    // Minus + Plus together toggles it; a button held when it closes is kept from the game until released
+    key(SDL_SCANCODE_TAB, true);
+    CHECK(g_buttons == DM_BTN_MINUS && !g_menu_is_open, "Minus alone is the game's");
+    key(SDL_SCANCODE_P, true);
+    CHECK(g_menu_is_open && g_buttons == 0, "Minus + Plus opens the menu");
+    key(SDL_SCANCODE_TAB, false); key(SDL_SCANCODE_P, false);
+    key(SDL_SCANCODE_TAB, true); key(SDL_SCANCODE_P, true);
+    CHECK(!g_menu_is_open && g_buttons == 0, "Minus + Plus again closes it, with both held kept from the game");
+    key(SDL_SCANCODE_P, false);
+    CHECK(g_buttons == 0, "Minus is still kept from the game while held from the menu");
+    key(SDL_SCANCODE_TAB, false);
+    key(SDL_SCANCODE_TAB, true);
+    CHECK(g_buttons == DM_BTN_MINUS, "a fresh Minus press reaches the game again");
+    key(SDL_SCANCODE_TAB, false);
 
     LOG("front input test: %s (%d failures)", failures ? "FAILED" : "passed", failures);
     return failures != 0;
