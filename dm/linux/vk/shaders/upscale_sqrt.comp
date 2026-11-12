@@ -1,0 +1,23 @@
+#version 450
+// DM_UPSCALER=linear (vk_upscaler.h): the game's upscaling stage replaced by a bilinear scale.
+// agl's NDSR reconstruction takes its scene as sqrt(linear colour) in an RGB9E5 texture and writes linear colour
+// (Ocarina of Time: d99fbeeb53d38847, 683x384 E5B9G9R9 -> 2048x1152 B10G11R11). The filter runs on the encoded
+// values, as the network reads them, and the result is squared back to linear for the image the game reads next.
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0) uniform sampler2D src;
+layout(set = 0, binding = 1, r11f_g11f_b10f) uniform writeonly image2D dst;
+layout(push_constant) uniform P {
+    ivec4 in_rect;    // x, y, w, h in src texels
+    ivec4 out_rect;   // x, y, w, h in dst texels
+    vec2 src_size;    // src texture size
+} p;
+
+void main()
+{
+    ivec2 o = ivec2(gl_GlobalInvocationID.xy);
+    if (o.x >= p.out_rect.z || o.y >= p.out_rect.w) return;
+    vec2 at = vec2(p.in_rect.xy) + (vec2(o) + 0.5) * vec2(p.in_rect.zw) / vec2(p.out_rect.zw);
+    vec2 lo = vec2(p.in_rect.xy) + 0.5, hi = vec2(p.in_rect.xy + p.in_rect.zw) - 0.5;   // stay inside the input rectangle
+    vec3 c = textureLod(src, clamp(at, lo, hi) / p.src_size, 0.0).rgb;
+    imageStore(dst, p.out_rect.xy + o, vec4(c * c, 1.0));
+}
