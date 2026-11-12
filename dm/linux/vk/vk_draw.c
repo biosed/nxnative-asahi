@@ -1138,7 +1138,7 @@ static int drv_fill(int st, int actual_st, int bank, VkDescriptorBufferInfo *out
         int base = vkx_stage_c0_ssbo_base(actual_st);
         if (base >= 0) for (int r = 0; r < 16; r++) { memcpy(d + base + 16 * r, &S.ssbo[st][r].addr, 8); uint32_t n = (uint32_t)S.ssbo[st][r].size; memcpy(d + base + 16 * r + 8, &n, 4); }
         if (st == 5) { memcpy(d + 0x200, g_dispatch, 12); if (dm_sdk_ounce()) memcpy(d + DMSH_C0_DISPATCH_NVN2, g_dispatch, 12); for (int r = 0; r < 16; r++) { memcpy(d + 0x210 + 16 * r, &S.ubo[st][r].addr, 8); uint32_t n = (uint32_t)S.ubo[st][r].size; memcpy(d + 0x210 + 16 * r + 8, &n, 4); } }
-        else { const float maxp = 2047.0f; memcpy(d + 0x610, &maxp, 4); memcpy(d + 0x644, &g_binst, 4); }
+        else { const float maxp = 2047.0f; memcpy(d + DMSH_C0_POINT_SIZE, &maxp, 4); memcpy(d + DMSH_C0_BASE_INSTANCE, &g_binst, 4); }
     } else if (bank == 2) {
         for (int k = 0; k < 41; k++) { uint64_t h = k >= 32 && k < 40 ? S.img[st][k - 32] : S.tex[st][k]; memcpy(d + 0x20 + 8 * k, &h, 8); }
         for (int k = 0; k < 128; k++) { memcpy(d + 0x168 + 8 * k, &S.tex[st][128 + k], 8); memcpy(d + 0x568 + 8 * k, &S.samp[st][k], 8); }
@@ -2145,6 +2145,9 @@ int vkx_draw(VkCommandBuffer c, uint32_t op, const void *a, uint32_t size, int n
     p_draw td; p_draw_idx ti; int ok;
     const p_draw *d = op == OP_DRAW ? draw_rec(a, size, &td) : NULL;
     const p_draw_idx *x = op == OP_DRAW_IDX ? draw_idx_rec(a, size, &ti) : NULL;
+    // Fill the driver word before stage_set can reuse or create c0. Leaving it
+    // at zero makes a split instanced draw reuse record zero's batch metadata.
+    g_binst = vkx_draw_base_instance(d, x);
     VkPrimitiveTopology tp = topo(d ? d->prim : x->prim, &ok);
     if (!ok || (ok == 2 && (x || d->ind || d->count > 4 * QUAD_MAX || !quad_ib()))) { g_st_skip[SK_QUADS]++; return 0; }
     if ((d ? d->mdi_cnt : x->mdi_cnt)) { g_st_skip[SK_INDIRECT]++; return 0; }   // open: indirect-count multi-draws

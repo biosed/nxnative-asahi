@@ -170,7 +170,7 @@ $(OUT)/t_nvn_queue: vk/tests/t_nvn_queue.c ../gfx/nvn/nvn_queue.inc ../gfx/nvn/n
 t_nvn_queue: $(OUT)/t_nvn_queue
 	$<
 	DM_NVN_QUEUE_SCHED=0 $< bypass
-$(OUT)/t_vk_stage: vk/tests/t_vk_stage.c vk/vk_stage.h | profile
+$(OUT)/t_vk_stage: vk/tests/t_vk_stage.c vk/vk_stage.h vk/vk_draw.h | profile
 	@mkdir -p $(dir $@)
 	$(CC) $(CPPFLAGS) -std=gnu11 -O1 -g -Wall -Wextra -Werror -Ivk $$($(PKG_CONFIG) --cflags vulkan) -o $@ $<
 t_vk_stage: $(OUT)/t_vk_stage
