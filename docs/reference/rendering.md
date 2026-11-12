@@ -856,6 +856,14 @@ The replay on Metal (`dm/gfx/nvn/nvn_mtl.m`) and the Vulkan and OpenGL layers. E
 - Instanced array draws (`DrawArraysInstanced`) carry instance count and base instance in the `OP_DRAW` record.
 - **Found on:** [Super Mario Bros. Wonder](../../dm/games/010015100B514000/README.md).
 
+### A draw's base instance in the Linux Vulkan driver bank
+
+- **Symptom:** dynamic dialogue body text and the label beside its button are absent, while the dialogue box, speaker name and static labels render. The glyph render targets stay transparent even though their source mask and per-instance records contain the glyphs.
+- **Cause:** translated GLSLC shaders add the draw's base instance from driver constant bank c0 at `DMSH_C0_BASE_INSTANCE` when they index per-instance data. The Linux Vulkan replay declared that word but never set it. A first glyph batch at base instance 0 rendered; a split batch at base instance 1 or 3 still read zero and used the first record's batch metadata.
+- **Fix:** `vkx_draw` copies each direct array or indexed draw record's base instance into the graphics driver state before it prepares descriptor sets, so the c0 cache is keyed by the value the shader will read. Metal and the Android Vulkan replay already set the same word per draw.
+- **Check:** `t_vk_stage` covers array and indexed record selection. A guarded M1 Pro/G13S C0 route changed the previously transparent 445x61 and 277x40 glyph targets to non-empty images and rendered `What is it, Link?` and `Conversation Log`; cgroup peak 12.89 GB and swap 404 MB. This is a dialogue-route check, not a gameplay pass.
+- **Found on:** [The Legend of Zelda: Ocarina of Time](../../dm/games/0400486024DEC000/README.md) on the native Linux NVN2-to-Vulkan path.
+
 ### 8-bit index buffers
 
 - **Cause:** Metal has only 16/32-bit indices.
