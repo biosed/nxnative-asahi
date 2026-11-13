@@ -28,6 +28,8 @@ typedef struct {
     uint8_t *addressed;                                  // chunks in ranges NVN has handed to the GPU
     uint8_t *backed_by;                                  // VKM_BACK_*: the path that first placed each chunk
     uint8_t *raw_visible;                                // chunks exported in a raw-global lookup table
+    VkDeviceMemory hole;                                 // DM_VK_GMEM_FLAT: one granule bound over every chunk not backed yet
+    int flat;                                            // every byte of the region is bound: exported as one raw-global entry
 } vkm_region;
 static vkm_region g_reg[VKM_MAXREG]; static int g_nreg;
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -289,6 +291,46 @@ void vkm_addressed(const void *addr, uint64_t len) {
     pthread_mutex_unlock(&g_mu);
 }
 
+// DM_VK_GMEM_FLAT=1 (experimental, default off): every region is one sparse buffer at one contiguous device address, so a guest address inside it is
+// the region's buffer address plus its offset. The raw-global table nevertheless lists each backed run, and the translated shaders binary-search it
+// (13 steps and range checks per access, inlined hundreds of times in the mesh producers). Here the chunks that are not backed yet are all bound to one
+// shared zero-initialised granule (this G13 reports residencyNonResidentStrict = false, so an unbound range must not be read), the table holds one entry
+// per region, and entry 0 carries DMSH_GMEM_FLAT_TAG so a translator fast path can use those few entries with no search. A backed chunk replaces its hole
+// binding as before. A stray GPU access to a hole reads zero or another hole's stray bytes instead of being refused; any write there is lost to the CPU.
+static int flat_mode(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("DM_VK_GMEM_FLAT"); v = e && *e && strcmp(e, "0");
+        if (v) LOG("[RED] vulkan: experimental flat raw-global map (DM_VK_GMEM_FLAT=1): unbacked guest chunks share one zero granule; not a gameplay baseline");
+    }
+    return v;
+}
+static void flat_cover_holes(vkm_region *r) {
+    uint64_t granule = vkm_granule(), nc = (r->size + granule - 1) / granule;
+    VkMemoryAllocateFlagsInfo zf = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, .flags = VK_MEMORY_ALLOCATE_ZERO_INITIALIZE_BIT_EXT};
+    VkMemoryAllocateInfo ma = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = g_vkd.zero_init ? &zf : NULL, .allocationSize = granule, .memoryTypeIndex = r->type};
+    VkResult vr = vkAllocateMemory(g_vkd.dev, &ma, NULL, &r->hole);
+    if (vr) { LOG("[RED] vulkan: flat raw-global map: no hole granule for region %p (%d); region keeps the run table", (void *)r->base, (int)vr); r->hole = VK_NULL_HANDLE; return; }
+    if (!g_vkd.zero_init) {   // not zero by contract: write the zeroes once
+        void *p = NULL;
+        if (vkMapMemory(g_vkd.dev, r->hole, 0, VK_WHOLE_SIZE, 0, &p) || !p) { vkFreeMemory(g_vkd.dev, r->hole, NULL); r->hole = VK_NULL_HANDLE; LOG("[RED] vulkan: flat raw-global map: hole granule not mappable"); return; }
+        memset(p, 0, granule); vkUnmapMemory(g_vkd.dev, r->hole);
+    }
+    VkSparseMemoryBind *sb = calloc(nc, sizeof *sb); uint32_t n = 0;
+    if (!sb) die("vulkan: flat raw-global map allocation failed");
+    for (uint64_t c = 0; c < nc; c++) if (!r->chunk[c]) sb[n++] = (VkSparseMemoryBind){c * granule, chunk_size(r, c), r->hole, 0, 0};
+    VkSparseBufferMemoryBindInfo sbi = {r->buf, n, sb};
+    VkBindSparseInfo bsi = {.sType = VK_STRUCTURE_TYPE_BIND_SPARSE_INFO, .bufferBindCount = n ? 1 : 0, .pBufferBinds = &sbi};
+    VkFenceCreateInfo fci = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO}; VkFence f; vkCreateFence(g_vkd.dev, &fci, NULL, &f);
+    pthread_mutex_lock(&g_vkd_qlock); vr = vkQueueBindSparse(g_vkd.q, 1, &bsi, f); pthread_mutex_unlock(&g_vkd_qlock);
+    if (!vr) vr = vkWaitForFences(g_vkd.dev, 1, &f, VK_TRUE, UINT64_MAX);
+    vkDestroyFence(g_vkd.dev, f, NULL); free(sb);
+    if (vr) die("vulkan: flat raw-global map: binding the hole granule into region %p failed (%d)", (void *)r->base, (int)vr);
+    r->flat = 1;
+    atomic_fetch_add_explicit(&g_generation, 1, memory_order_release);
+    LOG("vulkan: flat raw-global map: region %p+%#llx is one entry (%u chunks bound to the zero granule)", (void *)r->base, (unsigned long long)r->size, n);
+}
+
 static int region_buffer(vkm_region *r) {
     VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .flags = VK_BUFFER_CREATE_SPARSE_BINDING_BIT | VK_BUFFER_CREATE_SPARSE_RESIDENCY_BIT, .size = r->size,
         .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
@@ -311,6 +353,7 @@ static int region_buffer(vkm_region *r) {
     VkBufferDeviceAddressInfo ai = {.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, .buffer = r->buf};
     r->gpu = vkGetBufferDeviceAddress(g_vkd.dev, &ai);
     LOG("vulkan: guest memory region %p+%#llx is GPU buffer %#llx (memory type %u)", (void *)r->base, (unsigned long long)r->size, (unsigned long long)r->gpu, r->type);
+    if (flat_mode()) flat_cover_holes(r);
     return 1;
 }
 
@@ -457,6 +500,12 @@ int vkm_segments(uint64_t *lo, uint64_t *hi, uint64_t *gpu, int max) {
         vkm_region *r = &g_reg[i];
         if (!r->buf) continue;
         uint64_t nc = (r->size + granule - 1) / granule;
+        if (r->flat) {   // every chunk is bound (a backed one or the hole granule): the whole region is one entry
+            if (n == max) { more = 1; continue; }
+            memset(r->raw_visible, 1, nc);
+            lo[n] = (uint64_t)(uintptr_t)r->base; hi[n] = (uint64_t)(uintptr_t)r->base + r->size; gpu[n] = (uint64_t)r->gpu; n++;
+            continue;
+        }
         for (uint64_t c = 0; c < nc;) {
             while (c < nc && !r->chunk[c]) c++;
             if (c == nc) break;
@@ -492,6 +541,12 @@ int vkm_gmem_map(void *dst, size_t size, uint64_t *generation) {
     while (gen != vkm_generation());
     int out = vkx_gmem_map_pack(dst, size, lo, hi, gpu, n);
     if (out < 0) return -1;
+    // Flat only when every exported entry is a whole, fully bound region (a region that could not get its hole granule keeps its runs)
+    int flat = flat_mode() && out > 0 && out <= VKX_GMEM_FLAT_MAX;
+    pthread_mutex_lock(&g_mu);
+    for (int i = 0; i < g_nreg && flat; i++) if (g_reg[i].buf && !g_reg[i].flat) flat = 0;
+    pthread_mutex_unlock(&g_mu);
+    if (flat) vkx_gmem_map_mark_flat(dst, size, out);
     if (generation) *generation = gen;
     return out;
 }

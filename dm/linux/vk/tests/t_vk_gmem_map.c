@@ -92,6 +92,27 @@ int main(void) {
           entry == 2 && hinted == 1 && host == o_gpu[1] + 2 * chunk_sz + 0x10ull,
           "clipped overlapping segment preserves original GPU-minus-guest delta");
 
+    // 2. Flat table (DM_VK_GMEM_FLAT=1): two whole regions, entry 0 tagged. The tag must not change what the search
+    //    resolves (old shaders ignore it), and the fast path must agree with the search for every address.
+    const uint64_t f_lo[2] = {0xfffc00000000ull, 0xfffe80000000ull};
+    const uint64_t f_hi[2] = {0xfffc00000000ull + (8ull << 30), 0xfffe80000000ull + (4ull << 30)};
+    const uint64_t f_gpu[2] = {0x2000000000ull, 0x4000000000ull};
+    check(vkx_gmem_map_eval_flat(map, f_lo[0], &host) == -1, "untagged table is not flat");
+    check(vkx_gmem_map_pack(map, sizeof map, f_lo, f_hi, f_gpu, 2) == 2, "two whole regions pack");
+    vkx_gmem_map_mark_flat(map, sizeof map, 2);
+    const uint64_t probes[] = {f_lo[0], f_lo[0] + 0x12345678ull, f_hi[0] - 4, f_hi[0], f_lo[1] - 1, f_lo[1], f_hi[1] - 1, f_hi[1], f_lo[0] - 1, 0x1000ull};
+    for (size_t i = 0; i < sizeof probes / sizeof *probes; i++) {
+        uint64_t hs = 0, hf = 0;
+        int s = vkx_gmem_map_eval(map, probes[i], &hs, &entry, &hinted), f = vkx_gmem_map_eval_flat(map, probes[i], &hf);
+        check(f == s && (!s || hf == hs), "flat fast path agrees with the search");
+    }
+    check(vkx_gmem_map_eval_flat(map, f_lo[1] + 0x40ull, &host) == 1 && host == f_gpu[1] + 0x40ull, "flat second region translates to its GPU address");
+    check(vkx_gmem_map_eval_flat(map, f_hi[0] + 0x40ull, &host) == 0, "gap between regions is refused");
+    vkx_gmem_map_mark_flat(map, sizeof map, VKX_GMEM_FLAT_MAX + 1);   // out of range: must leave the existing tag alone
+    check(vkx_gmem_map_eval_flat(map, f_lo[0], &host) == 1, "out-of-range count is not written");
+    check(vkx_gmem_map_pack(map, sizeof map, f_lo, f_hi, f_gpu, 2) == 2 && vkx_gmem_map_eval_flat(map, f_lo[0], &host) == -1,
+          "repacking clears the flat tag");
+
     printf("t_vk_gmem_map: %s (%d failures)\n", bad ? "FAILED" : "passed", bad);
     return bad != 0;
 }

@@ -10,6 +10,32 @@ enum {
     VKX_GMEM_HINT_TAG_LIMIT = 1u << (32 - VKX_GMEM_MAP_LOG2),
 };
 
+// Flat table (DM_VK_GMEM_FLAT=1, vk_mem.c). Entry 0 is empty and the search never reads its delta (bytes 16..23): a flat table puts VKX_GMEM_FLAT_TAG in
+// that word's low half and the entry count n (1..VKX_GMEM_FLAT_MAX) in its high half. Entries 1..n are then whole guest regions, sorted, every byte bound
+// on the GPU, so a translator may resolve an address by testing those n entries' [start, end) in order (address + delta of the one holding it) instead of
+// searching; an address in none of them is refused as before. Kept out of dmsh_abi.h for now so the host change does not alter the shader chain ID: a
+// translator fast path that reads it must move these two values into dmsh_abi.h with its own chain change.
+#define VKX_GMEM_FLAT_TAG 0x54414C46u   // 'FLAT'
+#define VKX_GMEM_FLAT_MAX 4
+
+static inline void vkx_gmem_map_mark_flat(void *dst, size_t size, int n) {
+    if (!dst || size < (size_t)DMSH_GMEM_MAP_ENTRIES * DMSH_GMEM_MAP_ENTRY || n < 1 || n > VKX_GMEM_FLAT_MAX) return;
+    uint32_t w[2] = {VKX_GMEM_FLAT_TAG, (uint32_t)n};
+    memcpy((uint8_t *)dst + 16, w, sizeof w);
+}
+
+// What a translator fast path does with a flat table: 1 with the GPU address when addr lies in one of entries 1..n, 0 when outside all of them,
+// -1 when the table is not flat (the caller searches).
+static inline int vkx_gmem_map_eval_flat(const void *map, uint64_t addr, uint64_t *host_addr) {
+    const uint32_t *w = (const uint32_t *)map;
+    if (!map || w[4] != VKX_GMEM_FLAT_TAG || w[5] < 1 || w[5] > VKX_GMEM_FLAT_MAX) return -1;
+    for (uint32_t k = 1; k <= w[5]; k++) {
+        uint64_t e[3]; memcpy(e, (const uint8_t *)map + (size_t)k * DMSH_GMEM_MAP_ENTRY, sizeof e);
+        if (addr >= e[0] && addr < e[1]) { if (host_addr) *host_addr = addr + e[2]; return 1; }
+    }
+    return 0;
+}
+
 // Packs sorted guest-memory segments [lo[i], hi[i]) with GPU base gpu[i] into
 // the DMSH_GMEM_MAP_ENTRIES * DMSH_GMEM_MAP_ENTRY raw-global lookup table,
 // including 2-MiB chunk hints at byte +24 (word 6) as GlobalToStorage.cs and
