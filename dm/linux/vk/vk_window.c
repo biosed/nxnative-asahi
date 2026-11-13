@@ -283,7 +283,7 @@ static int present_one(uint64_t ticket, unsigned slot, const src_t *s) {
     if (mesh_related && mesh_log_on())
         LOG("vulkan mesh present: ticket=%llu slot=%u source-wait=%llu queue submit begin",
             (unsigned long long)ticket, slot, (unsigned long long)s->wait);
-    pthread_mutex_lock(&g_vkd_qlock); r = vkQueueSubmit(g_q, 1, &si, g_done[slot]); pthread_mutex_unlock(&g_vkd_qlock);
+    pthread_mutex_lock(&g_vkd_qlock); r = vkQueueSubmit(g_q, 1, &si, g_done[slot]); g_vkd_wsubs++; pthread_mutex_unlock(&g_vkd_qlock);
     if (mesh_related && mesh_log_on())
         LOG("vulkan mesh present: ticket=%llu slot=%u source-wait=%llu vkQueueSubmit=%d",
             (unsigned long long)ticket, slot, (unsigned long long)s->wait, (int)r);

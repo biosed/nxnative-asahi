@@ -7,6 +7,7 @@
 
 vkd_t g_vkd;
 pthread_mutex_t g_vkd_qlock = PTHREAD_MUTEX_INITIALIZER;
+volatile unsigned long g_vkd_wsubs;
 #define VKD_OK(x) do { VkResult r_ = (x); if (r_ != VK_SUCCESS) { LOG("[RED] vulkan: %s failed (%d)", #x, (int)r_); return 0; } } while (0)
 
 static int has_ext(VkPhysicalDevice pd, const char *name) {
