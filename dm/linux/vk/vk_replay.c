@@ -206,7 +206,24 @@ double mtl_gpu_ms(uint64_t f) {
     pthread_mutex_lock(&g_gfmu); double r = g_gf[f % 64].f == f ? g_gf[f % 64].ns / 1e6 : -1; pthread_mutex_unlock(&g_gfmu);
     return r;
 }
-int mtl_gpu_span(uint64_t f, uint64_t *t0, uint64_t *t1) { (void)f; *t0 = *t1 = 0; return 0; }   // (GPU clock, not the host's: not given)
+// The frame's first submission start and last submission end (DM_NVN_TSV's @gpu_beg_ms / @gpu_end_ms). The timestamps are on the GPU's
+// clock; they are moved onto the host's by one constant taken at the first span, so differences between them (a frame's busy span, the GPU
+// idle between frames) are exact and only their absolute placement against host events is approximate
+int mtl_gpu_span(uint64_t f, uint64_t *t0, uint64_t *t1) {
+    *t0 = *t1 = 0;
+    if (g_on <= 0 || !g_qp) return 0;
+    pthread_mutex_lock(&g_tmu); gpu_harvest_done(); pthread_mutex_unlock(&g_tmu);
+    static int64_t off; static int have;
+    pthread_mutex_lock(&g_gfmu);
+    const gpu_frame *g = &g_gf[f % 64];
+    int ok = g->f == f && g->t1 && g->t0 != UINT64_MAX;
+    if (ok) {
+        if (!have) { off = (int64_t)mono_ns() - (int64_t)g->t1; have = 1; }
+        *t0 = (uint64_t)((int64_t)g->t0 + off); *t1 = (uint64_t)((int64_t)g->t1 + off);
+    }
+    pthread_mutex_unlock(&g_gfmu);
+    return ok;
+}
 static int vkr_on(void) {
     if (g_on >= 0) return g_on;
     if (!vkd_ok()) return g_on = 0;
@@ -1135,7 +1152,23 @@ void mtl_sub_begin(void) {
 // A long submission goes to the GPU in parts: when enough draws are recorded and no render pass is open, what there is is submitted and recording goes on in the next
 // command buffer, so the GPU works on a frame's first passes while the rest is replayed (one command buffer per submission left the GPU idle for the whole replay, about
 // 10 ms of Mario Wonder's 24 ms frame, and the CPU idle while the GPU ran). Fences stay in order: each part signals the next timeline value
-#define FLUSH_DRAWS 128
+// Draws per part: 48 measured best on Honeykrisp G13 (Ocarina of Time, FSR1 tier 2, in-run A/B on one route: 128 -> 48 frame p50
+// 34.75 -> 34.01 ms; 48 vs 24: p50 32.19 vs 32.62, p95 34.08 vs 37.12 ms). Smaller parts start the GPU sooner after the replay
+// begins; each part is a submission, whose ~0.4 ms boundary cost wins below that. MacNativeGames' Metal TotK path found 30/40 best
+#define FLUSH_DRAWS 48
+// DM_VK_FLUSH_DRAWS=<n>: draws per part instead of 48. Too large and the GPU waits for the replay of the whole part (no draw-count split:
+// frame p50 33.4 -> 44.3 ms, GPU idle inside the frame 3.4 -> 14.2 ms); too small and the ~0.4 ms per-submission cost wins.
+// DM_VK_FLUSH_AB=<frames>: odd phases of that many frames use DM_VK_FLUSH_DRAWS_B (default: no draw-count split), for an in-run A/B.
+// The descriptor-pressure split stays in every mode
+static uint64_t flush_draws_limit(void) {
+    static long a = -1, b = -1, ab = -1;
+    if (a < 0) {
+        const char *e = getenv("DM_VK_FLUSH_DRAWS"), *eb = getenv("DM_VK_FLUSH_DRAWS_B"), *ea = getenv("DM_VK_FLUSH_AB");
+        a = e && atol(e) > 0 ? atol(e) : FLUSH_DRAWS; b = eb && atol(eb) > 0 ? atol(eb) : (1L << 40); ab = ea ? atol(ea) : 0; if (ab < 0) ab = 0;
+        if (e || ea) LOG("vulkan replay: parts of %ld draws%s", a, ab ? " (odd phases: DM_VK_FLUSH_DRAWS_B)" : "");
+    }
+    return (uint64_t)(ab && ((vkh_frame() / (uint64_t)ab) & 1) ? b : a);
+}
 // DM_VK_PROF=1 (diagnostic): the replay's time by record kind (nvn_obj.h's OP_ numbers), mid-submission flushes (64) and submission ends (65), logged as milliseconds a frame
 // every 300 frames: where the submit thread's time goes
 static int g_prof = -1; static uint64_t g_opns[66], g_prof_f0;
@@ -1752,7 +1785,7 @@ void mtl_exec(const uint8_t *handle) {
     const uint8_t *p = handle, *ret[16]; int nret = 0;
     for (uint64_t guard = 0; p && guard < 50000000; guard++) {
         int descriptor_split = vkx_descriptor_pressure();
-        if (!g_noflush && ((g_flush_draws >= FLUSH_DRAWS && !g_rp_on) || descriptor_split)) {
+        if (!g_noflush && ((g_flush_draws >= flush_draws_limit() && !g_rp_on) || descriptor_split)) {
             // Ordinary batching waits for the game to end dynamic rendering,
             // but an NVN pass may legitimately contain thousands of draws.
             // Bound descriptor lifetime directly: attachments use LOAD/STORE,
@@ -1824,7 +1857,7 @@ void mtl_exec(const uint8_t *handle) {
                 // buffer's descriptor pools before its first mesh draw.  The
                 // mesh bridge has just provided a legal split point; submit
                 // the old part before allocating the task/mesh/fragment sets.
-                if (!g_rp_on && g_flush_draws >= FLUSH_DRAWS && !g_noflush) {   // only at a split point: with the pass still open the next pass end flushes
+                if (!g_rp_on && g_flush_draws >= flush_draws_limit() && !g_noflush) {   // only at a split point: with the pass still open the next pass end flushes
                     uint64_t ft = g_prof > 0 ? mono_ns() : 0;
                     vkr_flush(); c = g_cb[g_cb_i];
                     if (g_prof > 0) g_opns[64] += mono_ns() - ft;
