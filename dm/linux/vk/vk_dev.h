@@ -27,3 +27,4 @@ static inline int vkd_ok(void) { return g_vkd.dev != VK_NULL_HANDLE; }
 const vkx_mesh_caps *vkd_mesh_active(void); // NULL unless the exact root proof token and all driver gates pass
 // The queue is shared by the present thread, sparse binds and the backend: every vkQueue* call holds this
 extern pthread_mutex_t g_vkd_qlock;
+extern volatile unsigned long g_vkd_wsubs;   // presentation submissions and presents made (DM_VK_PART_GAPS tells gaps behind them apart)

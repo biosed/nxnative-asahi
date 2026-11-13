@@ -82,7 +82,17 @@ static char g_dump_dir[900]; static int g_dump_left = -1; static uint64_t g_dump
 enum { SEG_Q = 128 };   // timestamp reports with a query of their own, per part (seg_ts)
 static VkQueryPool g_sq; static int g_sq_n[CB_RING];
 static VkQueryPool g_qp; static uint64_t g_cb_frame[CB_RING]; static int g_cb_timed[CB_RING];
-typedef struct { uint64_t f, ns, t0, t1; } gpu_frame;
+// DM_VK_PART_GAPS=1 (diagnostic): every 300 frames, the GPU idle between one frame's parts, split by how many earlier parts were unfinished when the later
+// part was submitted: none (starved: the replay was late), one (the GPU may finish it before the kernel's scheduler kicks the new part), or two and more
+// (the gap is the driver's or firmware's own cost of a submission boundary); and how many gaps had a presentation submitted between their parts
+typedef struct { uint64_t v, t0, t1; uint8_t starved, present, first; uint32_t draws, rec_us, ggap_us, wait_us; } part_rec;
+// per part, for the starved ones: opened by the game's submission begin (first), draws, host time from its command buffer's begin to its submission (rec_us),
+// for a first part the host time since the game's previous submission ended (ggap_us), and the time its ring slot's wait took (wait_us)
+static uint8_t g_cb_first[CB_RING]; static uint32_t g_cb_draws[CB_RING], g_cb_rec[CB_RING], g_cb_ggap[CB_RING], g_cb_wait[CB_RING];
+static uint64_t g_pg_t0, g_pg_commit, g_pg_ggap, g_pg_wait; static int g_pg_first;
+enum { PART_REC = 48 };
+static int g_pgaps = -1; static uint8_t g_cb_starved[CB_RING], g_cb_present[CB_RING]; static unsigned long g_pg_wsubs;   // starved: unfinished earlier parts at submission, capped at 2
+typedef struct { uint64_t f, ns, t0, t1; int np; part_rec p[PART_REC]; } gpu_frame;
 static gpu_frame g_gf[64]; static pthread_mutex_t g_gfmu = PTHREAD_MUTEX_INITIALIZER;
 uint64_t vkh_frame(void); static uint64_t done_value(void);
 static uint64_t mono_ns(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec; }
@@ -188,7 +198,9 @@ static void gpu_harvest(int i) {   // slot i's timestamps into its frame (its su
     double per = g_vkd.props.limits.timestampPeriod; uint64_t ns = q[1] > q[0] ? (uint64_t)((q[1] - q[0]) * per) : 0;
     pthread_mutex_lock(&g_gfmu);
     gpu_frame *g = &g_gf[g_cb_frame[i] % 64];
-    if (g->f != g_cb_frame[i]) *g = (gpu_frame){g_cb_frame[i], 0, UINT64_MAX, 0};
+    if (g->f != g_cb_frame[i]) { g->f = g_cb_frame[i]; g->ns = 0; g->t0 = UINT64_MAX; g->t1 = 0; g->np = 0; }
+    if (g_pgaps > 0 && g->np < PART_REC) g->p[g->np++] = (part_rec){atomic_load(&g_cb_val[i]), (uint64_t)(q[0] * per), (uint64_t)(q[1] * per), g_cb_starved[i], g_cb_present[i],
+        g_cb_first[i], g_cb_draws[i], g_cb_rec[i], g_cb_ggap[i], g_cb_wait[i]};
     g->ns += ns; if ((uint64_t)(q[0] * per) < g->t0) g->t0 = (uint64_t)(q[0] * per); if ((uint64_t)(q[1] * per) > g->t1) g->t1 = (uint64_t)(q[1] * per);
     pthread_mutex_unlock(&g_gfmu);
 }
@@ -209,6 +221,30 @@ double mtl_gpu_ms(uint64_t f) {
 // The frame's first submission start and last submission end (DM_NVN_TSV's @gpu_beg_ms / @gpu_end_ms). The timestamps are on the GPU's
 // clock; they are moved onto the host's by one constant taken at the first span, so differences between them (a frame's busy span, the GPU
 // idle between frames) are exact and only their absolute placement against host events is approximate
+static void part_gaps(const gpu_frame *g) {   // DM_VK_PART_GAPS: called with g_gfmu held, once per frame span
+    static uint64_t last_f, nf, parts, npres, gn[3], gns[3], gmax[3], sfirst, sdraws, srec, sggap, swait;
+    if (g->f == last_f || g->np < 1) return;
+    last_f = g->f; nf++; parts += (uint64_t)g->np;
+    part_rec r[PART_REC]; int n = g->np; memcpy(r, g->p, sizeof r[0] * (size_t)n);
+    for (int i = 1; i < n; i++) for (int j = i; j > 0 && r[j].v < r[j - 1].v; j--) { part_rec t = r[j]; r[j] = r[j - 1]; r[j - 1] = t; }
+    for (int i = 1; i < n; i++) {
+        uint64_t gap = r[i].t0 > r[i - 1].t1 ? r[i].t0 - r[i - 1].t1 : 0;
+        int k = r[i].starved; npres += r[i].present;
+        if (!k) { sfirst += r[i].first; sdraws += r[i].draws; srec += r[i].rec_us; sggap += r[i].ggap_us; swait += r[i].wait_us; }
+        gn[k]++; gns[k] += gap; if (gap > gmax[k]) gmax[k] = gap;
+    }
+    if (nf < 300) return;
+    double d = (double)nf;
+    LOG("vulkan replay part gaps, %.0f frames: %.1f parts a frame, %.2f gaps a frame behind a present; between parts (count a frame / ms a frame / mean us / max us): starved %.1f/%.2f/%.0f/%.0f, one part ahead %.1f/%.2f/%.0f/%.0f, two or more ahead %.1f/%.2f/%.0f/%.0f",
+        d, parts / d, npres / d,
+        gn[0] / d, gns[0] / 1e6 / d, gn[0] ? gns[0] / 1e3 / gn[0] : 0.0, gmax[0] / 1e3,
+        gn[1] / d, gns[1] / 1e6 / d, gn[1] ? gns[1] / 1e3 / gn[1] : 0.0, gmax[1] / 1e3,
+        gn[2] / d, gns[2] / 1e6 / d, gn[2] ? gns[2] / 1e3 / gn[2] : 0.0, gmax[2] / 1e3);
+    if (gn[0]) LOG("vulkan replay starved parts: %.0f%% open a game submission (game idle before it %.0f us), %.1f draws, recorded in %.0f us, ring-slot wait %.0f us (means)",
+        100.0 * sfirst / gn[0], sfirst ? (double)sggap / sfirst : 0.0, (double)sdraws / gn[0], (double)srec / gn[0], (double)swait / gn[0]);
+    sfirst = sdraws = srec = sggap = swait = 0;
+    nf = parts = npres = 0; memset(gn, 0, sizeof gn); memset(gns, 0, sizeof gns); memset(gmax, 0, sizeof gmax);
+}
 int mtl_gpu_span(uint64_t f, uint64_t *t0, uint64_t *t1) {
     *t0 = *t1 = 0;
     if (g_on <= 0 || !g_qp) return 0;
@@ -217,6 +253,7 @@ int mtl_gpu_span(uint64_t f, uint64_t *t0, uint64_t *t1) {
     pthread_mutex_lock(&g_gfmu);
     const gpu_frame *g = &g_gf[f % 64];
     int ok = g->f == f && g->t1 && g->t0 != UINT64_MAX;
+    if (ok && g_pgaps > 0) part_gaps(g);
     if (ok) {
         if (!have) { off = (int64_t)mono_ns() - (int64_t)g->t1; have = 1; }
         *t0 = (uint64_t)((int64_t)g->t0 + off); *t1 = (uint64_t)((int64_t)g->t1 + off);
@@ -1063,7 +1100,9 @@ static void dump_uploads(uint64_t fence);
 static void sub_open(void) {   // the next ring slot's command buffer, begun (its last use waited for)
     g_cb_i = (g_cb_i + 1) % g_cb_n;
     uint64_t submitted = atomic_load(&g_cb_val[g_cb_i]);
+    uint64_t wt0 = g_pgaps > 0 ? mono_ns() : 0;
     wait_value_named(submitted, UINT64_MAX, "sub_open", g_cb_i);   // its last use is done
+    if (g_pgaps > 0) { g_pg_t0 = mono_ns(); g_pg_wait = g_pg_t0 - wt0; }
     uint64_t done = done_value();
     gp_run(done);   // its reports written while its timestamp queries still hold that use's times (they are reset below)
     if (g_qp || g_cs_qp) {
@@ -1088,6 +1127,7 @@ static void sub_open(void) {   // the next ring slot's command buffer, begun (it
     vkx_sub_begin(g_cb_i, g_cb[g_cb_i], done);
     g_cb_mesh_seq[g_cb_i] = 0;
 }
+static uint64_t g_ahead_seen = ~0ull;   // DM_VK_FLUSH_AHEAD: the draw count whose queue check is done
 static uint64_t g_flush_draws, g_flushes, g_mesh_batch_draws; static int g_noflush = -1;   // draws recorded since the command buffer began; mid-submission flushes made
 // DM_VK_MESH_FLUSH=N submits after N successful mesh draws.  The historical
 // presence-only spelling (including an empty/invalid value) remains N=1 for
@@ -1129,7 +1169,13 @@ static uint64_t sub_submit(void) {   // the open command buffer (after its uploa
     if (mesh_seq && mesh_log_on())
         LOG("vulkan mesh submit: issue=%llu slot=%d signal=%llu command_buffers=%u begin",
             (unsigned long long)mesh_seq, g_cb_i, (unsigned long long)v, ncb);
-    pthread_mutex_lock(&g_vkd_qlock); VkResult r = vkQueueSubmit(g_vkd.q, 1, &si, VK_NULL_HANDLE); pthread_mutex_unlock(&g_vkd_qlock);
+    if (g_pgaps < 0) g_pgaps = getenv("DM_VK_PART_GAPS") != NULL;
+    if (g_pgaps) { uint64_t dv = done_value(), fv = atomic_load(&g_fence); g_cb_starved[g_cb_i] = dv >= fv ? 0 : fv - dv >= 2 ? 2 : 1;
+        g_cb_first[g_cb_i] = (uint8_t)g_pg_first; g_cb_draws[g_cb_i] = (uint32_t)g_flush_draws; g_cb_rec[g_cb_i] = (uint32_t)((mono_ns() - g_pg_t0) / 1000);
+        g_cb_ggap[g_cb_i] = g_pg_first ? (uint32_t)(g_pg_ggap / 1000) : 0; g_cb_wait[g_cb_i] = (uint32_t)(g_pg_wait / 1000); g_pg_first = 0; }
+    pthread_mutex_lock(&g_vkd_qlock);
+    if (g_pgaps) { g_cb_present[g_cb_i] = g_vkd_wsubs != g_pg_wsubs; g_pg_wsubs = g_vkd_wsubs; }
+    VkResult r = vkQueueSubmit(g_vkd.q, 1, &si, VK_NULL_HANDLE); pthread_mutex_unlock(&g_vkd_qlock);
     if (mesh_seq && mesh_log_on())
         LOG("vulkan mesh submit: issue=%llu slot=%d signal=%llu vkQueueSubmit=%d done=%llu",
             (unsigned long long)mesh_seq, g_cb_i, (unsigned long long)v, (int)r, (unsigned long long)done_value());
@@ -1141,12 +1187,13 @@ static uint64_t sub_submit(void) {   // the open command buffer (after its uploa
             g_cb_i, (unsigned long long)v);
     atomic_store(&g_cb_val[g_cb_i], v);
     pthread_mutex_unlock(&g_tmu);
-    atomic_store(&g_fence, v); g_flush_draws = 0; g_mesh_batch_draws = 0;
+    atomic_store(&g_fence, v); g_flush_draws = 0; g_mesh_batch_draws = 0; g_ahead_seen = ~0ull;
     return v;
 }
 void mtl_sub_begin(void) {
     if (!vkr_on()) return;
     if (g_noflush < 0) g_noflush = getenv("DM_VK_NOFLUSH") != NULL;   // diagnostic: one command buffer per submission, as before
+    if (g_pgaps > 0) { g_pg_first = 1; g_pg_ggap = g_pg_commit ? mono_ns() - g_pg_commit : 0; }
     sub_open(); g_rc_skip = 0;
 }
 // A long submission goes to the GPU in parts: when enough draws are recorded and no render pass is open, what there is is submitted and recording goes on in the next
@@ -1169,6 +1216,25 @@ static uint64_t flush_draws_limit(void) {
     }
     return (uint64_t)(ab && ((vkh_frame() / (uint64_t)ab) & 1) ? b : a);
 }
+// DM_VK_FLUSH_AHEAD=<k>: at the draw-count limit, keep recording while k or more submitted parts are unfinished, up to four times the limit. Splitting
+// helps only a GPU that would otherwise wait for the replay; with work already queued a boundary costs a submission for nothing. In Ocarina of Time at
+// graphics-scale tier 1, k=2 took parts from 16.6 to 9.8 a frame, and the frames within 33.3 ms from 80.7% to 86.4% (in-run DM_VK_FLUSH_AB A/B, p95
+// 34.16 -> 33.86 ms). DM_VK_FLUSH_AHEAD_B is the odd-phase value under DM_VK_FLUSH_AB. The timeline is read at most once per new draw
+static int split_due(void) {
+    static long ka = -1, kb = -1, ab = -1;
+    if (ka < 0) {
+        const char *e = getenv("DM_VK_FLUSH_AHEAD"), *eb = getenv("DM_VK_FLUSH_AHEAD_B"), *ea = getenv("DM_VK_FLUSH_AB");
+        ka = e && atol(e) > 0 ? atol(e) : 0; kb = eb && atol(eb) > 0 ? atol(eb) : 0; ab = ea ? atol(ea) : 0; if (ab < 0) ab = 0;
+        if (ka || kb) LOG("vulkan replay: parts grow while %ld or more parts are queued%s", ka, ab ? " (odd phases: DM_VK_FLUSH_AHEAD_B)" : "");
+    }
+    uint64_t n = g_flush_draws, lim = flush_draws_limit();
+    if (n < lim) return 0;
+    long k = ab && ((vkh_frame() / (uint64_t)ab) & 1) ? kb : ka;
+    if (!k || n >= 4 * lim) return 1;
+    if (n == g_ahead_seen) return 0;
+    g_ahead_seen = n;
+    return atomic_load(&g_fence) - done_value() < (uint64_t)k;
+}
 // DM_VK_PROF=1 (diagnostic): the replay's time by record kind (nvn_obj.h's OP_ numbers), mid-submission flushes (64) and submission ends (65), logged as milliseconds a frame
 // every 300 frames: where the submit thread's time goes
 static int g_prof = -1; static uint64_t g_opns[66], g_prof_f0;
@@ -1188,6 +1254,7 @@ uint64_t mtl_sub_commit(void) {
     uint64_t ct = g_prof > 0 ? mono_ns() : 0;
     rp_end(g_cb[g_cb_i]);
     uint64_t v = sub_submit(); g_subs++;
+    if (g_pgaps > 0) g_pg_commit = mono_ns();
     if (g_prof > 0) { g_opns[65] += mono_ns() - ct; prof_log(); }
     static int opslog = -1; if (opslog < 0) opslog = getenv("DM_VK_OPS") != NULL;
     if (opslog && !(g_subs & (g_subs - 1))) {
@@ -1216,6 +1283,7 @@ static void full_barrier(VkCommandBuffer c) {
     VkMemoryBarrier mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT, .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT};
     vkCmdPipelineBarrier(c, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
 }
+
 static VkImageSubresourceRange view_range(const vtex *t, const view_t *v, int has, VkImageAspectFlags asp) {
     VkImageSubresourceRange r = {asp, 0, 1, 0, t->layers};
     if (has && v->set_levels) { r.baseMipLevel = v->base_level; r.levelCount = v->nlevels ? v->nlevels : 1; }
@@ -1785,7 +1853,7 @@ void mtl_exec(const uint8_t *handle) {
     const uint8_t *p = handle, *ret[16]; int nret = 0;
     for (uint64_t guard = 0; p && guard < 50000000; guard++) {
         int descriptor_split = vkx_descriptor_pressure();
-        if (!g_noflush && ((g_flush_draws >= flush_draws_limit() && !g_rp_on) || descriptor_split)) {
+        if (!g_noflush && ((!g_rp_on && split_due()) || descriptor_split)) {
             // Ordinary batching waits for the game to end dynamic rendering,
             // but an NVN pass may legitimately contain thousands of draws.
             // Bound descriptor lifetime directly: attachments use LOAD/STORE,
@@ -1857,7 +1925,7 @@ void mtl_exec(const uint8_t *handle) {
                 // buffer's descriptor pools before its first mesh draw.  The
                 // mesh bridge has just provided a legal split point; submit
                 // the old part before allocating the task/mesh/fragment sets.
-                if (!g_rp_on && g_flush_draws >= flush_draws_limit() && !g_noflush) {   // only at a split point: with the pass still open the next pass end flushes
+                if (!g_rp_on && !g_noflush && split_due()) {   // only at a split point: with the pass still open the next pass end flushes
                     uint64_t ft = g_prof > 0 ? mono_ns() : 0;
                     vkr_flush(); c = g_cb[g_cb_i];
                     if (g_prof > 0) g_opns[64] += mono_ns() - ft;

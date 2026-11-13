@@ -363,8 +363,11 @@ DM_VK_COMPILE_WATCH	switch	`=0` leaves out the compile watcher thread that logs 
 DM_VK_CS_GPU	diagnostic	`=1` timestamps Vulkan compute dispatches in place and logs `[vk-cs-gpu]` lines with frame, shader key, workgroup dimensions and GPU time; no submissions, waits or barriers are added (4,096 samples by default, at most 512 per command buffer)
 DM_VK_CS_GPU_LIMIT	diagnostic	With `DM_VK_CS_GPU=1`, sets the bounded total number of dispatch samples to log (1..65,536; default 4,096)
 DM_VK_FLUSH_AB	diagnostic	`=<frames>` alternates `DM_VK_FLUSH_DRAWS` (even phases) and `DM_VK_FLUSH_DRAWS_B` (odd phases) so one run compares both on the same route
+DM_VK_FLUSH_AHEAD	switch	`=<k>` keeps a mid-submission part growing past `DM_VK_FLUSH_DRAWS` (up to four times it) while k or more submitted parts are unfinished, so a part boundary is spent only on a GPU that may run dry (off by default; Ocarina of Time tier 1: k=2, 16.6 -> 9.8 parts a frame, 80.7% -> 86.4% of frames within 33.3 ms)
+DM_VK_FLUSH_AHEAD_B	diagnostic	With `DM_VK_FLUSH_AB`, the `DM_VK_FLUSH_AHEAD` value in odd phases (default: off)
 DM_VK_FLUSH_DRAWS	diagnostic	`=<n>` draws per mid-submission part on the Linux Vulkan host (default 48): each part is a submission, so the GPU starts while the replay goes on
 DM_VK_FLUSH_DRAWS_B	diagnostic	With `DM_VK_FLUSH_AB`, the draws per part in odd phases (default: no draw-count split)
+DM_VK_PART_GAPS	diagnostic	`1` logs every 300 frames the GPU idle between one frame's parts, split by the unfinished parts at the later submission (none: starved; one; two or more), plus where the starved parts came from (draws, record time, game idle before a submission)
 DM_VK_GPU_HEARTBEAT	diagnostic	`=1` logs `vulkan GPU heartbeat: submitted/done/report-wait` once a second from the GPU-value thread (vk_replay.c), with any shader compile in flight for 2 s or more
 DM_VK_LOG	diagnostic	`=1` logs Vulkan object creation in the Vulkan-on-Metal layer
 DM_VK_SHADER_COMPILE_LOG	diagnostic	`=1` logs the begin and end of every shader compile with key, stage, form, fence value and elapsed time (vk_draw.c); compiles of 1 s or more are logged without it
