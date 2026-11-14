@@ -165,6 +165,14 @@ namespace Ryujinx.Graphics.Shader.Translation
             return Properties.AddLocalMemory(new MemoryDefinition($"gmem_last_{Properties.LocalMemories.Count}", AggregateType.U32, 1, zeroInit: true));
         }
 
+        // nxnative: the start, end and host-address delta of the pool-table
+        // entry the shader's raw read helpers resolved last. One zeroed array
+        // per shader; end zero cannot contain a valid address.
+        public int AddRawEntryCacheMemory()
+        {
+            return Properties.AddLocalMemory(new MemoryDefinition($"gmem_entry_{Properties.LocalMemories.Count}", AggregateType.Array | AggregateType.U32, 6, zeroInit: true));
+        }
+
         private int AddMemoryDefinition(string name, AggregateType type, int arrayLength = 1)
         {
             return Properties.AddLocalMemory(new MemoryDefinition(name, type, arrayLength));

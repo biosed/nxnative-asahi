@@ -76,6 +76,7 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
             private readonly Dictionary<(Instruction, StorageKind), int> _rawLastBindings;
             private readonly Dictionary<(Instruction, StorageKind), int> _rawSameBaseFunctions;
             private readonly HelperFunctionManager _hfm;
+            private int _rawEntryCacheBinding = -1;
             private BasicBlock _rawBlock;
             private Instruction _rawInst;
             private StorageKind _rawStorageKind;
@@ -103,6 +104,19 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
                 }
 
                 return binding;
+            }
+
+            // Read helpers all resolve through the same immutable table. Keep
+            // one cached start/end/delta tuple per invocation instead of one
+            // last-index word per helper kind.
+            public int GetOrAddRawEntryCacheBinding(ResourceManager resourceManager)
+            {
+                if (_rawEntryCacheBinding < 0)
+                {
+                    _rawEntryCacheBinding = resourceManager.AddRawEntryCacheMemory();
+                }
+
+                return _rawEntryCacheBinding;
             }
 
             public bool TryGetRawSameBaseFunctionId(Operation operation, out int functionId)
@@ -728,8 +742,11 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
                         return true;
                     }
 
-                    int lastBinding = gtsContext.GetOrAddRawLastBinding(resourceManager, operation);
-                    return TryGenerateRawSameBaseStorageOp(gtsContext, resourceManager, operation, lastBinding, out functionId);
+                    bool useEntryCache = operation.Inst == Instruction.Load;
+                    int localBinding = useEntryCache
+                        ? gtsContext.GetOrAddRawEntryCacheBinding(resourceManager)
+                        : gtsContext.GetOrAddRawLastBinding(resourceManager, operation);
+                    return TryGenerateRawSameBaseStorageOp(gtsContext, resourceManager, operation, localBinding, useEntryCache, out functionId);
                 }
 
                 gtsContext.SetRawBase(block, operation, baseLo, baseHi, constOffset);
@@ -944,16 +961,34 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
             Operand selected = Local();
             Operand lblFound = Label();
             Operand lblChosen = Label();
+            int lastBinding = -1;
+            int cacheBinding = -1;
 
-            // The entry this helper chose last in this invocation, if it holds the address: a shader reads a structure word after word from one pool, so all but the first access of a run
-            // choose the entry the first one chose (Ocarina of Time's foliage mesh shader 73dc0b90c4082e43, 135 reads, took 10.9 ms of a 683x384 frame). The table's ranges are disjoint
-            // (nvn_mtl.m gmem_map), so the search below would choose the same entry, and the host binds one table for a whole draw or dispatch. The word starts at 0, the empty entry
-            int lastBinding = gtsContext.GetOrAddRawLastBinding(resourceManager, operation);
-            Operand last = context.Load(StorageKind.LocalMemory, lastBinding);
-            Operand lastEntry = context.IMultiply(last, Const(GmemMapEntryWords));
-            Operand lastHolds = context.BitwiseAnd(AtOrBelow(MapWord(lastEntry, 1), MapWord(lastEntry, 0)), Below(MapWord(lastEntry, 3), MapWord(lastEntry, 2)));
-            context.Copy(selected, last);
-            context.BranchIfTrue(lblChosen, lastHolds);
+            Operand CacheWord(int word)
+            {
+                return context.Load(StorageKind.LocalMemory, cacheBinding, Const(word));
+            }
+
+            if (writes)
+            {
+                // Stores and atomics still need the selected entry index for
+                // the current entry-bit write log.
+                lastBinding = gtsContext.GetOrAddRawLastBinding(resourceManager, operation);
+                Operand last = context.Load(StorageKind.LocalMemory, lastBinding);
+                Operand lastEntry = context.IMultiply(last, Const(GmemMapEntryWords));
+                Operand lastHolds = context.BitwiseAnd(AtOrBelow(MapWord(lastEntry, 1), MapWord(lastEntry, 0)), Below(MapWord(lastEntry, 3), MapWord(lastEntry, 2)));
+                context.Copy(selected, last);
+                context.BranchIfTrue(lblChosen, lastHolds);
+            }
+            else
+            {
+                // Loads cache the six range and address-delta words. A hit
+                // reads no map-table word; end zero makes the initial cache
+                // miss every valid address.
+                cacheBinding = gtsContext.GetOrAddRawEntryCacheBinding(resourceManager);
+                Operand cachedHolds = context.BitwiseAnd(AtOrBelow(CacheWord(1), CacheWord(0)), Below(CacheWord(3), CacheWord(2)));
+                context.BranchIfTrue(lblChosen, cachedHolds);
+            }
 
             // The hint of the address's 2 MiB chunk names an entry holding the whole chunk (dmsh_abi.h DMSH_GMEM_HINT_SHIFT). An address too high for the tag searches
             Operand chunk = context.BitwiseOr(context.ShiftLeft(addrHigh, Const(32 - GmemHintShift)), context.ShiftRightU32(addrLow, Const(GmemHintShift)));
@@ -981,14 +1016,33 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
 
             context.Copy(selected, index);
             context.MarkLabel(lblFound);
-            context.Store(StorageKind.LocalMemory, lastBinding, selected);
             Operand found = context.IMultiply(selected, Const(GmemMapEntryWords));
             Operand lblSkip = Label();
-            context.BranchIfFalse(lblSkip, Below(MapWord(found, 3), MapWord(found, 2)));   // an address in no pool: the entry below it ends below it
 
-            // The last entry's range held it, or the hint's or the search's entry does
+            if (writes)
+            {
+                context.Store(StorageKind.LocalMemory, lastBinding, selected);
+                context.BranchIfFalse(lblSkip, Below(MapWord(found, 3), MapWord(found, 2)));   // an address in no pool: the entry below it ends below it
+            }
+            else
+            {
+                // Copy the resolved entry once, so the chosen path and address
+                // calculation use the same words. A miss clears the end pair.
+                for (int word = 0; word < 6; word++)
+                {
+                    context.Store(StorageKind.LocalMemory, cacheBinding, Const(word), MapWord(found, word));
+                }
+
+                context.BranchIfFalse(lblSkip, Below(CacheWord(3), CacheWord(2)));
+            }
+
+            // The cached/last entry held it, or the hint/search chose one.
             context.MarkLabel(lblChosen);
-            found = context.IMultiply(selected, Const(GmemMapEntryWords));
+
+            if (writes)
+            {
+                found = context.IMultiply(selected, Const(GmemMapEntryWords));
+            }
 
             if (writes)
             {
@@ -1003,9 +1057,9 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
 
             // A small integer is read or written in its 32-bit word
             Operand wordLow = isSmall ? context.BitwiseAnd(addrLow, Const(~3)) : addrLow;
-            Operand hostLow = context.IAdd(wordLow, MapWord(found, 4));
+            Operand hostLow = context.IAdd(wordLow, writes ? MapWord(found, 4) : CacheWord(4));
             Operand carry = context.ConditionalSelect(context.ICompareLessUnsigned(hostLow, wordLow), Const(1), Const(0));
-            Operand hostHigh = context.IAdd(context.IAdd(addrHigh, MapWord(found, 5)), carry);
+            Operand hostHigh = context.IAdd(context.IAdd(addrHigh, writes ? MapWord(found, 5) : CacheWord(5)), carry);
 
             Operand resultValue = null;
 
@@ -1068,7 +1122,18 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
             }
 
             context.MarkLabel(lblSkip);
-            context.Store(StorageKind.LocalMemory, lastBinding, Const(0));
+
+            if (writes)
+            {
+                context.Store(StorageKind.LocalMemory, lastBinding, Const(0));
+            }
+            else
+            {
+                // Same-base helpers use a nonzero cached end as their valid
+                // bit, matching the old last-index helper's miss behaviour.
+                context.Store(StorageKind.LocalMemory, cacheBinding, Const(2), Const(0));
+                context.Store(StorageKind.LocalMemory, cacheBinding, Const(3), Const(0));
+            }
 
             bool returnsValue = operation.Dest != null;
 
@@ -1097,12 +1162,14 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
             GtsContext gtsContext,
             ResourceManager resourceManager,
             Operation operation,
-            int lastBinding,
+            int localBinding,
+            bool useEntryCache,
             out int functionId)
         {
             functionId = 0;
+            int mapBinding = 0;
 
-            if (!resourceManager.TryGetStorageBufferBinding(GmemMapCbSlot, 0, write: false, out int mapBinding, restrict: true))
+            if (!useEntryCache && !resourceManager.TryGetStorageBufferBinding(GmemMapCbSlot, 0, write: false, out mapBinding, restrict: true))
             {
                 return false;
             }
@@ -1115,20 +1182,43 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
             Operand addrLow = Argument(0);
             Operand addrHigh = Argument(1);
 
-            Operand MapWord(Operand entry, int word)
+            Operand LocalWord(int word)
             {
-                return context.Load(StorageKind.StorageBuffer, mapBinding, Const(0), context.IAdd(entry, Const(word)));
+                return context.Load(StorageKind.LocalMemory, localBinding, Const(word));
             }
 
-            Operand last = context.Load(StorageKind.LocalMemory, lastBinding);
             Operand lblSkip = Label();
-            context.BranchIfFalse(lblSkip, context.ICompareNotEqual(last, Const(0)));
+            Operand deltaLow;
+            Operand deltaHigh;
 
-            Operand found = context.IMultiply(last, Const(GmemMapEntryWords));
+            if (useEntryCache)
+            {
+                // MatchesRawBase proves this is another word of the same
+                // bounded structure. The full helper cleared the end pair on
+                // a miss, so only a valid cache is needed here; repeating the
+                // complete 64-bit range test adds pressure at every word.
+                Operand cacheValid = context.BitwiseOr(
+                    context.ICompareNotEqual(LocalWord(2), Const(0)),
+                    context.ICompareNotEqual(LocalWord(3), Const(0)));
+                context.BranchIfFalse(lblSkip, cacheValid);
+                deltaLow = LocalWord(4);
+                deltaHigh = LocalWord(5);
+            }
+            else
+            {
+                // Stores retain the selected-entry index because the write log
+                // records entry bits and the cache deliberately holds no index.
+                Operand last = context.Load(StorageKind.LocalMemory, localBinding);
+                context.BranchIfFalse(lblSkip, context.ICompareNotEqual(last, Const(0)));
+                Operand found = context.IMultiply(last, Const(GmemMapEntryWords));
+                deltaLow = context.Load(StorageKind.StorageBuffer, mapBinding, Const(0), context.IAdd(found, Const(4)));
+                deltaHigh = context.Load(StorageKind.StorageBuffer, mapBinding, Const(0), context.IAdd(found, Const(5)));
+            }
+
             Operand wordLow = isSmall ? context.BitwiseAnd(addrLow, Const(~3)) : addrLow;
-            Operand hostLow = context.IAdd(wordLow, MapWord(found, 4));
+            Operand hostLow = context.IAdd(wordLow, deltaLow);
             Operand carry = context.ConditionalSelect(context.ICompareLessUnsigned(hostLow, wordLow), Const(1), Const(0));
-            Operand hostHigh = context.IAdd(context.IAdd(addrHigh, MapWord(found, 5)), carry);
+            Operand hostHigh = context.IAdd(context.IAdd(addrHigh, deltaHigh), carry);
 
             Operand resultValue = null;
 
