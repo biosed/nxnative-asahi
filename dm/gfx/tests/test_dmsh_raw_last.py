@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Raw global memory lookups that start from the entry they chose last (GlobalToStorage.TryGenerateRawStorageOp): through the offline translator (dmsh_xlate, arch sm86), a compute shader's two loads
-through an address it cannot trace share one zero-initialized word, the helper tries that entry before the hint and the search and records a new choice; and on this Mac's GPU the translated helper reads
+"""Raw global memory lookups that start from the entry range they resolved last (GlobalToStorage.TryGenerateRawStorageOp): through the offline translator (dmsh_xlate, arch sm86), a compute shader's loads
+through an address it cannot trace share one zero-initialized six-word start/end/delta cache, the helper tries that range before the hint and search and records a new choice; and on this Mac's GPU the translated helper reads
 what the pool table names on a run of addresses that hit, leave and come back to pools: adjacent pools, a gap, an address above 4 GiB, a hinted chunk, one lookup after another in each lane.
 Needs DMSH_TEST_XLATE (the translator) like the other translator tests."""
 import ast
@@ -25,8 +25,8 @@ exec(compile(ast.Module(body=[n for n in tree.body if isinstance(n, ast.Assign) 
 MAC_METAL = scope['MAC_METAL']
 
 LDG = (0x000ea200081e890f, 0x0000000405067981)   # LDG.E R6, [R5.64 + UR4]: R5 the thread index, an address the translator traces to no storage buffer
-LDG128 = (LDG[0] | (3 << 9), (LDG[1] & ~0xff0000) | (8 << 16))   # LDG.E.128 R8, [R5.64 + UR4]: four consecutive words from the same 64-bit base in one basic block
-HELPER = re.compile(r'(?m)^int (_\d+)\(thread const int& _\d+, thread const int& _\d+, const device (_\d+)& \w+, thread uint& (_\d+)\)\n\{\n')
+LDG128 = ((LDG[0] & ~(7 << 9)) | (6 << 9), (LDG[1] & ~0xff0000) | (8 << 16))  # LDG.E.128 R8, [R5.64 + UR4]: four consecutive words
+HELPER = re.compile(r'(?m)^int (_\d+)\(thread const int& _\d+, thread const int& _\d+, const device (_\d+)& \w+, thread array<uint, 6>& (_\d+)\)\n\{\n')
 
 # The pool table as the host writes it (nvn_mtl.m gmem_map, dmsh_abi.h DMSH_GMEM_MAP_*): 8,192 entries of 8 words {start lo, start hi, end lo, end hi, delta lo, delta hi, hint, 0}, sorted by start,
 # entry 0 empty, unused entries starting at ~0. Pools A and B are adjacent, C lies past a gap and above 4 GiB, and its 2 MiB chunk has a hint naming it (the only pool there; the gap after it is in
@@ -93,23 +93,25 @@ class RawLast(Translated):
         return self.translate(b''.join(inst(*waiting(i)) for i in code) + inst(*EXIT), shared=0x1000)
 
     @unittest.skipUnless(shutil.which('spirv-dis'), 'needs spirv-dis')
-    def test_two_guarded_loads_share_one_private_entry_word_in_spirv(self):
+    def test_two_guarded_loads_share_one_private_entry_cache_in_spirv(self):
         dis = self.spv_dis((s2r_tid(9), s2r_tid(5), LDG, STORE, (LDG[0], LDG[1] | 4 << 40), STORE))
         map_id = re.search(r'OpName (%\w+) "cp_s0"', dis)
         self.assertIsNotNone(map_id, dis[:3000])
         self.assertIn(f'OpDecorate {map_id.group(1)} NonWritable', dis)
         self.assertIn(f'OpDecorate {map_id.group(1)} Restrict', dis)
         self.assertEqual(len(re.findall(r'OpVariable \S+ Private %\w+', dis)), 1, dis[1500:3500])
+        self.assertEqual(len(re.findall(r'OpTypeArray %uint %uint_6\b', dis)), 1, dis[1500:3500])
         main = dis[dis.index(' = OpFunction %void None'):]
         calls = re.findall(r'OpFunctionCall %int (%\w+)', main)
         self.assertEqual(len(calls), 2)
         self.assertEqual(calls[0], calls[1])
 
     @unittest.skipUnless(shutil.which('spirv-dis'), 'needs spirv-dis')
-    def test_same_base_words_reuse_resolved_entry_without_repeating_search(self):
+    def test_same_base_words_use_cached_fast_helper(self):
         stores = tuple((STORE[0], (STORE[1] & ~0xff000000) | (r << 24) | (off << 40)) for r, off in ((8, 0), (9, 4), (10, 16), (11, 20)))
         dis = self.spv_dis((s2r_tid(9), s2r_tid(5), LDG128, *stores))
         self.assertEqual(len(re.findall(r'OpVariable \S+ Private %\w+', dis)), 1, dis[1500:3500])
+        self.assertEqual(len(re.findall(r'OpTypeArray %uint %uint_6\b', dis)), 1, dis[1500:3500])
         main = dis[dis.index(' = OpFunction %void None'):]
         calls = re.findall(r'OpFunctionCall %int (%\w+)', main)
         self.assertEqual(len(calls), 4)
@@ -120,21 +122,22 @@ class RawLast(Translated):
         self.assertIn('%int_21', funcs[calls[0]])
         self.assertNotIn('OpLoopMerge', funcs[calls[1]])
         self.assertNotIn('%int_21', funcs[calls[1]])
+        self.assertGreaterEqual(funcs[calls[1]].count('OpAccessChain %_ptr_Private_uint'), 4)
 
     @unittest.skipUnless(sys.platform == 'darwin', 'needs macOS spirv-cross')
-    def test_two_loads_share_one_zeroed_word(self):
+    def test_two_loads_share_one_zeroed_cache(self):
         msl = self.msl()
         m = HELPER.search(msl)
         self.assertTrue(m, msl[:3000])
         name, last = m.group(1), m.group(3)
         main = msl[msl.index('kernel void main0'):]
-        word = re.search(r'(?m)^    uint (_\d+) = 0u;$', main)
-        self.assertTrue(word, main[:600])
+        cache = re.search(r'(?m)^    array<uint, 6> (_\d+) = \{\};$', main)
+        self.assertTrue(cache, main[:600])
         calls = re.findall(name + r'\([^;]*, (_\d+)\);', main)
-        self.assertEqual(calls, [word.group(1)] * 2)
+        self.assertEqual(calls, [cache.group(1)] * 2)
         helper = msl[m.end():msl.index('\n}\n', m.end())]
-        self.assertLess(helper.index(last), helper.index('>> uint(21)'))   # the last entry first, then the 2 MiB chunk's hint
-        self.assertRegex(helper, re.escape(last) + r' = uint\(_\d+\);')   # a hint or search records its choice
+        self.assertLess(helper.index(last), helper.index('>> uint(21)'))   # the cached range first, then the 2 MiB chunk's hint
+        self.assertRegex(helper, re.escape(last) + r'\[\d+\] = uint\(_\d+\);')   # a hint or search refills it
 
     @unittest.skipUnless(shutil.which('xcrun') and sys.platform == 'darwin', 'needs Metal')
     def test_reads_on_gpu(self):
@@ -142,7 +145,7 @@ class RawLast(Translated):
         m = HELPER.search(msl)
         kernel = (msl[:msl.index('kernel void main0')] +
                   f'kernel void k(const device {m.group(2)}& map [[buffer(0)]], const device uint2* addr [[buffer(1)]], device int* out [[buffer(2)]], uint id [[thread_position_in_grid]])\n'
-                  '{\n    uint last = 0u;\n    for (int s = 0; s < 16; s++)\n    {\n        int lo = int(addr[id * 16 + s].x), hi = int(addr[id * 16 + s].y);\n'
+                  '{\n    array<uint, 6> last = {};\n    for (int s = 0; s < 16; s++)\n    {\n        int lo = int(addr[id * 16 + s].x), hi = int(addr[id * 16 + s].y);\n'
                   f'        out[id * 16 + s] = {m.group(1)}(lo, hi, map, last);\n    }}\n}}\n')
         with tempfile.TemporaryDirectory() as w:
             w = Path(w)
