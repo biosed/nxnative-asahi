@@ -47,6 +47,10 @@ Measured on an M6 Mac with 16 GB, headless, on one walk with camera turns (`walk
 - With a window, the first start on a new chain runs the pipeline prebuild first: 33,190 shader pairs, 691 s on this Mac. A run with no window skips it.
 - The opening movie runs at the movie's own 24 fps pace during the story section and cannot be skipped: about 8 minutes on a new file.
 
+## Dynamic resolution
+
+- The controller (`v131072`, found by fingerprint in [`patches.py`](patches.py)) reads GPU load at `main+0x805aa0` and selects a scale level at `main+0x8065e0` (`0..9` from `0.75` down to `0.333` of output). Because Apple GPU cost is dominated by mesh/compute rather than pixel count, the game's pixel-extrapolation model kept resolution stuck at its `683x384` floor. With `DM_DYNAMIC_RESOLUTION=0` (the default, state `+0x40`), the stub returns level `0` (full resolution); with `DM_DYNAMIC_RESOLUTION=1`, it climbs or steps down using the load measured at each level.
+
 ## Memory
 
 - Current: on the walk, run from an external drive with a 3.5 GB pipeline archive: resident 10.9-11.4 GB, wired about 9.4 GB, on a 16 GB Mac. `vmmap` and `footprint`: 6.4 GB of guest memory and 3.8 GB of Metal textures and targets, 1 GB of IOAccelerator memory. [Reading the archive into memory](../../../docs/reference/memory.md#a-pipeline-archive-on-an-external-drive-is-read-into-memory) used to add 3.5 GB (footprint 15.0, peak 16.7). `mem_map_limit on`: a map past the application pool fails as on Horizon, and the SDK's allocator then gives back the pages it keeps. Other apps' memory adds to the swap: other games running beside it can push the Mac over.
