@@ -1042,6 +1042,10 @@ typedef struct { VkDescriptorPool p[256]; VkDescriptorSet *set[256]; uint16_t us
 typedef struct { uint64_t h; VkDescriptorSet set; } setc_ent;
 static setc_ent g_setc[CB_RING][SETC]; static uint64_t g_setc_hit, g_setc_miss;
 static pool_chain g_pools[CB_RING][NST]; static int g_pool_slot = -1; static uint32_t g_sub_sets;
+// A command buffer starts with undefined dynamic state.  Incremented for each
+// vkx_sub_begin so set_state's exact-state memo never survives a reset/reuse of
+// the same ring handle.
+static uint64_t g_cmd_gen;
 static void gmem_log_poll(uint64_t done);
 static void pool_discard(VkDescriptorPool p, VkDescriptorSet *sets) {
     free(sets);
@@ -1086,6 +1090,7 @@ static VkDescriptorPool pool_new(int st, VkDescriptorSet **sets_out) {
 static void arena_reset(int slot);
 void vkx_sub_begin(int slot, VkCommandBuffer c, uint64_t done) {
     if (!draw_init()) return;
+    g_cmd_gen++;
     gmem_log_poll(done);   // before a completed slot's mapped arena is reused
     res_init(c);
     bindless_feedback_scan(slot);
@@ -1335,8 +1340,8 @@ static int buf_desc(uint64_t addr, uint64_t size, uint64_t align, uint64_t maxr,
     return 1;
 }
 // The descriptor set of one stage's shader for the draw now: 0 when nothing could be allocated
-static uint64_t g_prof_ns[8];   // DM_VK_PROF: shaders + sets, state, vertex input, the draw call; set writes listed, sets allocated + written, set cache hits, misses (counts)
-void vkx_prof_take(uint64_t out[8]) { memcpy(out, g_prof_ns, sizeof g_prof_ns); memset(g_prof_ns, 0, sizeof g_prof_ns); }
+static uint64_t g_prof_ns[10];   // DM_VK_PROF: shader/set, state, vertex and call times; set write/make/hit/miss and state emit/dedup counts
+void vkx_prof_take(uint64_t out[10]) { memcpy(out, g_prof_ns, sizeof g_prof_ns); memset(g_prof_ns, 0, sizeof g_prof_ns); }
 static int g_dprof = -1;
 static uint64_t mix64(uint64_t h, uint64_t v) { h ^= v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2); h *= 0xff51afd7ed558ccdull; return h ^ (h >> 33); }
 static VkDescriptorSet stage_set(int st, vks *s) {
@@ -1931,7 +1936,7 @@ void vkx_queue_select(uint64_t serial) {
     if (i == VKX_NQ) {
         for (i = 0; i < VKX_NQ && g_qslot[i].used; i++) {}
         if (i == VKX_NQ) { static int w; if (!w++) LOG("[RED] vulkan draws: more than %d NVN queues live at once: queue %llu shares the last slot's state", VKX_NQ, (unsigned long long)serial); i = VKX_NQ - 1; }
-        else { g_qslot[i] = (typeof(g_qslot[0])){serial, 1}; memset(&g_bind[i], 0, sizeof g_bind[i]); g_dyn[i] = (vkx_dyn_st)VKX_DYN_INIT; if (++g_qn == 2) LOG("vulkan draws: a second NVN queue (%llu): per-queue bound state from here on", (unsigned long long)serial); }
+        else { static const vkx_dyn_st dyn_init_val = VKX_DYN_INIT; g_qslot[i] = (typeof(g_qslot[0])){serial, 1}; memset(&g_bind[i], 0, sizeof g_bind[i]); memcpy(&g_dyn[i], &dyn_init_val, sizeof g_dyn[i]); if (++g_qn == 2) LOG("vulkan draws: a second NVN queue (%llu): per-queue bound state from here on", (unsigned long long)serial); }
     }
     g_bindp = &g_bind[i]; g_dynp = &g_dyn[i];
 }
@@ -2037,6 +2042,43 @@ static int quad_ib(void) {
 }
 // Everything a draw needs set, then the draw (inside the render pass vk_replay.c began). ncolor / rt_h: the render pass's colour attachments and height
 static void set_state(VkCommandBuffer c, int ncolor, uint32_t rt_w, uint32_t rt_h, VkPrimitiveTopology tp, int samples) {
+    // Shader-object graphics state is dynamic and persists until another
+    // command changes it.  Dense scenes commonly repeat the exact same state
+    // for hundreds of draws; emitting the whole block below for every one was
+    // several milliseconds of replay-thread work a frame on the BC-250.
+    //
+    // Compare the complete producer state, not a selected subset.  Target
+    // dimensions affect default viewport/scissor, topology and samples are
+    // call arguments, and the linked fragment shader's output map affects the
+    // write masks.  Any change therefore records the full block again.  The
+    // command generation is advanced at vkx_sub_begin, because resetting a
+    // command buffer also resets all of its dynamic state.
+    typedef struct {
+        vkx_dyn_st dyn;
+        uint32_t frag_out_map, rt_w, rt_h;
+        int ncolor, samples;
+        VkPrimitiveTopology topology;
+    } state_key;
+    static struct { uint64_t gen; VkCommandBuffer command; state_key key; } last;
+    static int dedup = -1;
+    if (dedup < 0) {
+        const char *e = getenv("DM_VK_STATE_DEDUP");
+        dedup = !e || atoi(e) != 0;   // diagnostic A/B: 0 records every block
+    }
+    state_key key;
+    memset(&key, 0, sizeof key);
+    memcpy(&key.dyn, &D, sizeof key.dyn);
+    key.frag_out_map = S.frag_out_map;
+    key.rt_w = rt_w; key.rt_h = rt_h; key.ncolor = ncolor;
+    key.samples = samples; key.topology = tp;
+    if (dedup && last.gen == g_cmd_gen && last.command == c &&
+        !memcmp(&last.key, &key, sizeof key)) {
+        if (g_dprof > 0) g_prof_ns[9]++;
+        return;
+    }
+    if (dedup) { last.gen = g_cmd_gen; last.command = c; memcpy(&last.key, &key, sizeof key); }
+    if (g_dprof > 0) g_prof_ns[8]++;
+
     VkViewport vp[16]; int nvp = D.nvp ? D.nvp : 1;
     for (int i = 0; i < nvp; i++) {
         float x = D.nvp ? D.vp[i][0] : 0, y = D.nvp ? D.vp[i][1] : 0, w = D.nvp ? D.vp[i][2] : (float)rt_w, h = D.nvp ? D.vp[i][3] : (float)rt_h;

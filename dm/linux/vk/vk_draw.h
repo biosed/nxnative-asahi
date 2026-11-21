@@ -133,7 +133,7 @@ void vkx_depth_clamp(int on); void vkx_prim_restart(int on); void vkx_rast_disca
 int vkr_ub_shadow(uint64_t addr, uint64_t size, VkBuffer *b, VkDeviceSize *off);   // vk_replay.c: a uniform binding over updates deferred in the pass: 1 and a shadow
 int vkx_scissor_get(int r[4]);   // the scissor rectangle; 0 when none was set
 uint32_t vkx_chmask(void);
-void vkx_prof_take(uint64_t out[8]);   // DM_VK_PROF: the draws' time by part since the last take       // the channel write mask, 4 bits per colour slot
+void vkx_prof_take(uint64_t out[10]);  // DM_VK_PROF: draw-part times/counts since the last take
 int vkx_origin_ll(void);   // the window origin is lower-left (the presented image is bottom-up)
 void vkx_vattr(const p_bind_vattr *a); void vkx_vstream(const p_bind_vstream *s); void vkx_vbuf(const p_bind_vbuf *b);
 // Per-queue bound state (vk_draw.c): select the queue about to submit (mtl_queue_activate), drop a finalized one (mtl_queue_forget)

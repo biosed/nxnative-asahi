@@ -1144,9 +1144,9 @@ static void prof_log(void) {
     double nf = (double)(f - g_prof_f0), tot = 0; char b[700]; int o = 0; int idx[66]; for (int i = 0; i < 66; i++) { idx[i] = i; tot += g_opns[i]; }
     for (int i = 0; i < 66; i++) for (int j = i + 1; j < 66; j++) if (g_opns[idx[j]] > g_opns[idx[i]]) { int t = idx[i]; idx[i] = idx[j]; idx[j] = t; }
     for (int i = 0; i < 12 && g_opns[idx[i]] && o < (int)sizeof b - 32; i++) o += snprintf(b + o, sizeof b - o, " %d:%.2f", idx[i], g_opns[idx[i]] / 1e6 / nf);
-    uint64_t dp[8]; vkx_prof_take(dp);
-    LOG("vulkan replay profile, %.0f frames: %.2f ms a frame; by record (ms a frame):%s; draws: shaders + sets %.2f (set writes listed %.2f, sets made %.2f; %.0f cache hits, %.0f misses a frame), state %.2f, vertex %.2f, call %.2f",
-        nf, tot / 1e6 / nf, b, dp[0] / 1e6 / nf, dp[4] / 1e6 / nf, dp[5] / 1e6 / nf, dp[6] / nf, dp[7] / nf, dp[1] / 1e6 / nf, dp[2] / 1e6 / nf, dp[3] / 1e6 / nf);
+    uint64_t dp[10]; vkx_prof_take(dp);
+    LOG("vulkan replay profile, %.0f frames: %.2f ms a frame; by record (ms a frame):%s; draws: shaders + sets %.2f (set writes listed %.2f, sets made %.2f; %.0f cache hits, %.0f misses a frame), state %.2f (%.0f blocks emitted, %.0f deduped a frame), vertex %.2f, call %.2f",
+        nf, tot / 1e6 / nf, b, dp[0] / 1e6 / nf, dp[4] / 1e6 / nf, dp[5] / 1e6 / nf, dp[6] / nf, dp[7] / nf, dp[1] / 1e6 / nf, dp[8] / nf, dp[9] / nf, dp[2] / 1e6 / nf, dp[3] / 1e6 / nf);
     memset(g_opns, 0, sizeof g_opns); g_prof_f0 = f;
 }
 static void vkr_flush(void) { uint64_t t0 = g_prof > 0 ? mono_ns() : 0; sub_submit(); uint64_t t1 = g_prof > 0 ? mono_ns() : 0; g_flushes++; sub_open(); if (g_prof > 0) { g_opns[60] += t1 - t0; g_opns[61] += mono_ns() - t1; } }   // DM_VK_PROF: 60 the submit, 61 the next part's start
