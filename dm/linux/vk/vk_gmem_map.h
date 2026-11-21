@@ -28,8 +28,13 @@ static inline int vkx_gmem_map_pack(void *dst, size_t size,
     for (int i = 0; i < n && out < DMSH_GMEM_MAP_ENTRIES - 1; i++) {
         uint64_t l = lo[i] > end ? lo[i] : end, h = hi[i];
         if (l >= h) continue;
+        uint8_t *entry = d + (size_t)(++out) * DMSH_GMEM_MAP_ENTRY;
         uint64_t e[3] = {l, h, gpu[i] - lo[i]};
-        memcpy(d + (size_t)(++out) * DMSH_GMEM_MAP_ENTRY, e, sizeof e);
+        memcpy(entry, e, sizeof e);
+        if (h - l <= UINT32_MAX && (l >> 32) == ((h - 1) >> 32)) {
+            uint32_t span = (uint32_t)(h - l);
+            memcpy(entry + 28, &span, sizeof span);
+        }
         end = h;
     }
     const uint64_t chunk_size = 1ull << DMSH_GMEM_HINT_SHIFT;

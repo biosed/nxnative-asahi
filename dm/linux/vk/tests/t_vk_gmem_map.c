@@ -92,6 +92,26 @@ int main(void) {
           entry == 2 && hinted == 1 && host == o_gpu[1] + 2 * chunk_sz + 0x10ull,
           "clipped overlapping segment preserves original GPU-minus-guest delta");
 
+    uint32_t span0 = 0, span1 = 0, span2 = 0, span3 = 0;
+    memcpy(&span0, map + 28, sizeof span0);
+    memcpy(&span1, map + 1 * DMSH_GMEM_MAP_ENTRY + 28, sizeof span1);
+    memcpy(&span2, map + 2 * DMSH_GMEM_MAP_ENTRY + 28, sizeof span2);
+    check(span0 == 0u && span1 == (uint32_t)(2 * chunk_sz) && span2 == (uint32_t)(2 * chunk_sz),
+          "word 7 records clipped 32-bit byte span for entries within one 4 GiB window");
+
+    // 4 GiB boundary checks for word 7 (span): ending at 4 GiB stays nonzero;
+    // straddling 4 GiB or spanning >= 4 GiB must pack span == 0.
+    const uint64_t b_lo[3] = {0x0fff00000ull, 0x1ffff0000ull, 0x300000000ull};
+    const uint64_t b_hi[3] = {0x100000000ull, 0x200010000ull, 0x400000000ull};
+    const uint64_t b_gpu[3] = {0x700000000ull, 0x800000000ull, 0x900000000ull};
+    check(vkx_gmem_map_pack(map, sizeof map, b_lo, b_hi, b_gpu, 3) == 3,
+          "4 GiB boundary test segments pack into three entries");
+    memcpy(&span1, map + 1 * DMSH_GMEM_MAP_ENTRY + 28, sizeof span1);
+    memcpy(&span2, map + 2 * DMSH_GMEM_MAP_ENTRY + 28, sizeof span2);
+    memcpy(&span3, map + 3 * DMSH_GMEM_MAP_ENTRY + 28, sizeof span3);
+    check(span1 == 0x00100000u && span2 == 0u && span3 == 0u,
+          "word 7 zeroes span when crossing or reaching 4 GiB");
+
     printf("t_vk_gmem_map: %s (%d failures)\n", bad ? "FAILED" : "passed", bad);
     return bad != 0;
 }

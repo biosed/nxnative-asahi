@@ -28,14 +28,14 @@ LDG = (0x000ea200081e890f, 0x0000000405067981)   # LDG.E R6, [R5.64 + UR4]: R5 t
 LDG128 = (LDG[0] | (3 << 9), (LDG[1] & ~0xff0000) | (8 << 16))   # LDG.E.128 R8, [R5.64 + UR4]: four consecutive words from the same 64-bit base in one basic block
 HELPER = re.compile(r'(?m)^int (_\d+)\(thread const int& _\d+, thread const int& _\d+, const device (_\d+)& \w+, thread uint& (_\d+)\)\n\{\n')
 
-# The pool table as the host writes it (nvn_mtl.m gmem_map, dmsh_abi.h DMSH_GMEM_MAP_*): 8,192 entries of 8 words {start lo, start hi, end lo, end hi, delta lo, delta hi, hint, 0}, sorted by start,
+# The pool table as the host writes it (nvn_mtl.m gmem_map, dmsh_abi.h DMSH_GMEM_MAP_*): 8,192 entries of 8 words {start lo, start hi, end lo, end hi, delta lo, delta hi, hint, span}, sorted by start,
 # entry 0 empty, unused entries starting at ~0. Pools A and B are adjacent, C lies past a gap and above 4 GiB, and its 2 MiB chunk has a hint naming it (the only pool there; the gap after it is in
 # the chunk too, so the hint's entry does not hold that address)
 RUNNER = '''#import <Metal/Metal.h>
 #include <stdio.h>
 #include <string.h>
-enum { POOLS = 3, WORDS = 1024, LANES = 64, STEPS = 16 };
-static const uint64_t GUEST[POOLS] = {0x10000000ull, 0x10001000ull, 0x200040000ull};
+enum { POOLS = 4, WORDS = 1024, LANES = 64, STEPS = 20 };
+static const uint64_t GUEST[POOLS] = {0x10000000ull, 0x10001000ull, 0x200040000ull, 0x3fffff800ull};
 static uint32_t value(int p, uint64_t off) { return (uint32_t)(p + 1) << 24 | (uint32_t)(off / 4); }
 static int expect(uint64_t a, int64_t *pool) { for (int p = 0; p < POOLS; p++) if (a >= GUEST[p] && a < GUEST[p] + WORDS * 4) { *pool = p; return (int)value(p, a - GUEST[p]); } *pool = -1; return 0; }
 int main(int ac, char **av) { @autoreleasepool {
@@ -47,10 +47,11 @@ int main(int ac, char **av) { @autoreleasepool {
     for (int p = 0; p < POOLS; p++) {
         pool[p] = [d newBufferWithLength:WORDS * 4 options:MTLResourceStorageModeShared]; uint32_t *w = pool[p].contents; for (int i = 0; i < WORDS; i++) w[i] = value(p, i * 4);
         uint64_t s = GUEST[p], end = s + WORDS * 4, delta = pool[p].gpuAddress - s, *ent = (uint64_t *)(t + (p + 1) * 8); ent[0] = s; ent[1] = end; ent[2] = delta;
+        if ((s >> 32) == ((end - 1) >> 32)) t[(p + 1) * 8 + 7] = WORDS * 4;
     }
     uint32_t chunk = (uint32_t)(GUEST[2] >> 32) << 11 | (uint32_t)GUEST[2] >> 21; t[(chunk & 8191) * 8 + 6] = 3 | chunk << 13;   // C's chunk: entry 3
-    // each lane: a word walk in A, B right after A, back to A, a gap, C above 4 GiB (through the hint), the gap after C in its chunk, C again, B, entry 0's range, A
-    static const int64_t SEQ[STEPS][2] = {{0, 0}, {0, 4}, {0, 8}, {1, 0}, {1, 4}, {0, 12}, {-1, 0x10002000}, {2, 0}, {2, 4}, {-1, 0x200041000}, {2, 8}, {1, 8}, {-1, 0}, {-1, 0xfff}, {0, 16}, {0, 20}};
+    // D straddles a 4 GiB boundary, so its repeated loads must use the full range. Also try the same low word as A in a different window.
+    static const int64_t SEQ[STEPS][2] = {{0, 0}, {0, 4}, {0, 8}, {1, 0}, {1, 4}, {0, 12}, {-1, 0x10002000}, {2, 0}, {2, 4}, {-1, 0x200041000}, {2, 8}, {1, 8}, {-1, 0}, {-1, 0xfff}, {0, 16}, {0, 20}, {-1, 0x110000000}, {3, 0}, {3, 0x800}, {-1, 0x400000800}};
     id<MTLBuffer> addr = [d newBufferWithLength:LANES * STEPS * 8 options:MTLResourceStorageModeShared], out = [d newBufferWithLength:LANES * STEPS * 4 options:MTLResourceStorageModeShared];
     uint64_t *a = addr.contents; int want[LANES * STEPS];
     for (int lane = 0; lane < LANES; lane++) for (int s = 0; s < STEPS; s++) {
@@ -104,6 +105,10 @@ class RawLast(Translated):
         calls = re.findall(r'OpFunctionCall %int (%\w+)', main)
         self.assertEqual(len(calls), 2)
         self.assertEqual(calls[0], calls[1])
+        helper = re.search(rf'{re.escape(calls[0])} = OpFunction %int None .*?OpFunctionEnd', dis, re.S).group(0)
+        self.assertRegex(helper, r'OpIAdd %int %\w+ %int_7\b')
+        self.assertIn('OpISub %int', helper)
+        self.assertIn('OpULessThan %bool', helper)
 
     @unittest.skipUnless(shutil.which('spirv-dis'), 'needs spirv-dis')
     def test_same_base_words_reuse_resolved_entry_without_repeating_search(self):
@@ -142,8 +147,8 @@ class RawLast(Translated):
         m = HELPER.search(msl)
         kernel = (msl[:msl.index('kernel void main0')] +
                   f'kernel void k(const device {m.group(2)}& map [[buffer(0)]], const device uint2* addr [[buffer(1)]], device int* out [[buffer(2)]], uint id [[thread_position_in_grid]])\n'
-                  '{\n    uint last = 0u;\n    for (int s = 0; s < 16; s++)\n    {\n        int lo = int(addr[id * 16 + s].x), hi = int(addr[id * 16 + s].y);\n'
-                  f'        out[id * 16 + s] = {m.group(1)}(lo, hi, map, last);\n    }}\n}}\n')
+                  '{\n    uint last = 0u;\n    for (int s = 0; s < 20; s++)\n    {\n        int lo = int(addr[id * 20 + s].x), hi = int(addr[id * 20 + s].y);\n'
+                  f'        out[id * 20 + s] = {m.group(1)}(lo, hi, map, last);\n    }}\n}}\n')
         with tempfile.TemporaryDirectory() as w:
             w = Path(w)
             (w / 'k.metal').write_text(kernel)
@@ -153,7 +158,7 @@ class RawLast(Translated):
             (w / 'r.m').write_text(RUNNER)
             subprocess.run(['clang', '-fobjc-arc', '-framework', 'Metal', '-framework', 'Foundation', str(w / 'r.m'), '-o', str(w / 'r')], check=True, capture_output=True)
             out = subprocess.run([str(w / 'r'), str(w / 'k.metallib')], capture_output=True, text=True)
-            self.assertIn('bad 0 of 1024', out.stdout, out.stdout + out.stderr)
+            self.assertIn('bad 0 of 1280', out.stdout, out.stdout + out.stderr)
 
 
 if __name__ == '__main__':
