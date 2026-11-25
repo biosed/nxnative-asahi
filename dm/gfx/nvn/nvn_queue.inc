@@ -323,7 +323,8 @@ static void *nq_worker(void *unused) {
                     nq_event_write *queued = predecessor > nq_completed ? nq_event_write_of(n->event) : NULL;
                     if (queued && queued->exact && nq_predicate(queued->value, n->mode, n->value)) {
                         if (batch.nitem) { batch_boundary = 1; break; }
-                        n->event = NULL; n->wait_fence = predecessor; nq_stat(NVN_QUEUE_STAT_EXACT_QUEUED_RELEASES); break;
+                        // The writer's fence goes with the wait (q->physical below): a fence right behind it waits for the writer.
+                        n->event = NULL; n->wait_fence = queued->fence; nq_stat(NVN_QUEUE_STAT_EXACT_QUEUED_RELEASES); break;
                     }
                     if (predecessor > nq_completed || !nq_predicate(atomic_load_explicit((_Atomic uint32_t *)n->event, memory_order_acquire), n->mode, n->value)) {
                         n->waiting = 1; if (!n->parked_at) n->parked_at = now_ns(); mapped_event_wait = 1; continue;

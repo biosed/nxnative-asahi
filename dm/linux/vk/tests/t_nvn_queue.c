@@ -288,6 +288,25 @@ int main(int argc, char **argv) {
     complete_to(atomic_load(&fake_fence));
     CHECK(event == 1 && write_fence != 0, "queued WRITE publishes on completion");
 
+    // A fence recorded directly behind a wait on an in-flight exact WRITE
+    // (with no commands between them) carries the writer's fence, not the
+    // consumer queue's earlier completed fence (PR #3276).
+    event = 0; commits = atomic_load(&fake_commits);
+    recording write_only = {0}, wait_fence = {0}; sync_t behind_wait = {0};
+    record_signal(&write_only, &event, 0, 2); record_end(&write_only); submit(&producer, &write_only);
+    CHECK(wait_at_least(&fake_commits, commits + 1, 1000000000ull), "in-flight WRITE producer for bare fence encodes");
+    uint64_t inflight_write_fence = atomic_load(&fake_fence);
+    record_wait(&wait_fence, &event, 0, 2); record_fence(&wait_fence, &behind_wait); record_end(&wait_fence); submit(&consumer, &wait_fence);
+    uint64_t behind_val = 0;
+    uint64_t t_start = now_ns(); int behind_pub = 0;
+    while (now_ns() - t_start < 1000000000ull) {
+        pthread_mutex_lock(&nq_mu); behind_pub = nq_sync_encoded(&behind_wait, &behind_val); pthread_mutex_unlock(&nq_mu);
+        if (behind_pub) break;
+        struct timespec pause_ns = {0, 1000000}; nanosleep(&pause_ns, NULL);
+    }
+    CHECK(behind_pub && behind_val >= inflight_write_fence, "fence directly behind exact queued WRITE wait carries writer's fence");
+    complete_to(atomic_load(&fake_fence)); nvn_sync_release(&behind_wait);
+
     event = 0; commits = atomic_load(&fake_commits); markers = atomic_load(&marker_count);
     recording add = {0}, add_wait = {0};
     record_signal(&add, &event, 1, 1); record_end(&add); submit(&producer, &add);
