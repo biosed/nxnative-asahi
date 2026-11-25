@@ -17,16 +17,44 @@
 #include "nvn_protos.h"
 #include "nvn_mtl.h"
 #include "nvn_dirty.h"
+#include "../vk_tex_lifetime.h"
 
 #define mtl_tex_cpu_written null_mtl_tex_cpu_written
+#define mtl_tex_init null_mtl_tex_init
+#define mtl_tex_release null_mtl_tex_release
 #include "../../null/nvn_null.c"
 #undef mtl_tex_cpu_written
+#undef mtl_tex_init
+#undef mtl_tex_release
 
 static _Atomic uint64_t g_cpu_written_calls;
 static _Atomic uint64_t g_cpu_written_last_serial;
 void mtl_tex_cpu_written(const tex_t *t) {
     atomic_fetch_add(&g_cpu_written_calls, 1);
     atomic_store(&g_cpu_written_last_serial, t ? t->serial : 0);
+}
+
+static struct { uint64_t serial; const tex_t *owner; } g_live_owner[32];
+void mtl_tex_init(const tex_t *t) {
+    for (size_t i = 0; i < sizeof g_live_owner / sizeof g_live_owner[0]; i++) {
+        if (!g_live_owner[i].serial || g_live_owner[i].serial == t->serial) {
+            g_live_owner[i].serial = t->serial;
+            g_live_owner[i].owner = t;
+            return;
+        }
+    }
+}
+int mtl_tex_release(tex_t *t) {
+    if (!t->serial) return 1;
+    for (size_t i = 0; i < sizeof g_live_owner / sizeof g_live_owner[0]; i++) {
+        if (g_live_owner[i].serial == t->serial) {
+            if (vkx_tex_release_is_copy(g_live_owner[i].owner, t)) return 0;
+            g_live_owner[i].serial = 0;
+            g_live_owner[i].owner = NULL;
+            return 1;
+        }
+    }
+    return 1;
 }
 
 #include "../../../gfx/nvn/hle_nvn.c"
@@ -129,6 +157,43 @@ int main(void) {
     nvn_ft_poll();
     check(atomic_load(&g_cpu_written_calls) == 0,
           "nvn_ft_poll skips texture from finalized pool without touching unmapped storage");
+
+    // Copy-finalize and re-init semantics (PR #3305):
+    uint8_t *mem2 = mmap(NULL, pool_sz, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    check(mem2 != MAP_FAILED, "second pool backing maps");
+    NVNmemoryPool *pool2 = calloc(1, sizeof *pool2);
+    check(pool2 != NULL, "second pool struct allocates");
+    h_nvnMemoryPoolBuilderSetStorage(&pb, mem2, pool_sz);
+    check(h_nvnMemoryPoolInitialize(pool2, &pb), "second memory pool initializes");
+    h_nvnTextureBuilderSetStorage(&tb, pool2, 0);
+
+    NVNtexture owner, copy;
+    check(h_nvnTextureInitialize(&owner, &tb), "owner texture initializes");
+    uint64_t ser_owner = ((const tex_t *)&owner)->serial;
+    check(nvn_ft_tracked(ser_owner), "owner texture is tracked in g_ft");
+
+    copy = owner;
+    h_nvnTextureFinalize(&copy);
+    check(nvn_ft_tracked(ser_owner), "finalizing a copy keeps live texture registered in g_ft");
+
+    copy = owner;
+    h_nvnTextureBuilderSetStorage(&tb, pool2, 0x10000);
+    check(h_nvnTextureInitialize(&copy, &tb), "re-initializing a copy succeeds");
+    uint64_t ser_copy = ((const tex_t *)&copy)->serial;
+    check(nvn_ft_tracked(ser_owner) && nvn_ft_tracked(ser_copy),
+          "re-initializing a copy keeps the original owner's serial tracked");
+
+    h_nvnTextureFinalize(&owner);
+    check(!nvn_ft_tracked(ser_owner), "finalizing the owning texture drops its serial from g_ft");
+
+    check(h_nvnTextureInitialize(&copy, &tb), "re-initializing live copy object without Finalize succeeds");
+    uint64_t ser_copy2 = ((const tex_t *)&copy)->serial;
+    check(!nvn_ft_tracked(ser_copy) && nvn_ft_tracked(ser_copy2),
+          "re-initializing a live texture object without Finalize drops old serial and tracks new serial");
+
+    h_nvnMemoryPoolFinalize(pool2);
+    munmap(mem2, pool_sz);
+    free(pool2);
 
     printf("t_nvn_ft: %s (%d failures)\n", bad ? "FAILED" : "passed", bad);
     return bad != 0;

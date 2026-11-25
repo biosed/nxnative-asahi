@@ -80,7 +80,7 @@ void mtl_drain(void) {}
 
 // textures, samplers, programs: no GPU objects
 void mtl_tex_init(const tex_t *t) { (void)t; }
-void mtl_tex_release(tex_t *t) { (void)t; }
+int mtl_tex_release(tex_t *t) { (void)t; return 1; }
 void mtl_tex_pin(const tex_t *t) { (void)t; }
 void mtl_tex_unpin(uint64_t serial) { (void)serial; }
 void mtl_tex_cpu_written(const tex_t *t) { (void)t; }

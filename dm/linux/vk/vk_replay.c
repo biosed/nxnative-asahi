@@ -1030,14 +1030,15 @@ void mtl_alias_drop_pool(const void *pool) {
         LOG("vulkan replay: %llu images detached from finalized memory pools so far (%.0f MiB; %llu with this pool, %llu still held for presentation)", (unsigned long long)k, g_pool_dropped_bytes / 1048576.0, (unsigned long long)n, (unsigned long long)held); }
     pthread_mutex_unlock(&g_tmu);
 }
-void mtl_tex_release(tex_t *o) {
-    if (!g_on || !o->serial) return;
+int mtl_tex_release(tex_t *o) {
+    if (!g_on || !o->serial) return 1;
     pthread_mutex_lock(&g_tmu);
     const tex_t *owner = nvn_hm_get(&g_tex_live, &o->serial);
-    if (vkx_tex_release_is_copy(owner, o)) { pthread_mutex_unlock(&g_tmu); return; }
+    if (vkx_tex_release_is_copy(owner, o)) { pthread_mutex_unlock(&g_tmu); return 0; }
     nvn_hm_del(&g_tex_live, &o->serial);
     if (!nvn_hm_get(&g_tex_pins, &o->serial)) sref_drop_serial(o->serial);   // with storage it stays for the next object over it
     pthread_mutex_unlock(&g_tmu);
+    return 1;
 }
 
 // ---- submissions ----
