@@ -38,7 +38,7 @@ OBJ := $(NVN_OBJ) \
        $(patsubst %,$(OUT)/obj/linux/%.o,$(NULL_SRC))
 
 .DEFAULT_GOAL := null-renderer
-.PHONY: profile null-renderer vulkan-replay-objects nxasahi-renderer-objects nxasahi-renderer nxasahi-front vulkan-selftest vk-mem-selftest t_push t_skipcs t_gpstamp t_focus t_front_input t_gmem_trace t_missing_log t_counter_report t_nvn_capture t_nvn_queue t_nvn_dirty t_vk_stage t_vk_compile_watch t_vk_shader_cache t_vk_format t_vk_cs_gpu_lifecycle t_vk_image_refs t_vk_gmem_map t_vk_bindless_lru t_vk_mesh t_vk_mesh_compile t_vk_descriptor_pool t_vk_mesh_coverage t_vk_shader_resolve t_vk_movie t_vk_linear t_vk_passlog t_vk_texraw t_vk_upscaler t_vk_cube t_vk_menu dmhost dmhost-vulkan t_fs_linux clean
+.PHONY: profile null-renderer vulkan-replay-objects nxasahi-renderer-objects nxasahi-renderer nxasahi-front vulkan-selftest vk-mem-selftest t_push t_skipcs t_gpstamp t_focus t_front_input t_gmem_trace t_missing_log t_counter_report t_nvn_capture t_nvn_queue t_nvn_dirty t_nvn_ft t_vk_stage t_vk_compile_watch t_vk_shader_cache t_vk_format t_vk_cs_gpu_lifecycle t_vk_image_refs t_vk_gmem_map t_vk_bindless_lru t_vk_mesh t_vk_mesh_compile t_vk_descriptor_pool t_vk_mesh_coverage t_vk_shader_resolve t_vk_movie t_vk_linear t_vk_passlog t_vk_texraw t_vk_upscaler t_vk_cube t_vk_menu dmhost dmhost-vulkan t_fs_linux clean
 
 # The consolidated asahi branch also carries the Linux host. Keep its object
 # namespace and rules separate so renderer-only checks remain bounded and a
@@ -177,6 +177,11 @@ $(OUT)/t_nvn_dirty: vk/tests/t_nvn_dirty.c ../gfx/nvn/nvn_dirty.c ../gfx/nvn/nvn
 	@mkdir -p $(dir $@)
 	$(CC) $(CPPFLAGS) -std=gnu11 -O1 -g -Wall -Wextra -Werror -pthread -o $@ vk/tests/t_nvn_dirty.c ../gfx/nvn/nvn_dirty.c
 t_nvn_dirty: $(OUT)/t_nvn_dirty
+	$<
+$(OUT)/t_nvn_ft: vk/tests/t_nvn_ft.c null/nvn_null.c ../gfx/nvn/hle_nvn.c $(filter-out $(OUT)/obj/gfx/hle_nv.c.o $(OUT)/obj/gfx/hle_vi.c.o $(OUT)/obj/gfx/nvn/hle_nvn.c.o $(OUT)/obj/gfx/nvn/nvn_entry.S.o,$(NVN_OBJ)) $(OUT)/obj/linux/compat/compat.c.o $(OUT)/obj/linux/src/nvn_capture_none.c.o | profile
+	@mkdir -p $(dir $@)
+	$(CC) $(CPPFLAGS) -std=gnu11 -O1 -g -Wall -Wextra -Wno-unused-function -Wno-format -Wno-deprecated-declarations -Wno-missing-field-initializers -pthread -o $@ vk/tests/t_nvn_ft.c $(filter-out $(OUT)/obj/gfx/hle_nv.c.o $(OUT)/obj/gfx/hle_vi.c.o $(OUT)/obj/gfx/nvn/hle_nvn.c.o $(OUT)/obj/gfx/nvn/nvn_entry.S.o,$(NVN_OBJ)) $(OUT)/obj/linux/compat/compat.c.o $(OUT)/obj/linux/src/nvn_capture_none.c.o -lm
+t_nvn_ft: $(OUT)/t_nvn_ft
 	$<
 $(OUT)/t_vk_stage: vk/tests/t_vk_stage.c vk/vk_stage.h vk/vk_draw.h | profile
 	@mkdir -p $(dir $@)
